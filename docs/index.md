@@ -2,8 +2,8 @@
 layout: home
 
 hero:
-  text: Local-Model Gateway
-  tagline: OpenAI- and Anthropic-compatible APIs for local LLM servers. Run agents, tools, and coding assistants against your own models.
+  text: Local Model Gateway
+  tagline: A lightweight, agnostic API layer for local LLM servers. Run OpenAI- and Anthropic-compatible agents, tools, and coding assistants against your own models.
   actions:
     - theme: brand
       text: Get Started
