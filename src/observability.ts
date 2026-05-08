@@ -186,22 +186,29 @@ export class ObservabilityStore {
   }
 }
 
-export async function captureRequest(request: Request, requestId: string, timestamp: string): Promise<RequestCapture> {
+export async function captureRequest(request: Request, requestId: string, timestamp: string, captureBody = false): Promise<RequestCapture> {
   const headers = Object.fromEntries(
     [...request.headers.entries()]
       .map(([key, value]) => [key.toLowerCase(), value])
       .sort(([a], [b]) => a.localeCompare(b)),
   );
   const contentType = request.headers.get('content-type');
-  const raw = await request.text().catch(() => '');
-  const bytes = new TextEncoder().encode(raw).length;
-  const parsed = parseJsonBody(raw, contentType);
-  const shape = parsed.ok
-    ? summarizeBody(parsed.value)
-    : summarizeRawBody(raw, contentType);
+  let bytes = 0;
+  let parsed: { ok: true; value: unknown } | { ok: false } = { ok: false };
+  let shape: unknown = null;
+  let streaming = false;
+  let keys: string[] = [];
 
-  const streaming = detectStreamingFlag(parsed.ok ? parsed.value : undefined);
-  const keys = parsed.ok ? collectJsonPaths(parsed.value) : [];
+  if (captureBody) {
+    const raw = await request.text().catch(() => '');
+    bytes = new TextEncoder().encode(raw).length;
+    parsed = parseJsonBody(raw, contentType);
+    shape = parsed.ok
+      ? summarizeBody(parsed.value)
+      : summarizeRawBody(raw, contentType);
+    streaming = detectStreamingFlag(parsed.ok ? parsed.value : undefined);
+    keys = parsed.ok ? collectJsonPaths(parsed.value) : [];
+  }
 
   return {
     request_id: requestId,

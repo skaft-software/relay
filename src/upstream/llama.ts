@@ -1,5 +1,6 @@
 import { GatewayError, upstreamError } from '../errors.ts';
 import type { AppConfig } from '../config.ts';
+import { redactText } from '../redact.ts';
 
 export type UpstreamResult = {
   response: Response;
@@ -14,7 +15,7 @@ export async function upstreamJson(config: AppConfig, path: string, init: Reques
     },
   });
   if (!result.response.ok) {
-    throw await upstreamHttpError(result.response);
+    throw await upstreamHttpError(result.response, config);
   }
   try {
     return await result.response.json();
@@ -42,11 +43,21 @@ export async function upstreamFetch(config: AppConfig, path: string, init: Reque
   }
 }
 
-export async function upstreamHttpError(response: Response) {
+export async function upstreamHttpError(response: Response, config?: AppConfig) {
+  if (config && config.exposeUpstreamErrors !== true) {
+    return new GatewayError(
+      502,
+      `Upstream llama server returned HTTP ${response.status}`,
+      'upstream_error',
+      'upstream_unavailable',
+      null,
+      response.status,
+    );
+  }
   const detail = await readUpstreamErrorDetail(response);
   return new GatewayError(
     502,
-    detail ?? `Upstream llama server returned HTTP ${response.status}`,
+    detail ? truncateAndRedact(detail) : `Upstream llama server returned HTTP ${response.status}`,
     'upstream_error',
     'upstream_unavailable',
     null,
@@ -92,4 +103,9 @@ function extractMessage(payload: unknown): string | undefined {
     if (typeof nested.message === 'string' && nested.message.trim()) return nested.message.trim();
   }
   return undefined;
+}
+
+function truncateAndRedact(message: string): string {
+  const truncated = message.length > 200 ? `${message.slice(0, 200)}...` : message;
+  return redactText(truncated);
 }

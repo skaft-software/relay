@@ -23,6 +23,11 @@ export type AppConfig = {
   logPrompts: boolean;
   requestHistoryLimit: number;
   upstreamCtxSize?: number;
+  corsOrigin?: string;
+  rateLimitAuthMax?: number;
+  rateLimitAuthWindowMs?: number;
+  exposeUpstreamErrors?: boolean;
+  observabilityCaptureBody?: boolean;
 };
 
 export type UnknownFieldPolicy = 'pass_through' | 'strip' | 'reject';
@@ -74,6 +79,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     logPrompts: readBoolean(env.RELAY_LOG_PROMPTS, false),
     requestHistoryLimit: readInteger(env.RELAY_REQUEST_HISTORY_LIMIT, 100, 'RELAY_REQUEST_HISTORY_LIMIT'),
     upstreamCtxSize: readOptionalNumber(env.UPSTREAM_CTX_SIZE, 'UPSTREAM_CTX_SIZE'),
+    corsOrigin: readOptional(env.CORS_ORIGIN),
+    rateLimitAuthMax: readInteger(env.RATE_LIMIT_AUTH_MAX, 20, 'RATE_LIMIT_AUTH_MAX'),
+    rateLimitAuthWindowMs: readInteger(env.RATE_LIMIT_AUTH_WINDOW_SECONDS, 60, 'RATE_LIMIT_AUTH_WINDOW_SECONDS') * 1000,
+    exposeUpstreamErrors: readBoolean(env.RELAY_EXPOSE_UPSTREAM_ERRORS, false),
+    observabilityCaptureBody: readBoolean(env.RELAY_OBSERVABILITY_CAPTURE_BODY, false),
   };
 }
 

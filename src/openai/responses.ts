@@ -52,7 +52,7 @@ export async function createResponse(config: AppConfig, store: ResponseStore, bo
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(chatRequest),
   });
-  if (!upstreamRes.response.ok) throw await upstreamHttpError(upstreamRes.response);
+  if (!upstreamRes.response.ok) throw await upstreamHttpError(upstreamRes.response, config);
   const upstreamText = await upstreamRes.response.text();
   const upstreamBytes = Buffer.byteLength(upstreamText);
   let chat: unknown;
@@ -105,7 +105,7 @@ async function streamResponse(config: AppConfig, chatRequest: JsonObject): Promi
     body: JSON.stringify(chatRequest),
   });
   if (!upstream.response.ok || !upstream.response.body) {
-    throw upstream.response.body ? await upstreamHttpError(upstream.response) : upstreamError('bad_response', 'Upstream returned an empty stream');
+    throw upstream.response.body ? await upstreamHttpError(upstream.response, config) : upstreamError('bad_response', 'Upstream returned an empty stream');
   }
 
   const responseId = `resp_${crypto.randomUUID()}`;

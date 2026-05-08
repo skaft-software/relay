@@ -2,7 +2,9 @@ FROM node:25-alpine
 
 WORKDIR /app
 
-COPY package.json ./
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts
+
 COPY src ./src
 
 RUN addgroup -S relay && adduser -S relay -G relay
@@ -16,4 +18,4 @@ EXPOSE 1234
 
 USER relay
 
-CMD ["npm", "start"]
+CMD ["node", "--experimental-strip-types", "src/main.ts"]

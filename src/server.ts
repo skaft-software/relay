@@ -28,19 +28,32 @@ export function createApp(config: AppConfig): App {
   const responseStore = new ResponseStore();
   const capabilities = new CapabilityRegistry(config);
   const observability = new ObservabilityStore(config);
+  const authRateLimiter = new AuthRateLimiter(config.rateLimitAuthMax ?? 20, config.rateLimitAuthWindowMs ?? 60_000);
+
+  const expectedHost = config.host === '0.0.0.0' || config.host === '::'
+    ? null
+    : `${config.host}:${config.port}`;
 
   async function handler(request: Request): Promise<Response> {
+    if (expectedHost !== null) {
+      const requestUrl = new URL(request.url);
+      const hostHeader = ((request.headers.get('host') ?? requestUrl.host) ?? '').toLowerCase();
+      const isLocalhost = hostHeader.startsWith('127.0.0.1:') || hostHeader.startsWith('localhost:') || hostHeader.startsWith('[::1]:');
+      if (!isLocalhost && hostHeader !== expectedHost.toLowerCase()) {
+        return new Response('Bad Request', { status: 400 });
+      }
+    }
     const requestId = request.headers.get('x-request-id') ?? crypto.randomUUID();
     const startedAtMs = Date.now();
     const startedAt = new Date(startedAtMs).toISOString();
     const url = new URL(request.url);
     const path = url.pathname;
-    const requestCapturePromise = captureRequest(request.clone(), requestId, startedAt);
+    const requestCapturePromise = captureRequest(request.clone(), requestId, startedAt, config.observabilityCaptureBody ?? false);
     let requestModel: string | undefined;
     let response: Response;
     try {
       if (request.method === 'OPTIONS') {
-        response = optionsResponse(request);
+        response = optionsResponse(request, config);
         return finalizeResponse(response, requestId, path, request.method, startedAt, startedAtMs, requestModel);
       }
       if (request.method === 'GET' && path === '/') {
@@ -55,8 +68,10 @@ export function createApp(config: AppConfig): App {
         response = jsonResponse({ ok: true });
         return finalizeResponse(response, requestId, path, request.method, startedAt, startedAtMs, requestModel);
       }
-      const relayAuthError = authorizeRelay(config, request, path);
-      if (relayAuthError) return finalizeResponse(relayAuthError, requestId, path, request.method, startedAt, startedAtMs, requestModel);
+      if (config.apiKey) {
+        const relayAuthError = authorizeRelay(config, request, path, authRateLimiter);
+        if (relayAuthError) return finalizeResponse(relayAuthError, requestId, path, request.method, startedAt, startedAtMs, requestModel);
+      }
       if (request.method === 'GET' && path === '/relay/capabilities') {
         response = jsonResponse(capabilities.get());
         return finalizeResponse(response, requestId, path, request.method, startedAt, startedAtMs, requestModel);
@@ -91,8 +106,10 @@ export function createApp(config: AppConfig): App {
         else response = jsonResponse({ type: 'error', error: { type: 'not_found_error', message: 'Not found' } }, 404);
         return finalizeResponse(response, requestId, path, request.method, startedAt, startedAtMs, requestModel);
       }
-      const authError = authorizeOpenAI(config, request, path);
-      if (authError) return finalizeResponse(authError, requestId, path, request.method, startedAt, startedAtMs, requestModel);
+      if (config.apiKey) {
+        const authError = authorizeOpenAI(config, request, path, authRateLimiter);
+        if (authError) return finalizeResponse(authError, requestId, path, request.method, startedAt, startedAtMs, requestModel);
+      }
       if (isUnsupportedOpenAIEndpoint(path)) {
         return finalizeResponse(unsupportedEndpoint(path), requestId, path, request.method, startedAt, startedAtMs, requestModel);
       }
@@ -254,8 +271,11 @@ export function createApp(config: AppConfig): App {
           return;
         }
         observability.record(summary);
-      } catch {
-        // Never fail the request because observability bookkeeping did.
+      } catch (err) {
+        logger.error('observability record failed', {
+          request_id: currentRequestId,
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
     }
   }
@@ -307,41 +327,28 @@ export function createApp(config: AppConfig): App {
   };
 }
 
-function optionsResponse(request: Request): Response {
+const CORS_ALLOWED_HEADERS = 'authorization,content-type,x-api-key,x-request-id,anthropic-version,anthropic-beta,cf-access-client-id,cf-access-client-secret';
+
+function optionsResponse(request: Request, config: AppConfig): Response {
+  const origin = config.corsOrigin ?? request.headers.get('origin') ?? '*';
   return new Response(null, {
     status: 204,
     headers: {
-      'access-control-allow-origin': '*',
+      'access-control-allow-origin': origin ?? '',
       'access-control-allow-methods': 'GET,POST,DELETE,OPTIONS',
-      'access-control-allow-headers': corsAllowHeaders(request),
+      'access-control-allow-headers': CORS_ALLOWED_HEADERS,
       'access-control-max-age': '86400',
     },
   });
-}
-
-function corsAllowHeaders(request: Request): string {
-  const allowed = new Set([
-    'authorization',
-    'content-type',
-    'x-api-key',
-    'x-request-id',
-    'anthropic-version',
-    'anthropic-beta',
-  ]);
-  const requested = request.headers.get('access-control-request-headers');
-  if (requested) {
-    for (const header of requested.split(',')) {
-      const normalized = header.trim().toLowerCase();
-      if (normalized) allowed.add(normalized);
-    }
-  }
-  return [...allowed].join(',');
 }
 
 function withRelayHeaders(response: Response, requestId: string, config: AppConfig): Response {
   response.headers.set('x-request-id', requestId);
   response.headers.set('x-relay-request-id', requestId);
   response.headers.set('x-relay-model-profile', activeProfile(config).id);
+  response.headers.set('x-content-type-options', 'nosniff');
+  response.headers.set('x-frame-options', 'DENY');
+  response.headers.set('referrer-policy', 'no-referrer');
   return response;
 }
 
@@ -359,20 +366,75 @@ function isUnsupportedOpenAIEndpoint(path: string): boolean {
   ].some((pattern) => pattern.test(path));
 }
 
-function authorizeOpenAI(config: AppConfig, request: Request, path: string): Response | undefined {
+function authorizeOpenAI(config: AppConfig, request: Request, path: string, rateLimiter?: AuthRateLimiter): Response | undefined {
   if (!config.apiKey || (!path.startsWith('/v1/') && path !== '/rerank')) return undefined;
+  const ip = clientIp(request);
+  if (rateLimiter && !rateLimiter.allow(ip)) {
+    return openAIError(429, 'Too many requests', 'rate_limit_exceeded');
+  }
   const bearer = request.headers.get('authorization')?.match(/^Bearer\s+(.+)$/i)?.[1];
   const xKey = request.headers.get('x-api-key');
-  if (hasValidApiKey(config.apiKey, bearer, xKey)) return undefined;
+  if (hasValidApiKey(config.apiKey, bearer, xKey)) {
+    if (rateLimiter) rateLimiter.reset(ip);
+    return undefined;
+  }
   return openAIError(401, 'Unauthorized', 'authentication_error');
 }
 
-function authorizeRelay(config: AppConfig, request: Request, path: string): Response | undefined {
+function authorizeRelay(config: AppConfig, request: Request, path: string, rateLimiter?: AuthRateLimiter): Response | undefined {
   if (!config.apiKey || !path.startsWith('/relay/')) return undefined;
+  const ip = clientIp(request);
+  if (rateLimiter && !rateLimiter.allow(ip)) {
+    return openAIError(429, 'Too many requests', 'rate_limit_exceeded');
+  }
   const bearer = request.headers.get('authorization')?.match(/^Bearer\s+(.+)$/i)?.[1];
   const xKey = request.headers.get('x-api-key');
-  if (hasValidApiKey(config.apiKey, bearer, xKey)) return undefined;
+  if (hasValidApiKey(config.apiKey, bearer, xKey)) {
+    if (rateLimiter) rateLimiter.reset(ip);
+    return undefined;
+  }
   return openAIError(401, 'Unauthorized', 'authentication_error');
+}
+
+function clientIp(request: Request): string {
+  return request.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
+    ?? request.headers.get('x-real-ip')
+    ?? 'unknown';
+}
+
+class AuthRateLimiter {
+  private readonly max: number;
+  private readonly windowMs: number;
+  private readonly counters = new Map<string, { count: number; resetAt: number }>();
+
+  constructor(max: number, windowMs: number) {
+    this.max = max;
+    this.windowMs = windowMs;
+  }
+
+  allow(key: string): boolean {
+    this.prune();
+    const now = Date.now();
+    const entry = this.counters.get(key);
+    if (!entry || now >= entry.resetAt) {
+      this.counters.set(key, { count: 1, resetAt: now + this.windowMs });
+      return true;
+    }
+    if (entry.count >= this.max) return false;
+    entry.count += 1;
+    return true;
+  }
+
+  reset(key: string): void {
+    this.counters.delete(key);
+  }
+
+  private prune(): void {
+    const now = Date.now();
+    for (const [key, entry] of this.counters) {
+      if (now >= entry.resetAt) this.counters.delete(key);
+    }
+  }
 }
 
 async function readJson(request: Request, logger: ReturnType<typeof createLogger>, path: string): Promise<unknown> {
