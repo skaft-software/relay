@@ -5,6 +5,7 @@ export default defineConfig({
   description: 'OpenAI/Anthropic-compatible gateway for local model servers',
   base: '/relay/',
   cleanUrls: true,
+  appearance: 'dark',
   themeConfig: {
     siteTitle: '',
     nav: [
