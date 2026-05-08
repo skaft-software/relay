@@ -144,6 +144,12 @@ onUnmounted(() => {
 }
 
 .problem-stage {
+  --vp-c-text-1: #f4f7fb;
+  --vp-c-text-2: #c3cad6;
+  --vp-c-text-3: #8691a3;
+  --vp-c-brand-1: #75a7df;
+  --vp-c-brand-2: #8fb8e9;
+
   position: relative;
   overflow: hidden;
   min-height: 300px;

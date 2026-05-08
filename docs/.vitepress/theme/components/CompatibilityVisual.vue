@@ -47,6 +47,11 @@ withDefaults(
 
 <style scoped>
 .compat-visual {
+  --vp-c-text-1: #f4f7fb;
+  --vp-c-text-2: #c3cad6;
+  --vp-c-text-3: #8b95a5;
+  --vp-c-brand-2: #8fb8e9;
+
   margin: 0;
 }
 

@@ -1,12 +1,12 @@
-/* Relay docs custom styles — infrastructure-oriented dark theme. */
+/* Relay docs custom styles — infrastructure-oriented theme. */
 
 :root {
-  --relay-bg: #0a0a0c;
-  --relay-surface: #111115;
-  --relay-surface-soft: #17171c;
-  --relay-border: #1e1e24;
-  --relay-text: #d4d4d8;
-  --relay-text-muted: #71717a;
+  --relay-bg: #ffffff;
+  --relay-surface: #f7f9fc;
+  --relay-surface-soft: #eef3f9;
+  --relay-border: #dbe4f0;
+  --relay-text: #242833;
+  --relay-text-muted: #5e6675;
   --relay-steel-rgb: 86 141 208;
 
   --vp-c-brand-1: #467ec2;
@@ -26,6 +26,13 @@
 }
 
 .dark {
+  --relay-bg: #0a0a0c;
+  --relay-surface: #111115;
+  --relay-surface-soft: #17171c;
+  --relay-border: #1e1e24;
+  --relay-text: #d4d4d8;
+  --relay-text-muted: #71717a;
+
   --vp-c-bg: var(--relay-bg);
   --vp-c-bg-alt: #08080a;
   --vp-c-bg-soft: var(--relay-surface);
@@ -284,6 +291,8 @@
 
 /* ---- Terminal / quickstart block ---- */
 .relay-terminal {
+  --vp-c-text-3: #8b95a5;
+
   background: #08080a;
   border: 1px solid var(--relay-border);
   border-radius: 8px;
@@ -330,6 +339,10 @@
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace !important;
   font-size: 13px !important;
   line-height: 1.7 !important;
+}
+
+.relay-terminal .shiki span {
+  color: var(--shiki-dark) !important;
 }
 
 /* ---- Footer ---- */
