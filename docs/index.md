@@ -20,6 +20,8 @@ features:
     details: Built-in health checks, capabilities introspection, request stats, and configurable observability — no external dependencies.
 ---
 
+<CompatibilityVisual />
+
 ## Fast Path
 
 ```sh

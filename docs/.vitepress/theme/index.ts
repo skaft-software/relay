@@ -1,7 +1,8 @@
-import { h } from 'vue'
+import { h, type App } from 'vue'
 import type { Theme } from 'vitepress'
 import DefaultTheme from 'vitepress/theme'
 import RelayLogo from './RelayLogo.vue'
+import CompatibilityVisual from './components/CompatibilityVisual.vue'
 import './style.css'
 
 export default {
@@ -16,5 +17,8 @@ export default {
       'home-hero-image': () =>
         h(RelayLogo, { size: 120, hero: true }),
     })
+  },
+  enhanceApp({ app }: { app: App }) {
+    app.component('CompatibilityVisual', CompatibilityVisual)
   },
 } satisfies Theme
