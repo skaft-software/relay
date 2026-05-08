@@ -150,18 +150,16 @@
 
 /* ---- Pretext pipeline visual wrapper ---- */
 .relay-pipeline-section {
-  margin: 40px 0 16px;
+  margin: 40px auto 32px;
 }
 
 .relay-pipeline-section .compat-visual {
-  margin: 8px 0 0;
-}
-
-.relay-pipeline-section .compat-canvas {
+  margin: 8px auto 0;
+  width: 100%;
   background: var(--relay-surface);
   border: 1px solid var(--relay-border);
   border-radius: 8px;
-  padding: 8px 0 4px;
+  padding: 14px;
 }
 
 /* ---- Pain points grid ---- */

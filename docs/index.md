@@ -15,21 +15,7 @@ hero:
 
 <div class="relay-section">
 
-<p class="relay-section-label">The Problem</p>
-
-<h2 class="relay-section-title">Local servers are almost compatible. Agents need <em>actually</em> compatible.</h2>
-
-<div class="relay-pain-grid">
-
-<div class="relay-pain-card"><p>OpenAI-compatible endpoints differ subtly across local servers — header conventions, field presence, and error shapes don't match what SDKs expect.</p></div>
-
-<div class="relay-pain-card"><p>Anthropic clients expect different message shapes, streaming event orders, and tool-call structures than what upstream servers return.</p></div>
-
-<div class="relay-pain-card"><p>Tool calls, model IDs, SSE chunk framing, and capability metadata often cause agent loops to break or silently degrade.</p></div>
-
-<div class="relay-pain-card"><p>Relay normalizes the boundary instead of forcing every client, SDK, and agent to special-case each local inference server.</p></div>
-
-</div>
+<ProblemVisual />
 
 <div class="relay-pipeline-section">
   <p class="relay-section-label">Translation Pipeline</p>

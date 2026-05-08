@@ -4,6 +4,7 @@ import DefaultTheme from 'vitepress/theme'
 import RelayLogo from './RelayLogo.vue'
 import GatewayDiagram from './GatewayDiagram.vue'
 import CompatibilityVisual from './components/CompatibilityVisual.vue'
+import ProblemVisual from './components/ProblemVisual.vue'
 import './style.css'
 
 export default {
@@ -21,5 +22,6 @@ export default {
   },
   enhanceApp({ app }: { app: App }) {
     app.component('CompatibilityVisual', CompatibilityVisual)
+    app.component('ProblemVisual', ProblemVisual)
   },
 } satisfies Theme
