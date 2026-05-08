@@ -4,13 +4,6 @@ layout: home
 hero:
   text: Stop patching every agent for local models.
   tagline: Relay is a lightweight compatibility gateway for llama.cpp and local inference servers. It exposes OpenAI- and Anthropic-compatible APIs, normalizes streaming, tools, models, and errors, and lets real agents talk to your local models without custom glue code.
-  actions:
-    - theme: brand
-      text: Quickstart
-      link: /quickstart
-    - theme: alt
-      text: GitHub
-      link: https://github.com/achuthanmukundan00/relay
 ---
 
 <div class="relay-section">
