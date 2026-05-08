@@ -95,7 +95,7 @@
   padding-top: 64px;
 }
 
-/* Hero image: gateway diagram gets a wider container */
+/* Hero image: Three.js bridge scene gets a prominent container */
 .VPHero.has-image .image {
   order: -1;
   margin: 0 0 28px;
@@ -105,7 +105,7 @@
   width: auto;
   height: auto;
   transform: none;
-  max-width: 480px;
+  max-width: 800px;
 }
 
 .VPHero.has-image .image-bg {
@@ -115,6 +115,8 @@
 .VPHero.has-image .image-src {
   max-width: 100%;
   max-height: none;
+  border-radius: 10px;
+  overflow: hidden;
 }
 
 .VPHero .main {
@@ -307,6 +309,12 @@
   border-radius: 8px;
   overflow: hidden;
   margin: 16px 0 0;
+  transition: border-color 0.3s ease, box-shadow 0.3s ease;
+}
+
+.relay-terminal:hover {
+  border-color: rgba(var(--relay-steel-rgb) / 0.22);
+  box-shadow: 0 0 0 1px rgba(var(--relay-steel-rgb) / 0.05), 0 4px 20px rgba(0, 0, 0, 0.25);
 }
 
 .relay-terminal-bar {
@@ -323,10 +331,16 @@
   height: 10px;
   border-radius: 50%;
   background: #333;
+  transition: background 0.3s ease;
 }
 
 .relay-terminal-dot:first-child {
   background: #5e5e5e;
+}
+
+.relay-terminal:hover .relay-terminal-dot:first-child {
+  background: #568dd0;
+  box-shadow: 0 0 4px rgba(86, 141, 208, 0.4);
 }
 
 .relay-terminal-label {
@@ -335,6 +349,59 @@
   color: var(--vp-c-text-3);
   margin-left: auto;
   letter-spacing: 0.04em;
+}
+
+/* Terminal copy button */
+.relay-terminal-copy {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--vp-c-text-3);
+  cursor: pointer;
+  font-size: 13px;
+  transition: all 0.2s ease;
+  margin-left: 4px;
+}
+
+.relay-terminal-copy:hover {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: rgba(var(--relay-steel-rgb) / 0.2);
+  color: var(--vp-c-brand-2);
+}
+
+.relay-terminal-copy--copied {
+  color: #6a9955 !important;
+  border-color: rgba(106, 153, 85, 0.3) !important;
+  background: rgba(106, 153, 85, 0.08) !important;
+}
+
+/* Terminal cursor blink */
+.relay-terminal pre::after {
+  content: "";
+  display: inline-block;
+  width: 8px;
+  height: 14px;
+  background: rgba(86, 141, 208, 0.7);
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  animation: terminal-cursor-blink 1s step-end infinite;
+}
+
+@keyframes terminal-cursor-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .relay-terminal pre::after {
+    animation: none;
+    opacity: 0;
+  }
 }
 
 .relay-terminal pre {
@@ -367,6 +434,50 @@
   max-width: 800px;
 }
 
+/* ---- Scroll-driven reveal animations (progressive enhancement) ---- */
+@supports (animation-timeline: view()) {
+  .relay-pain-card,
+  .relay-norm-card,
+  .relay-callout,
+  .relay-note,
+  .relay-terminal {
+    animation: reveal-up linear both;
+    animation-timeline: view();
+    animation-range: entry 8% cover 18%;
+  }
+
+  .relay-pain-card:nth-child(1) { animation-range: entry 4% cover 14%; }
+  .relay-pain-card:nth-child(2) { animation-range: entry 10% cover 20%; }
+  .relay-pain-card:nth-child(3) { animation-range: entry 16% cover 26%; }
+  .relay-pain-card:nth-child(4) { animation-range: entry 22% cover 32%; }
+}
+
+@keyframes reveal-up {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Disable scroll animations when reduced motion is preferred */
+@media (prefers-reduced-motion: reduce) {
+  @supports (animation-timeline: view()) {
+    .relay-pain-card,
+    .relay-norm-card,
+    .relay-callout,
+    .relay-note,
+    .relay-terminal {
+      animation: none;
+      opacity: 1;
+      transform: none;
+    }
+  }
+}
+
 /* ---- Responsive ---- */
 @media (max-width: 768px) {
   .VPHero.has-image .image {
@@ -375,6 +486,12 @@
 
   .VPHero.has-image .image-container {
     max-width: 100%;
+  }
+
+  .relay-bridge {
+    aspect-ratio: 800 / 340;
+    min-height: 220px;
+    max-height: 340px;
   }
 
   .VPHero .text {

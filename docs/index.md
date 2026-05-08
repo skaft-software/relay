@@ -70,13 +70,7 @@ hero:
 
 <p class="relay-section-label">Quickstart</p>
 
-<div class="relay-terminal">
-  <div class="relay-terminal-bar">
-    <span class="relay-terminal-dot"></span>
-    <span class="relay-terminal-dot"></span>
-    <span class="relay-terminal-dot"></span>
-    <span class="relay-terminal-label">terminal</span>
-  </div>
+<TerminalBlock>
 
 ```bash
 # 1. Start your local model server
@@ -90,7 +84,7 @@ cd relay && npm install && cp .env.example .env && npm run dev
 curl http://127.0.0.1:1234/v1/models
 ```
 
-</div>
+</TerminalBlock>
 
 <div class="relay-note">
   <strong>Using Synax?</strong> Relay can act as the local model gateway underneath it. Synax is the agent UX and runtime; Relay is the compatibility boundary that makes local inference actually work with it.
