@@ -2,6 +2,7 @@ import { h, type App } from 'vue'
 import type { Theme } from 'vitepress'
 import DefaultTheme from 'vitepress/theme'
 import RelayLogo from './RelayLogo.vue'
+import GatewayDiagram from './GatewayDiagram.vue'
 import CompatibilityVisual from './components/CompatibilityVisual.vue'
 import './style.css'
 
@@ -15,7 +16,7 @@ export default {
           h('span', { class: 'relay-nav-text' }, 'Relay'),
         ]),
       'home-hero-image': () =>
-        h(RelayLogo, { size: 120, hero: true }),
+        h(GatewayDiagram, { width: 420, height: 248 }),
     })
   },
   enhanceApp({ app }: { app: App }) {
