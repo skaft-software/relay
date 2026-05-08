@@ -17,7 +17,7 @@ export async function createEmbedding(config: AppConfig, body: unknown): Promise
       body: JSON.stringify(normalized),
     });
     if (upstream.response.status === 404 || upstream.response.status === 501) throw embeddingsUnsupportedError();
-    if (!upstream.response.ok) throw await upstreamHttpError(upstream.response);
+    if (!upstream.response.ok) throw await upstreamHttpError(upstream.response, config);
     const payload = await upstream.response.json().catch(() => {
       throw upstreamError('bad_response', 'Upstream returned invalid embeddings JSON');
     });
@@ -42,7 +42,7 @@ export async function createRerank(config: AppConfig, body: unknown): Promise<Re
       body: JSON.stringify(normalized),
     });
     if (upstream.response.status === 404 || upstream.response.status === 501) throw rerankUnsupportedError();
-    if (!upstream.response.ok) throw await upstreamHttpError(upstream.response);
+    if (!upstream.response.ok) throw await upstreamHttpError(upstream.response, config);
     const payload = await upstream.response.json().catch(() => {
       throw upstreamGatewayError('bad_response', 'Upstream returned invalid rerank JSON');
     });

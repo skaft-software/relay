@@ -26,7 +26,7 @@ export async function handleAnthropicMessages(config: AppConfig, request: Reques
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(chatRequest),
     });
-    if (!upstreamRes.response.ok) throw await upstreamHttpError(upstreamRes.response);
+    if (!upstreamRes.response.ok) throw await upstreamHttpError(upstreamRes.response, config);
     const upstreamText = await upstreamRes.response.text();
     let chat: unknown;
     try {
@@ -57,7 +57,7 @@ export async function handleAnthropicCountTokens(config: AppConfig, request: Req
       throw unsupportedCapabilityError('Token counting is not supported by this local llama.cpp backend');
     }
     if (!upstream.response.ok) {
-      throw await upstreamHttpError(upstream.response);
+      throw await upstreamHttpError(upstream.response, config);
     }
     const payload = await upstream.response.json().catch(() => {
       throw upstreamError('bad_response', 'Upstream returned invalid token count JSON');
@@ -230,7 +230,7 @@ async function streamAnthropicMessage(config: AppConfig, chatRequest: JsonObject
     body: JSON.stringify(chatRequest),
   });
   if (!upstream.response.ok || !upstream.response.body) {
-    throw upstream.response.body ? await upstreamHttpError(upstream.response) : upstreamError('bad_response', 'Upstream returned an empty stream');
+    throw upstream.response.body ? await upstreamHttpError(upstream.response, config) : upstreamError('bad_response', 'Upstream returned an empty stream');
   }
   const encoder = new TextEncoder();
   const messageId = `msg_${crypto.randomUUID()}`;

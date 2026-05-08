@@ -757,13 +757,29 @@ test('upstream unavailable and timeout map to OpenAI-shaped gateway errors', asy
   await t.test('upstream detail is preserved when upstream returns an explicit error message', async () => {
     await withUpstream(async (upstream) => {
       upstream.handler = (_req, res) => sendJson(res, 500, { error: { message: 'Context size has been exceeded.' } });
-      const res = await createApp(testConfig(upstream.url)).fetch('/v1/chat/completions', {
+      const config = { ...testConfig(upstream.url), exposeUpstreamErrors: true };
+      const res = await createApp(config).fetch('/v1/chat/completions', {
         method: 'POST',
         body: { model: 'llama', messages: [{ role: 'user', content: 'hello' }] },
       });
       assert.equal(res.status, 502);
       const body = await res.json();
       assert.equal(body.error.message, 'Context size has been exceeded.');
+      assert.equal(body.error.code, 'upstream_unavailable');
+    });
+  });
+
+  await t.test('upstream detail is sanitized when exposeUpstreamErrors is disabled', async () => {
+    await withUpstream(async (upstream) => {
+      upstream.handler = (_req, res) => sendJson(res, 500, { error: { message: 'Context size has been exceeded.' } });
+      const config = { ...testConfig(upstream.url), exposeUpstreamErrors: false };
+      const res = await createApp(config).fetch('/v1/chat/completions', {
+        method: 'POST',
+        body: { model: 'llama', messages: [{ role: 'user', content: 'hello' }] },
+      });
+      assert.equal(res.status, 502);
+      const body = await res.json();
+      assert.notEqual(body.error.message, 'Context size has been exceeded.');
       assert.equal(body.error.code, 'upstream_unavailable');
     });
   });

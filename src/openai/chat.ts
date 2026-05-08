@@ -90,7 +90,7 @@ export async function createChatCompletion(config: AppConfig, store: CompletionS
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(normalized),
   });
-  if (!upstreamRes.response.ok) throw await upstreamHttpError(upstreamRes.response);
+  if (!upstreamRes.response.ok) throw await upstreamHttpError(upstreamRes.response, config);
   const upstreamText = await upstreamRes.response.text();
   const upstreamBytes = Buffer.byteLength(upstreamText);
   let upstream: unknown;
@@ -215,7 +215,7 @@ async function streamChatCompletion(config: AppConfig, body: JsonObject): Promis
     body: JSON.stringify(body),
   });
   if (!upstream.response.ok) {
-    throw await upstreamHttpError(upstream.response);
+    throw await upstreamHttpError(upstream.response, config);
   }
   if (!upstream.response.body) {
     throw upstreamError('bad_response', 'Upstream returned an empty stream');

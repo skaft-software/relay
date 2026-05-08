@@ -96,8 +96,9 @@ function summarizeLargeContentFields(value: unknown): Array<Record<string, unkno
       tail_200_sha256: sha256(v.slice(-200)),
     };
     if (truncationContentDebugEnabled()) {
-      item.first_80 = v.slice(0, 80);
-      item.last_80 = v.slice(-80);
+      item.first_80_sha256 = sha256(v.slice(0, 80));
+      item.last_80_sha256 = sha256(v.slice(-80));
+      item.midpoint_sha256 = v.length > 160 ? sha256(v.slice(v.length / 2 - 40, v.length / 2 + 40)) : undefined;
     }
     out.push(item);
   });
