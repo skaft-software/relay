@@ -19,7 +19,7 @@ async function checkMessages(): Promise<void> {
     },
     body: JSON.stringify({
       model,
-      max_tokens: 16,
+      max_tokens: 32768,
       messages: [{ role: 'user', content: 'Reply with OK' }],
     }),
   });
