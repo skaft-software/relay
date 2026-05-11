@@ -99,8 +99,6 @@ async function readJson(request: Request, logLevel: string): Promise<JsonObject>
 function anthropicRequestToChat(input: JsonObject, config: AppConfig): JsonObject {
   const canonical = anthropicMessagesRequestToCanonical(input, config);
   const chat = canonicalToUpstreamChatRequest(canonical);
-  // Preserve existing behavior: accepted but intentionally not forwarded.
-  delete chat.thinking;
   return chat;
 }
 

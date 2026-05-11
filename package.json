@@ -1,6 +1,6 @@
 {
   "name": "relay",
-  "version": "0.1.0",
+  "version": "0.1.3",
   "description": "Lightweight OpenAI/Anthropic-compatible gateway for local llama.cpp models.",
   "type": "module",
   "scripts": {
