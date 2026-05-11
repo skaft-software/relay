@@ -742,6 +742,102 @@ test('bad JSON returns OpenAI-shaped 400', async () => {
   });
 });
 
+test('surrogate-safe JSON parsing accepts body with lone high surrogate', async () => {
+  // Simulate a string truncated mid-emoji: 📁 (U+1F4C1) is \uD83D\uDCC1.
+  // A .slice() at the wrong boundary leaves a orphaned high surrogate.
+  const orphanedHigh = '\uD83D';
+  const body = JSON.stringify({
+    model: 'test',
+    messages: [{ role: 'user', content: 'broken ' + orphanedHigh }],
+  });
+
+  await withUpstream(async (upstream) => {
+    upstream.handler = (_req, res, upstreamBody) => {
+      // The surrogate should have been replaced with U+FFFD before reaching upstream.
+      const content = (upstreamBody as any)?.messages?.[0]?.content;
+      assert.equal(typeof content, 'string');
+      assert.ok(!/[\uD800-\uDBFF]/.test(content), 'lone high surrogate not cleaned');
+      sendJson(res, 200, upstreamChat('test', 'ok'));
+    };
+    const res = await createApp(testConfig(upstream.url)).fetch('/v1/chat/completions', {
+      method: 'POST',
+      body,
+      headers: { 'content-type': 'application/json' },
+    });
+    assert.equal(res.status, 200, await res.text());
+  });
+});
+
+test('surrogate-safe JSON parsing accepts body with JSON-escaped lone surrogate', async () => {
+  // The raw JSON text contains the escape sequence \\ud83d (literal
+  // backslash-u-d-8-3-d), which JSON.parse() resolves into an actual
+  // lone surrogate inside the JS string.  Post-parse sanitisation must
+  // catch and replace it.
+  const bodyWithEscape = '{"model":"test","messages":[{"role":"user","content":"broken \\ud83d"}]}';
+
+  await withUpstream(async (upstream) => {
+    upstream.handler = (_req, res, upstreamBody) => {
+      const content = (upstreamBody as any)?.messages?.[0]?.content;
+      assert.equal(typeof content, 'string');
+      assert.ok(!/[\uD800-\uDBFF]/.test(content), 'escaped lone surrogate not cleaned post-parse');
+      sendJson(res, 200, upstreamChat('test', 'ok'));
+    };
+    const res = await createApp(testConfig(upstream.url)).fetch('/v1/chat/completions', {
+      method: 'POST',
+      body: bodyWithEscape,
+      headers: { 'content-type': 'application/json' },
+    });
+    assert.equal(res.status, 200, await res.text());
+  });
+});
+
+test('surrogate-safe JSON parsing preserves intact emoji', async () => {
+  // A complete surrogate pair (e.g. 📁 = \\uD83D\\uDCC1) must survive intact.
+  const emoji = '\u{1F4C1}'; // 📁
+  const body = JSON.stringify({
+    model: 'test',
+    messages: [{ role: 'user', content: 'hi ' + emoji }],
+  });
+
+  await withUpstream(async (upstream) => {
+    upstream.handler = (_req, res, upstreamBody) => {
+      const content = (upstreamBody as any)?.messages?.[0]?.content;
+      assert.equal(content, 'hi ' + emoji);
+      sendJson(res, 200, upstreamChat('test', 'ok'));
+    };
+    const res = await createApp(testConfig(upstream.url)).fetch('/v1/chat/completions', {
+      method: 'POST',
+      body,
+      headers: { 'content-type': 'application/json' },
+    });
+    assert.equal(res.status, 200, await res.text());
+  });
+});
+
+test('sanitized upstream payload contains no lone surrogate escapes', async () => {
+  // Regression: after parse-and-sanitise, the JSON serialised to the
+  // upstream must not contain \\uD83D-style escape sequences.
+  const bodyWithEscape = '{"model":"test","messages":[{"role":"user","content":"broken \\ud83d"}]}';
+
+  await withUpstream(async (upstream) => {
+    upstream.handler = async (req, res) => {
+      // Read the raw body bytes to inspect what Relay actually sent.
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(Buffer.from(chunk));
+      const rawText = Buffer.concat(chunks).toString('utf8');
+      // Must not contain the lone-surrogate escape sequence.
+      assert.ok(!/\\ud83d/i.test(rawText), 'lone surrogate escape leaked to upstream');
+      sendJson(res, 200, upstreamChat('test', 'ok'));
+    };
+    const res = await createApp(testConfig(upstream.url)).fetch('/v1/chat/completions', {
+      method: 'POST',
+      body: bodyWithEscape,
+      headers: { 'content-type': 'application/json' },
+    });
+    assert.equal(res.status, 200, await res.text());
+  });
+});
+
 test('upstream unavailable and timeout map to OpenAI-shaped gateway errors', async (t) => {
   await t.test('unavailable', async () => {
     await withUpstream(async (upstream) => {
