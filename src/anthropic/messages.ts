@@ -8,6 +8,7 @@ import { anthropicMessagesRequestToCanonical } from '../internal/anthropic-messa
 import { canonicalToUpstreamChatRequest } from '../internal/openai-chat.ts';
 import { canonicalToAnthropicMessage, upstreamChatCompletionToCanonical } from '../internal/response.ts';
 import { createLogger } from '../logger.ts';
+import { parseJson } from '../json.ts';
 import { detectProviderFormat, logInboundDiagnostics, logStreamingResponseDiagnostics, logUpstreamPayloadDiagnostics } from '../truncation-diagnostics.ts';
 
 type JsonObject = Record<string, any>;
@@ -78,8 +79,9 @@ function authorizeAnthropic(config: AppConfig, request: Request): void {
 
 async function readJson(request: Request, logLevel: string): Promise<JsonObject> {
   const logger = createLogger(logLevel);
+  const text = await request.text();
   try {
-    const body = await request.json();
+    const body = parseJson(text);
     if (!isObject(body)) throw new Error('not object');
     logInboundDiagnostics(logger, {
       route: new URL(request.url).pathname,
