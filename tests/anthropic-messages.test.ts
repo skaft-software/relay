@@ -20,7 +20,8 @@ test('POST /v1/messages maps Anthropic request to OpenAI chat and returns Anthro
         { role: 'system', content: 'Rules\nMore rules' },
         { role: 'user', content: 'hello' },
       ]);
-      assert.equal('thinking' in (body as any), false);
+      assert.equal('thinking' in (body as any), true);
+      assert.deepEqual((body as any).thinking, { type: 'enabled' });
       sendJson(res, 200, chatCompletion('llama', { role: 'assistant', content: 'hi' }, 'stop'));
     };
 
@@ -273,10 +274,11 @@ test('Anthropic unknown fields follow the configured field policy', async (t) =>
   });
 });
 
-test('Anthropic strips thinking permissively with warning', async () => {
+test('Anthropic passes through thinking field', async () => {
   await withUpstream(async (upstream) => {
     upstream.handler = async (_req, res, body) => {
-      assert.equal('thinking' in (body as any), false);
+      assert.equal('thinking' in (body as any), true);
+      assert.deepEqual((body as any).thinking, { type: 'enabled' });
       sendJson(res, 200, chatCompletion('llama', { role: 'assistant', content: 'ok' }, 'stop'));
     };
     const res = await createApp(testConfig(upstream.url)).fetch('/v1/messages', {
@@ -289,7 +291,6 @@ test('Anthropic strips thinking permissively with warning', async () => {
       },
     });
     assert.equal(res.status, 200, await res.text());
-    assert.equal(res.headers.get('x-relay-warning'), 'stripped_unsupported_fields');
   });
 });
 

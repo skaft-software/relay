@@ -35,9 +35,8 @@ const protocolPolicies: Record<ProtocolName, Record<string, FieldPolicyAction>> 
   anthropic_messages: {
     ...entries([
       'model', 'max_tokens', 'messages', 'system', 'temperature', 'top_p', 'top_k', 'stop_sequences',
-      'stream', 'tools', 'tool_choice', 'metadata',
+      'stream', 'tools', 'tool_choice', 'metadata', 'thinking',
     ], 'map'),
-    thinking: 'strip',
   },
   embeddings: entries([
     'model', 'input', 'encoding_format', 'dimensions', 'user',
