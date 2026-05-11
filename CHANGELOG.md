@@ -2,13 +2,20 @@
 
 ## Unreleased
 
-### Added
+## v0.1.3 - 2026-05-11
 
-- Cline context/token usage support: Relay now preserves and surfaces OpenAI/Anthropic usage metadata in streaming and non-streaming responses for compatible clients.
+### Changed
 
-### Notes
+- Anthropic Messages: `thinking` field is now stripped with a warning instead of passed through, since upstream llama.cpp backends do not support Anthropic's native thinking extension.
 
-- Exact token usage depends on upstream llama.cpp/OpenAI-compatible servers exposing usage counts.
+### Removed
+
+- `RELAY_THINKING_SUPPORTED` and `RELAY_THINKING_LEVELS` environment variables — superseded by the field-policy strip.
+
+### Fixed
+
+- `.gitignore` regression that stopped ignoring top-level `node_modules/`.
+- Removed dead `delete chat.thinking` in Anthropic request conversion (field policy already strips it).
 
 ## v0.1.1 - 2026-05-02
 
