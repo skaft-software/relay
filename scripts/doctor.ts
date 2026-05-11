@@ -11,7 +11,7 @@ const upstreamApiBaseUrl = config.upstreamBaseUrl.replace(/\/+$/, '');
 const upstreamRootUrl = upstreamApiBaseUrl.replace(/\/v1$/, '');
 const rows: Row[] = [];
 
-const envModel = process.env.MODEL ?? process.env.DEFAULT_MODEL ?? config.defaultModel;
+const envModel = (process.env.MODEL?.trim() || undefined) ?? (process.env.DEFAULT_MODEL?.trim() || undefined) ?? config.defaultModel;
 rows.push({
   name: 'relay env',
   status: 'PASS',
