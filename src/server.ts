@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 
 import { hasValidApiKey } from './auth.ts';
+import { parseJson } from './json.ts';
 import { CapabilityRegistry } from './capabilities.ts';
 import type { AppConfig } from './config.ts';
 import { errorResponse, GatewayError, invalidJsonError, jsonResponse, openAIError, requestTooLargeError, unsupportedEndpoint } from './errors.ts';
@@ -438,8 +439,9 @@ class AuthRateLimiter {
 }
 
 async function readJson(request: Request, logger: ReturnType<typeof createLogger>, path: string): Promise<unknown> {
+  const text = await request.text();
   try {
-    const body = await request.json();
+    const body = parseJson(text);
     logInboundDiagnostics(logger, {
       route: path,
       provider_format: detectProviderFormat(path),
