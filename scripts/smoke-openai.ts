@@ -19,7 +19,7 @@ async function checkChat(): Promise<void> {
     body: JSON.stringify({
       model,
       messages: [{ role: 'user', content: 'Reply with OK' }],
-      max_tokens: 16,
+      max_tokens: 32768,
     }),
   });
 
