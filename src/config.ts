@@ -19,6 +19,8 @@ export type AppConfig = {
   modelProfile: RelayModelProfileId;
   reasoningMode: RelayReasoningMode;
   toolMode: RelayToolMode;
+  thinkingSupported?: boolean;
+  thinkingLevels?: string[];
   observabilityEnabled: boolean;
   logPrompts: boolean;
   requestHistoryLimit: number;
@@ -75,6 +77,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     modelProfile: readModelProfile(env.RELAY_MODEL_PROFILE),
     reasoningMode: readReasoningMode(env.RELAY_REASONING_MODE),
     toolMode: readToolMode(env.RELAY_TOOL_MODE),
+    thinkingSupported: readBoolean(env.RELAY_THINKING_SUPPORTED, false),
+    thinkingLevels: readList(env.RELAY_THINKING_LEVELS, ['on', 'off']),
     observabilityEnabled: readBoolean(env.RELAY_OBSERVABILITY_ENABLED, true),
     logPrompts: readBoolean(env.RELAY_LOG_PROMPTS, false),
     requestHistoryLimit: readInteger(env.RELAY_REQUEST_HISTORY_LIMIT, 100, 'RELAY_REQUEST_HISTORY_LIMIT'),
@@ -131,6 +135,12 @@ function readBoolean(value: string | undefined, fallback: boolean): boolean {
   const raw = readOptional(value);
   if (!raw) return fallback;
   return raw.toLowerCase() === 'true';
+}
+
+function readList(value: string | undefined, fallback: string[]): string[] {
+  const raw = readOptional(value);
+  if (!raw) return fallback;
+  return raw.split(',').map((s) => s.trim()).filter(Boolean);
 }
 
 function readUnknownFieldPolicy(value: string | undefined): UnknownFieldPolicy {

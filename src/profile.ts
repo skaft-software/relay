@@ -13,6 +13,10 @@ export type RelayModelProfile = {
     knownFields?: string[];
     stripPatterns?: string[];
   };
+  thinking?: {
+    supported: boolean;
+    levels: string[];
+  };
   tools: {
     defaultMode: RelayToolMode;
     supportsParallelToolCalls?: boolean | 'unknown';
@@ -140,11 +144,16 @@ export function getModelProfile(config: AppConfig): RelayModelProfile {
 
 export function activeProfile(config: AppConfig) {
   const profile = getModelProfile(config);
+  const thinking: { supported: boolean; levels: string[] } =
+    config.thinkingSupported && config.thinkingLevels?.length
+      ? { supported: true, levels: config.thinkingLevels }
+      : profile.thinking ?? { supported: false, levels: ['on', 'off'] };
   return {
     id: profile.id,
     name: profile.displayName,
     reasoningMode: config.reasoningMode,
     toolMode: config.toolMode,
+    thinking,
     expectedContext: profile.expectedContext,
     recommendedSampling: {
       ...(profile.sampling ?? {}),

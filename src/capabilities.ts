@@ -39,6 +39,7 @@ export type RelayCapabilities = {
     id: string;
     name: string;
     reasoningMode: string;
+    thinking: { supported: boolean; levels: string[] };
     toolMode: string;
     expectedContext?: {
       recommended: string;
