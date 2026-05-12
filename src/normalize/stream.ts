@@ -185,6 +185,10 @@ function splitFrames(buffer: string): { complete: string[]; remainder: string } 
       complete.push(buffer.slice(start, index));
       start = index + 2;
       index += 1;
+    } else if (buffer[index] === '\r' && buffer[index + 1] === '\n' && buffer[index + 2] === '\r' && buffer[index + 3] === '\n') {
+      complete.push(buffer.slice(start, index));
+      start = index + 4;
+      index += 3;
     }
   }
   return {

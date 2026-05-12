@@ -10,7 +10,8 @@ export function redactText(value: string): string {
     .replace(/(cf-access-client-id\s*[:=]\s*)([^\s,;]+)/gi, `$1${REDACTED}`)
     .replace(/(cf-access-client-secret\s*[:=]\s*)([^\s,;]+)/gi, `$1${REDACTED}`)
     .replace(/((?:openai|anthropic|relay)?_?api_?key\s*[:=]\s*)([^\s,;]+)/gi, `$1${REDACTED}`)
-    .replace(/(cookie\s*[:=]\s*)([^\n]+)/gi, `$1${REDACTED}`);
+    .replace(/(cookie\s*[:=]\s*)([^\n]+)/gi, `$1${REDACTED}`)
+    .replace(/(\/(?:[\w.-]+\/)+[\w.-]{3,})/g, '[PATH]');
 }
 
 function redactValue(value: unknown): unknown {

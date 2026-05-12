@@ -177,6 +177,9 @@ function normalizeImageBlock(block: { source: { media_type?: string; data?: stri
   }
   const mediaType = typeof block.source.media_type === 'string' ? block.source.media_type : 'image/png';
   const data = typeof block.source.data === 'string' ? block.source.data : '';
+  if (data.length > 11_000_000) {
+    throw new GatewayError(413, 'Image data exceeds maximum size (8MB decoded)');
+  }
   return { type: 'image_url', image_url: { url: `data:${mediaType};base64,${data}` } };
 }
 

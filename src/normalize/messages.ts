@@ -7,6 +7,9 @@ export function normalizeMessages(messages: unknown, config: AppConfig): JsonObj
   if (!Array.isArray(messages)) {
     throw invalidRequestError('messages must be an array');
   }
+  if (messages.length > 10000) {
+    throw new GatewayError(400, 'Too many messages (max 10000)');
+  }
   return messages.map((raw, index) => normalizeMessage(raw, index, config));
 }
 
@@ -34,6 +37,9 @@ function normalizeContent(content: unknown, message: JsonObject, config: AppConf
   if (typeof content === 'string' || content === null || content === undefined) return content;
   if (!Array.isArray(content)) {
     throw invalidRequestError('message content must be a string, null, or content part array');
+  }
+  if (content.length > 100) {
+    throw new GatewayError(400, 'Too many content parts (max 100)');
   }
   const text: string[] = [];
   let hasPassthroughPart = false;

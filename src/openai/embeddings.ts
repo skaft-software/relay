@@ -1,11 +1,11 @@
 import type { AppConfig } from '../config.ts';
 import { embeddingsUnsupportedError, GatewayError, invalidRequestError, jsonResponse, rerankUnsupportedError, upstreamError, upstreamError as upstreamGatewayError } from '../errors.ts';
 import { applyFieldPolicy, withFieldWarning } from '../field-policy.ts';
-import { upstreamFetch, upstreamHttpError, upstreamJson } from '../upstream/llama.ts';
+import { upstreamFetch, upstreamHttpError, upstreamJson, readLimitedJson } from '../upstream/llama.ts';
 
 type JsonObject = Record<string, any>;
 
-export async function createEmbedding(config: AppConfig, body: unknown): Promise<Response> {
+export async function createEmbedding(config: AppConfig, body: unknown, externalSignal?: AbortSignal): Promise<Response> {
   if (!isObject(body)) throw invalidRequestError('JSON body must be an object');
   const { body: normalized, strippedFields } = applyFieldPolicy('embeddings', body, config);
   validateEmbeddingRequest(normalized);
@@ -15,10 +15,10 @@ export async function createEmbedding(config: AppConfig, body: unknown): Promise
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(normalized),
-    });
+    }, externalSignal);
     if (upstream.response.status === 404 || upstream.response.status === 501) throw embeddingsUnsupportedError();
     if (!upstream.response.ok) throw await upstreamHttpError(upstream.response, config);
-    const payload = await upstream.response.json().catch(() => {
+    const payload = await readLimitedJson(upstream.response, config.maxUpstreamResponseBytes).catch(() => {
       throw upstreamError('bad_response', 'Upstream returned invalid embeddings JSON');
     });
     return withFieldWarning(jsonResponse(normalizeEmbeddingResponse(payload, normalized.model)), strippedFields, config);
@@ -27,7 +27,7 @@ export async function createEmbedding(config: AppConfig, body: unknown): Promise
   }
 }
 
-export async function createRerank(config: AppConfig, body: unknown): Promise<Response> {
+export async function createRerank(config: AppConfig, body: unknown, externalSignal?: AbortSignal): Promise<Response> {
   if (!isObject(body)) throw invalidRequestError('JSON body must be an object');
   const { body: normalized, strippedFields } = applyFieldPolicy('rerank', body, config);
   validateRerankRequest(normalized);
@@ -40,10 +40,10 @@ export async function createRerank(config: AppConfig, body: unknown): Promise<Re
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(normalized),
-    });
+    }, externalSignal);
     if (upstream.response.status === 404 || upstream.response.status === 501) throw rerankUnsupportedError();
     if (!upstream.response.ok) throw await upstreamHttpError(upstream.response, config);
-    const payload = await upstream.response.json().catch(() => {
+    const payload = await readLimitedJson(upstream.response, config.maxUpstreamResponseBytes).catch(() => {
       throw upstreamGatewayError('bad_response', 'Upstream returned invalid rerank JSON');
     });
     return withFieldWarning(jsonResponse(normalizeRerankResponse(payload, normalized)), strippedFields, config);

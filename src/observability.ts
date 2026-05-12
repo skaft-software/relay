@@ -281,7 +281,6 @@ function summarizeRawBody(raw: string, contentType: string | null): unknown {
   if (!raw) return null;
   return {
     kind: (contentType ?? '').includes('application/json') ? 'invalid_json' : 'raw',
-    preview: raw.slice(0, 200),
     bytes: new TextEncoder().encode(raw).length,
   };
 }

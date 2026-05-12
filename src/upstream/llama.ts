@@ -6,35 +6,35 @@ export type UpstreamResult = {
   response: Response;
 };
 
-export async function upstreamJson(config: AppConfig, path: string, init: RequestInit = {}): Promise<unknown> {
+export async function upstreamJson(config: AppConfig, path: string, init: RequestInit = {}, externalSignal?: AbortSignal): Promise<unknown> {
   const result = await upstreamFetch(config, path, {
     ...init,
     headers: {
       accept: 'application/json',
       ...(init.headers ?? {}),
     },
-  });
+  }, externalSignal);
   if (!result.response.ok) {
     throw await upstreamHttpError(result.response, config);
   }
-  try {
-    return await result.response.json();
-  } catch {
-    throw upstreamError('bad_response', 'Upstream returned invalid JSON');
-  }
+  return readLimitedJson(result.response, config.maxUpstreamResponseBytes);
 }
 
-export async function upstreamFetch(config: AppConfig, path: string, init: RequestInit = {}): Promise<UpstreamResult> {
+export async function upstreamFetch(config: AppConfig, path: string, init: RequestInit = {}, externalSignal?: AbortSignal): Promise<UpstreamResult> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), config.requestTimeoutMs);
+  const signal = externalSignal ? AbortSignal.any([controller.signal, externalSignal]) : controller.signal;
   try {
     const response = await fetch(upstreamUrl(config.upstreamBaseUrl, path), {
       ...init,
-      signal: controller.signal,
+      signal,
     });
     return { response };
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') {
+      if (externalSignal?.aborted) {
+        throw upstreamError('unavailable', 'Request cancelled by client disconnect');
+      }
       throw upstreamError('timeout', 'Upstream llama server timed out');
     }
     throw upstreamError('unavailable', 'Upstream llama server is unavailable');
@@ -54,7 +54,7 @@ export async function upstreamHttpError(response: Response, config?: AppConfig) 
       response.status,
     );
   }
-  const detail = await readUpstreamErrorDetail(response);
+  const detail = await readUpstreamErrorDetail(response, config?.maxUpstreamResponseBytes ?? 16_777_216);
   return new GatewayError(
     502,
     detail ? truncateAndRedact(detail) : `Upstream llama server returned HTTP ${response.status}`,
@@ -65,6 +65,36 @@ export async function upstreamHttpError(response: Response, config?: AppConfig) 
   );
 }
 
+export async function readLimitedText(response: Response, maxBytes: number): Promise<string> {
+  const reader = response.body?.getReader();
+  if (!reader) return '';
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        throw upstreamError('bad_response', `Upstream response exceeds maximum size of ${maxBytes} bytes`);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return new TextDecoder().decode(Buffer.concat(chunks.map((c) => Buffer.from(c))));
+}
+
+export async function readLimitedJson(response: Response, maxBytes: number): Promise<unknown> {
+  const text = await readLimitedText(response, maxBytes);
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw upstreamError('bad_response', 'Upstream returned invalid JSON');
+  }
+}
+
 function upstreamUrl(baseUrl: string, path: string): string {
   if (baseUrl.endsWith('/v1') && path.startsWith('/v1/')) {
     return `${baseUrl}${path.slice('/v1'.length)}`;
@@ -72,12 +102,12 @@ function upstreamUrl(baseUrl: string, path: string): string {
   return `${baseUrl}${path}`;
 }
 
-async function readUpstreamErrorDetail(response: Response): Promise<string | undefined> {
+async function readUpstreamErrorDetail(response: Response, maxBytes: number): Promise<string | undefined> {
   const contentType = response.headers.get('content-type') ?? '';
 
   if (contentType.includes('application/json')) {
     try {
-      const payload = await response.json();
+      const payload = await readLimitedJson(response, maxBytes);
       const message = extractMessage(payload);
       if (message) return message;
     } catch {
@@ -86,7 +116,7 @@ async function readUpstreamErrorDetail(response: Response): Promise<string | und
   }
 
   try {
-    const text = (await response.text()).trim();
+    const text = (await readLimitedText(response, maxBytes)).trim();
     return text ? text.slice(0, 500) : undefined;
   } catch {
     return undefined;

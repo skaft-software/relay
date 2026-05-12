@@ -147,6 +147,9 @@ function testConfig(upstreamBaseUrl: string): AppConfig {
     observabilityEnabled: true,
     logPrompts: false,
     requestHistoryLimit: 100,
+    maxStoreEntries: 1000,
+    trustProxy: false,
+    maxUpstreamResponseBytes: 16_777_216,
   };
 }
 
