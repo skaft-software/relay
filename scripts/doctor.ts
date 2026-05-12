@@ -90,6 +90,8 @@ async function checkOpenAIChat(name: string, model: string): Promise<void> {
       body: JSON.stringify({
         model,
         messages: [{ role: 'user', content: 'Reply with OK' }],
+        stop: ['OK', 'ok', '
+'],
       }),
     });
     const body = await response.json().catch(() => undefined);
@@ -116,6 +118,8 @@ async function checkOpenAIStream(name: string, model: string): Promise<void> {
         model,
         messages: [{ role: 'user', content: 'Reply with OK' }],
         stream: true,
+        stop: ['OK', 'ok', '
+'],
       }),
     });
     if (!response.ok || !response.body) {
@@ -156,7 +160,9 @@ async function checkAnthropicChat(name: string, model: string): Promise<void> {
       },
       body: JSON.stringify({
         model,
-        max_tokens: 1024,
+        max_tokens: 128,
+        stop_sequences: ['OK', 'ok', '
+'],
         messages: [{ role: 'user', content: 'Reply with OK' }],
       }),
     });
