@@ -81,6 +81,8 @@ async function checkJson(
 
 async function checkOpenAIChat(name: string, model: string): Promise<void> {
   try {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 45_000);
     const response = await fetch(`${relayBaseUrl}/v1/chat/completions`, {
       method: 'POST',
       headers: {
@@ -90,9 +92,12 @@ async function checkOpenAIChat(name: string, model: string): Promise<void> {
       body: JSON.stringify({
         model,
         messages: [{ role: 'user', content: 'Reply with OK' }],
+        max_tokens: 64,
         stop: ['OK', 'ok'],
       }),
+      signal: controller.signal,
     });
+    clearTimeout(t);
     const body = await response.json().catch(() => undefined);
     if (!response.ok) {
       rows.push({ name, status: 'FAIL', detail: `HTTP ${response.status} ${summarizeFailure(body)}` });
@@ -106,6 +111,8 @@ async function checkOpenAIChat(name: string, model: string): Promise<void> {
 
 async function checkOpenAIStream(name: string, model: string): Promise<void> {
   try {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 45_000);
     const response = await fetch(`${relayBaseUrl}/v1/chat/completions`, {
       method: 'POST',
       headers: {
@@ -116,10 +123,13 @@ async function checkOpenAIStream(name: string, model: string): Promise<void> {
       body: JSON.stringify({
         model,
         messages: [{ role: 'user', content: 'Reply with OK' }],
+        max_tokens: 64,
         stream: true,
         stop: ['OK', 'ok'],
       }),
+      signal: controller.signal,
     });
+    clearTimeout(t);
     if (!response.ok || !response.body) {
       const body = await response.text().catch(() => '');
       rows.push({ name, status: 'FAIL', detail: `HTTP ${response.status} ${summarizeFailure(body)}` });
@@ -149,6 +159,8 @@ async function checkOpenAIStream(name: string, model: string): Promise<void> {
 
 async function checkAnthropicChat(name: string, model: string): Promise<void> {
   try {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 45_000);
     const response = await fetch(`${relayBaseUrl}/v1/messages`, {
       method: 'POST',
       headers: {
@@ -158,11 +170,13 @@ async function checkAnthropicChat(name: string, model: string): Promise<void> {
       },
       body: JSON.stringify({
         model,
-        max_tokens: 128,
+        max_tokens: 64,
         stop_sequences: ['OK', 'ok'],
         messages: [{ role: 'user', content: 'Reply with OK' }],
       }),
+      signal: controller.signal,
     });
+    clearTimeout(t);
     const body = await response.json().catch(() => undefined);
     if (!response.ok) {
       if (response.status === 404 || summarizeFailure(body).toLowerCase().includes('not supported')) {
