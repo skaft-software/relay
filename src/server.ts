@@ -706,8 +706,8 @@ export function createApp(config: AppConfig): App {
         const requestId =
           nodeHeaderValue(req.headers["x-request-id"]) ?? crypto.randomUUID();
         const abortController = new AbortController();
-        const onClose = () => abortController.abort();
-        req.once('close', onClose);
+        const onClose = () => { if (!res.writableEnded) abortController.abort(); };
+        res.once('close', onClose);
         try {
           const response = await handler(
             await nodeRequestToWebRequest(req, config),
@@ -724,7 +724,7 @@ export function createApp(config: AppConfig): App {
             withRelayHeaders(errorResponse(error), requestId, config),
           );
         } finally {
-          req.removeListener('close', onClose);
+          res.removeListener('close', onClose);
         }
       });
       await new Promise<void>((resolve) =>
