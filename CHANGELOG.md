@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.1.4 - 2026-05-12
+
+### Added
+
+- Thinking/brainstorming level metadata exposed via OpenAI-compatible `x-relay-*` headers and Anthropic thinking field passthrough sizing.
+- Three.js animated protocol bridge on landing page visualizing the fallback pipeline.
+
+### Changed
+
+- Security hardening pass: request body size limits, depth-aware recursion guards, signal propagation, CORS allow-list tightening, host validation, and auth header stripping.
+- JSON parsing now repairs lone UTF-16 surrogates before attempting deserialization (surrogate-safe `parseJson`).
+- Anthropic `max_tokens` budget now accounts for thinking token reservation; hard errors surface cleanly instead of silent truncation.
+- Post-hardening tidy: off-by-one depth bounds corrected, record deduplication fixed, and upstream forwarding stabilized.
+
+### Fixed
+
+- Allowed hosts validation edge case.
+- Parsing failures from surrogate code points injected by certain tokenizers.
+
+### Security
+
+- Hardened against DoS vectors via configurable payload limits, recursion depth guards, and origin scoping.
+- Auth secrets no longer leak through error paths or CORS headers.
+
 ## Unreleased
 
 ## v0.1.3 - 2026-05-11
