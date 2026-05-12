@@ -52,7 +52,7 @@ export function normalizeTools(body: JsonObject): void {
 }
 
 function validateSchemaSize(schema: unknown, maxKeys: number, maxDepth: number, depth = 0, keyCount: { value: number } = { value: 0 }): void {
-  if (depth > maxDepth) {
+  if (depth >= maxDepth) {
     throw new GatewayError(400, 'Tool schema exceeds maximum nesting depth (32)', 'invalid_request_error', 'invalid_tool_schema');
   }
   if (!isObject(schema)) return;

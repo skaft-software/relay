@@ -97,7 +97,10 @@ export function createApp(config: AppConfig): App {
         hostHeader !== bindHost.toLowerCase() &&
         !isAllowedHost
       ) {
-        return new Response("Bad Request", { status: 400 });
+        const rejectId = crypto.randomUUID();
+        const rejectRes = new Response("Bad Request", { status: 400 });
+        rejectRes.headers.set("x-request-id", rejectId);
+        return rejectRes;
       }
     }
     const requestId =
@@ -660,10 +663,6 @@ export function createApp(config: AppConfig): App {
             failure_classification: failureClassification,
           },
         };
-        if (streaming) {
-          observability.record(summary);
-          return;
-        }
         observability.record(summary);
       } catch (err) {
         logger.error("observability record failed", {
