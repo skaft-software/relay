@@ -31,6 +31,9 @@ export type AppConfig = {
   exposeUpstreamErrors?: boolean;
   observabilityCaptureBody?: boolean;
   allowedHosts?: string[];
+  maxStoreEntries: number;
+  trustProxy: boolean;
+  maxUpstreamResponseBytes: number;
 };
 
 export type UnknownFieldPolicy = 'pass_through' | 'strip' | 'reject';
@@ -90,6 +93,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     exposeUpstreamErrors: readBoolean(env.RELAY_EXPOSE_UPSTREAM_ERRORS, false),
     observabilityCaptureBody: readBoolean(env.RELAY_OBSERVABILITY_CAPTURE_BODY, false),
     allowedHosts: readList(env.RELAY_ALLOWED_HOSTS, []),
+    maxStoreEntries: readInteger(env.MAX_STORE_ENTRIES, 1000, 'MAX_STORE_ENTRIES'),
+    trustProxy: readBoolean(env.TRUST_PROXY, false),
+    maxUpstreamResponseBytes: readInteger(env.MAX_UPSTREAM_RESPONSE_BYTES, 16_777_216, 'MAX_UPSTREAM_RESPONSE_BYTES'),
   };
 }
 

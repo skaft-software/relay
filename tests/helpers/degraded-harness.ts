@@ -70,6 +70,9 @@ export function createTestConfig(upstreamBaseUrl: string, overrides: Partial<App
     observabilityEnabled: true,
     logPrompts: false,
     requestHistoryLimit: 100,
+    maxStoreEntries: 1000,
+    trustProxy: false,
+    maxUpstreamResponseBytes: 16_777_216,
     ...overrides,
   };
 }

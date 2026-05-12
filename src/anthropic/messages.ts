@@ -3,7 +3,7 @@ import type { AppConfig } from '../config.ts';
 import { anthropicError, GatewayError, invalidJsonError, jsonResponse, missingRequiredFieldError, unsupportedCapabilityError, upstreamError } from '../errors.ts';
 import { applyFieldPolicy, withFieldWarning } from '../field-policy.ts';
 import { encodeSSE, parseSSEJson, parseSSEStream, streamHeaders } from '../normalize/stream.ts';
-import { upstreamFetch, upstreamHttpError } from '../upstream/llama.ts';
+import { upstreamFetch, upstreamHttpError, readLimitedText } from '../upstream/llama.ts';
 import { anthropicMessagesRequestToCanonical } from '../internal/anthropic-messages.ts';
 import { canonicalToUpstreamChatRequest } from '../internal/openai-chat.ts';
 import { canonicalToAnthropicMessage, upstreamChatCompletionToCanonical } from '../internal/response.ts';
@@ -13,7 +13,7 @@ import { detectProviderFormat, logInboundDiagnostics, logStreamingResponseDiagno
 
 type JsonObject = Record<string, any>;
 
-export async function handleAnthropicMessages(config: AppConfig, request: Request): Promise<Response> {
+export async function handleAnthropicMessages(config: AppConfig, request: Request, externalSignal?: AbortSignal): Promise<Response> {
   const logger = createLogger(config.logLevel);
   try {
     authorizeAnthropic(config, request);
@@ -21,14 +21,14 @@ export async function handleAnthropicMessages(config: AppConfig, request: Reques
     const { body, strippedFields } = applyFieldPolicy('anthropic_messages', rawBody, config);
     const chatRequest = anthropicRequestToChat(body, config);
     logUpstreamPayloadDiagnostics(logger, { route: '/v1/messages', upstream_route: '/v1/chat/completions', payload: chatRequest });
-    if (body.stream === true) return withFieldWarning(await streamAnthropicMessage(config, chatRequest), strippedFields, config);
+    if (body.stream === true) return withFieldWarning(await streamAnthropicMessage(config, chatRequest, externalSignal), strippedFields, config);
     const upstreamRes = await upstreamFetch(config, '/v1/chat/completions', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(chatRequest),
-    });
+    }, externalSignal);
     if (!upstreamRes.response.ok) throw await upstreamHttpError(upstreamRes.response, config);
-    const upstreamText = await upstreamRes.response.text();
+    const upstreamText = await readLimitedText(upstreamRes.response, config.maxUpstreamResponseBytes);
     let chat: unknown;
     try {
       chat = JSON.parse(upstreamText);
@@ -43,7 +43,7 @@ export async function handleAnthropicMessages(config: AppConfig, request: Reques
   }
 }
 
-export async function handleAnthropicCountTokens(config: AppConfig, request: Request): Promise<Response> {
+export async function handleAnthropicCountTokens(config: AppConfig, request: Request, externalSignal?: AbortSignal): Promise<Response> {
   try {
     authorizeAnthropic(config, request);
     const rawBody = await readJson(request, config.logLevel);
@@ -53,7 +53,7 @@ export async function handleAnthropicCountTokens(config: AppConfig, request: Req
       method: 'POST',
       headers: { 'content-type': 'application/json', accept: 'application/json' },
       body: JSON.stringify(tokenizerRequest),
-    });
+    }, externalSignal);
     if (upstream.response.status === 404 || upstream.response.status === 501) {
       throw unsupportedCapabilityError('Token counting is not supported by this local llama.cpp backend');
     }
@@ -222,13 +222,13 @@ function chatCompletionToAnthropicMessage(chat: unknown, requestedModel: unknown
   return canonicalToAnthropicMessage(canonical);
 }
 
-async function streamAnthropicMessage(config: AppConfig, chatRequest: JsonObject): Promise<Response> {
+async function streamAnthropicMessage(config: AppConfig, chatRequest: JsonObject, externalSignal?: AbortSignal): Promise<Response> {
   const logger = createLogger(config.logLevel);
   const upstream = await upstreamFetch(config, '/v1/chat/completions', {
     method: 'POST',
     headers: { accept: 'text/event-stream', 'content-type': 'application/json' },
     body: JSON.stringify(chatRequest),
-  });
+  }, externalSignal);
   if (!upstream.response.ok || !upstream.response.body) {
     throw upstream.response.body ? await upstreamHttpError(upstream.response, config) : upstreamError('bad_response', 'Upstream returned an empty stream');
   }
@@ -289,6 +289,7 @@ async function streamAnthropicMessage(config: AppConfig, chatRequest: JsonObject
       let stopReason = 'end_turn';
       let failed = false;
       let outputTokens = startUsage.output_tokens;
+      let lastToolIndex = -1;
       try {
         for await (const frame of iterateFrames(firstFrame, iterator)) {
           upstreamEvents += 1;
@@ -318,7 +319,15 @@ async function streamAnthropicMessage(config: AppConfig, chatRequest: JsonObject
           }
           for (const toolCall of choice?.delta?.tool_calls ?? []) {
             const fn = toolCall.function ?? {};
-            const blockIndex = (textStarted ? 1 : 0) + (typeof toolCall.index === 'number' ? toolCall.index : 0);
+            const rawIndex = typeof toolCall.index === 'number' ? toolCall.index : 0;
+            if (rawIndex < 0) {
+              throw upstreamError('bad_response', 'Upstream returned negative tool_call index');
+            }
+            if (rawIndex < lastToolIndex) {
+              throw upstreamError('bad_response', 'Upstream returned out-of-order tool_call index');
+            }
+            lastToolIndex = rawIndex;
+            const blockIndex = (textStarted ? 1 : 0) + rawIndex;
             if (!startedBlocks.has(blockIndex) && toolCall.id && fn.name) {
               startedBlocks.add(blockIndex);
               enqueue(controller, encodeSSE({ event: 'content_block_start', data: {
@@ -446,6 +455,9 @@ function normalizeImageBlock(block: JsonObject, config: AppConfig): JsonObject {
   }
   const source = isObject(block.source) ? block.source : {};
   if (source.type === 'base64' && typeof source.media_type === 'string' && typeof source.data === 'string') {
+    if (source.data.length > 11_000_000) {
+      throw new GatewayError(413, 'Image data exceeds maximum size (8MB decoded)');
+    }
     return {
       type: 'image_url',
       image_url: { url: `data:${source.media_type};base64,${source.data}` },

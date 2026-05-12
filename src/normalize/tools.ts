@@ -11,8 +11,25 @@ export function normalizeTools(body: JsonObject): void {
   }
 
   if (Array.isArray(body.tools)) {
+    if (body.tools.length > 100) {
+      throw new GatewayError(400, 'Too many tools (max 100)');
+    }
     body.tools = body.tools.map(normalizeFunctionToolDefinition);
     body.tools.forEach(validateFunctionTool);
+    const names = new Set<string>();
+    for (const tool of body.tools) {
+      if (isObject(tool) && isObject(tool.function) && typeof tool.function.name === 'string') {
+        if (names.has(tool.function.name)) {
+          throw new GatewayError(400, `Duplicate tool name: ${tool.function.name}`);
+        }
+        names.add(tool.function.name);
+      }
+    }
+    for (const tool of body.tools) {
+      if (isObject(tool) && isObject(tool.function) && isObject(tool.function.parameters)) {
+        validateSchemaSize(tool.function.parameters, 10000, 32);
+      }
+    }
   }
 
   if (body.function_call !== undefined && body.tool_choice === undefined) {
@@ -32,6 +49,20 @@ export function normalizeTools(body: JsonObject): void {
 
   delete body.functions;
   delete body.function_call;
+}
+
+function validateSchemaSize(schema: unknown, maxKeys: number, maxDepth: number, depth = 0, keyCount: { value: number } = { value: 0 }): void {
+  if (depth > maxDepth) {
+    throw new GatewayError(400, 'Tool schema exceeds maximum nesting depth (32)', 'invalid_request_error', 'invalid_tool_schema');
+  }
+  if (!isObject(schema)) return;
+  for (const key of Object.keys(schema)) {
+    keyCount.value++;
+    if (keyCount.value > maxKeys) {
+      throw new GatewayError(400, 'Tool schema exceeds maximum key count (10000)', 'invalid_request_error', 'invalid_tool_schema');
+    }
+    validateSchemaSize((schema as Record<string, unknown>)[key], maxKeys, maxDepth, depth + 1, keyCount);
+  }
 }
 
 function normalizeFunctionToolDefinition(tool: unknown): unknown {

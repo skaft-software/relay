@@ -67,11 +67,11 @@ export class CapabilityRegistry {
     return structuredClone(this.capabilities);
   }
 
-  async refresh(): Promise<RelayCapabilities> {
+  async refresh(externalSignal?: AbortSignal): Promise<RelayCapabilities> {
     const next = initialCapabilities(this.config);
-    const modelProbe = await this.probe('/v1/models', { headers: { accept: 'application/json' } });
+    const modelProbe = await this.probe('/v1/models', { headers: { accept: 'application/json' } }, externalSignal);
     if (modelProbe.reachable) next.upstream.reachable = true;
-    next.upstream.health = await this.probeHealth();
+    next.upstream.health = await this.probeHealth(externalSignal);
     if (modelProbe.response?.ok) {
       next.models.list = 'supported';
       const body = await modelProbe.response.json().catch(() => undefined);
@@ -87,7 +87,7 @@ export class CapabilityRegistry {
         messages: [{ role: 'user', content: 'ping' }],
         max_tokens: 1,
       }),
-    });
+    }, externalSignal);
     if (chatProbe.reachable) next.upstream.reachable = true;
     next.features.chatCompletions = statusFromProbe(chatProbe);
     next.features.streaming = chatProbe.response?.ok ? 'supported' : 'unknown';
@@ -96,7 +96,7 @@ export class CapabilityRegistry {
       method: 'POST',
       headers: { 'content-type': 'application/json', accept: 'application/json' },
       body: JSON.stringify({ content: 'ping' }),
-    });
+    }, externalSignal);
     if (tokenizeProbe.reachable) next.upstream.reachable = true;
     next.features.tokenization = statusFromProbe(tokenizeProbe);
     next.endpoints.tokenCounting = statusFromProbe(tokenizeProbe);
@@ -108,7 +108,7 @@ export class CapabilityRegistry {
         model: next.models.currentModel ?? this.config.defaultModel ?? 'local',
         input: 'ping',
       }),
-    });
+    }, externalSignal);
     if (embeddingsProbe.reachable) next.upstream.reachable = true;
     next.endpoints.embeddings = statusFromProbe(embeddingsProbe);
 
@@ -121,7 +121,7 @@ export class CapabilityRegistry {
         documents: ['ping'],
         top_n: 1,
       }),
-    });
+    }, externalSignal);
     if (rerankProbe.reachable) next.upstream.reachable = true;
     next.endpoints.rerank = statusFromProbe(rerankProbe);
 
@@ -129,13 +129,14 @@ export class CapabilityRegistry {
     return this.get();
   }
 
-  private async probe(path: string, init: RequestInit): Promise<{ response?: Response; reachable: boolean }> {
+  private async probe(path: string, init: RequestInit, externalSignal?: AbortSignal): Promise<{ response?: Response; reachable: boolean }> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.config.probeTimeoutMs ?? 3000);
+    const signal = externalSignal ? AbortSignal.any([controller.signal, externalSignal]) : controller.signal;
     try {
       const response = await fetch(upstreamUrl(this.config.upstreamBaseUrl, path), {
         ...init,
-        signal: controller.signal,
+        signal,
       });
       return {
         response,
@@ -148,8 +149,8 @@ export class CapabilityRegistry {
     }
   }
 
-  private async probeHealth(): Promise<RelayCapabilityStatus> {
-    const probe = await this.probe('/health', { headers: { accept: 'application/json' } });
+  private async probeHealth(externalSignal?: AbortSignal): Promise<RelayCapabilityStatus> {
+    const probe = await this.probe('/health', { headers: { accept: 'application/json' } }, externalSignal);
     if (probe.reachable && probe.response?.ok) return 'supported';
     if (probe.response?.status === 404) return 'unknown';
     return probe.reachable ? 'unknown' : 'unknown';

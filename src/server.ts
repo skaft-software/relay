@@ -59,24 +59,25 @@ type AppFetchInit = Omit<RequestInit, "body"> & { body?: unknown };
 
 export type App = {
   fetch: (path: string, init?: AppFetchInit) => Promise<Response>;
-  handler: (request: Request) => Promise<Response>;
+  handler: (request: Request, externalSignal?: AbortSignal) => Promise<Response>;
   listen: () => Promise<{ close: () => Promise<void>; url: string }>;
 };
 
 export function createApp(config: AppConfig): App {
   const logger = createLogger(config.logLevel);
-  const store = new CompletionStore();
-  const responseStore = new ResponseStore();
+  const store = new CompletionStore(config.maxStoreEntries);
+  const responseStore = new ResponseStore(config.maxStoreEntries);
   const capabilities = new CapabilityRegistry(config);
   const observability = new ObservabilityStore(config);
   const authRateLimiter = new AuthRateLimiter(
     config.rateLimitAuthMax ?? 20,
     config.rateLimitAuthWindowMs ?? 60_000,
   );
+  const refreshRateLimiter = new AuthRateLimiter(1, 60_000);
 
   const bindHost = `${config.host}:${config.port}`;
 
-  async function handler(request: Request): Promise<Response> {
+  async function handler(request: Request, externalSignal?: AbortSignal): Promise<Response> {
     if (config.host !== "0.0.0.0" && config.host !== "::") {
       const requestUrl = new URL(request.url);
       const hostHeader = (
@@ -127,6 +128,24 @@ export function createApp(config: AppConfig): App {
         );
       }
       if (request.method === "GET" && path === "/") {
+        if (config.apiKey) {
+          const relayAuthError = authorizeRelay(
+            config,
+            request,
+            path,
+            authRateLimiter,
+          );
+          if (relayAuthError)
+            return finalizeResponse(
+              relayAuthError,
+              requestId,
+              path,
+              request.method,
+              startedAt,
+              startedAtMs,
+              requestModel,
+            );
+        }
         response = jsonResponse({
           object: "gateway",
           name: "relay",
@@ -139,8 +158,6 @@ export function createApp(config: AppConfig): App {
             "/v1/messages",
             "/v1/embeddings",
             "/v1/rerank",
-            "/relay/capabilities",
-            "/relay/stats",
           ],
         });
         return finalizeResponse(
@@ -196,7 +213,19 @@ export function createApp(config: AppConfig): App {
         );
       }
       if (request.method === "POST" && path === "/relay/capabilities/refresh") {
-        response = jsonResponse(await capabilities.refresh());
+        const ip = clientIp(request, config);
+        if (!refreshRateLimiter.allow(ip)) {
+          return finalizeResponse(
+            openAIError(429, "Too many requests", "rate_limit_exceeded"),
+            requestId,
+            path,
+            request.method,
+            startedAt,
+            startedAtMs,
+            requestModel,
+          );
+        }
+        response = jsonResponse(await capabilities.refresh(externalSignal));
         return finalizeResponse(
           response,
           requestId,
@@ -253,7 +282,7 @@ export function createApp(config: AppConfig): App {
       }
       if (path === "/v1/messages/count_tokens") {
         if (request.method === "POST")
-          response = await handleAnthropicCountTokens(config, request);
+          response = await handleAnthropicCountTokens(config, request, externalSignal);
         else
           response = jsonResponse(
             {
@@ -274,7 +303,7 @@ export function createApp(config: AppConfig): App {
       }
       if (path === "/v1/messages") {
         if (request.method === "POST")
-          response = await handleAnthropicMessages(config, request);
+          response = await handleAnthropicMessages(config, request, externalSignal);
         else
           response = jsonResponse(
             {
@@ -323,7 +352,7 @@ export function createApp(config: AppConfig): App {
         );
       }
       if (request.method === "GET" && path === "/v1/models") {
-        response = await handleModels(config);
+        response = await handleModels(config, undefined, externalSignal);
         return finalizeResponse(
           response,
           requestId,
@@ -339,6 +368,7 @@ export function createApp(config: AppConfig): App {
         response = await handleModels(
           config,
           decodeURIComponent(modelMatch[1]),
+          externalSignal,
         );
         return finalizeResponse(
           response,
@@ -354,7 +384,7 @@ export function createApp(config: AppConfig): App {
         if (request.method === "POST") {
           const body = await readJson(request, logger, path);
           requestModel = readRequestModel(body);
-          response = await createChatCompletion(config, store, body);
+          response = await createChatCompletion(config, store, body, externalSignal);
           return finalizeResponse(
             response,
             requestId,
@@ -381,7 +411,7 @@ export function createApp(config: AppConfig): App {
       if (path === "/v1/completions" && request.method === "POST") {
         const body = await readJson(request, logger, path);
         requestModel = readRequestModel(body);
-        response = await createCompletionShim(config, store, body);
+        response = await createCompletionShim(config, store, body, externalSignal);
         return finalizeResponse(
           response,
           requestId,
@@ -395,7 +425,7 @@ export function createApp(config: AppConfig): App {
       if (path === "/v1/responses" && request.method === "POST") {
         const body = await readJson(request, logger, path);
         requestModel = readRequestModel(body);
-        response = await createResponse(config, responseStore, body);
+        response = await createResponse(config, responseStore, body, externalSignal);
         return finalizeResponse(
           response,
           requestId,
@@ -409,7 +439,7 @@ export function createApp(config: AppConfig): App {
       if (path === "/v1/embeddings" && request.method === "POST") {
         const body = await readJson(request, logger, path);
         requestModel = readRequestModel(body);
-        response = await createEmbedding(config, body);
+        response = await createEmbedding(config, body, externalSignal);
         return finalizeResponse(
           response,
           requestId,
@@ -429,7 +459,7 @@ export function createApp(config: AppConfig): App {
         response = await createRerank(config, {
           ...(isObject(body) ? body : {}),
           upstream_path: path,
-        });
+        }, externalSignal);
         return finalizeResponse(
           response,
           requestId,
@@ -676,9 +706,13 @@ export function createApp(config: AppConfig): App {
       const server = createServer(async (req, res) => {
         const requestId =
           nodeHeaderValue(req.headers["x-request-id"]) ?? crypto.randomUUID();
+        const abortController = new AbortController();
+        const onClose = () => abortController.abort();
+        req.once('close', onClose);
         try {
           const response = await handler(
             await nodeRequestToWebRequest(req, config),
+            abortController.signal,
           );
           await writeWebResponse(res, response);
         } catch (error) {
@@ -690,6 +724,8 @@ export function createApp(config: AppConfig): App {
             res,
             withRelayHeaders(errorResponse(error), requestId, config),
           );
+        } finally {
+          req.removeListener('close', onClose);
         }
       });
       await new Promise<void>((resolve) =>
@@ -709,18 +745,20 @@ export function createApp(config: AppConfig): App {
 }
 
 const CORS_ALLOWED_HEADERS =
-  "authorization,content-type,x-api-key,x-request-id,anthropic-version,anthropic-beta,cf-access-client-id,cf-access-client-secret";
+  "authorization,content-type,x-api-key,x-request-id,anthropic-version,anthropic-beta";
 
 function optionsResponse(request: Request, config: AppConfig): Response {
-  const origin = config.corsOrigin ?? request.headers.get("origin") ?? "*";
+  const headers: Record<string, string> = {
+    "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
+    "access-control-allow-headers": CORS_ALLOWED_HEADERS,
+    "access-control-max-age": "86400",
+  };
+  if (config.corsOrigin) {
+    headers["access-control-allow-origin"] = config.corsOrigin;
+  }
   return new Response(null, {
     status: 204,
-    headers: {
-      "access-control-allow-origin": origin ?? "",
-      "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
-      "access-control-allow-headers": CORS_ALLOWED_HEADERS,
-      "access-control-max-age": "86400",
-    },
+    headers,
   });
 }
 
@@ -760,7 +798,7 @@ function authorizeOpenAI(
 ): Response | undefined {
   if (!config.apiKey || (!path.startsWith("/v1/") && path !== "/rerank"))
     return undefined;
-  const ip = clientIp(request);
+  const ip = clientIp(request, config);
   if (rateLimiter && !rateLimiter.allow(ip)) {
     return openAIError(429, "Too many requests", "rate_limit_exceeded");
   }
@@ -782,7 +820,7 @@ function authorizeRelay(
   rateLimiter?: AuthRateLimiter,
 ): Response | undefined {
   if (!config.apiKey || !path.startsWith("/relay/")) return undefined;
-  const ip = clientIp(request);
+  const ip = clientIp(request, config);
   if (rateLimiter && !rateLimiter.allow(ip)) {
     return openAIError(429, "Too many requests", "rate_limit_exceeded");
   }
@@ -797,12 +835,16 @@ function authorizeRelay(
   return openAIError(401, "Unauthorized", "authentication_error");
 }
 
-function clientIp(request: Request): string {
-  return (
-    request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
-    request.headers.get("x-real-ip") ??
-    "unknown"
-  );
+function clientIp(request: Request, config: AppConfig): string {
+  if (config.trustProxy) {
+    return (
+      request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
+      request.headers.get("x-real-ip") ??
+      request.headers.get("x-relay-internal-remote-address") ??
+      "unknown"
+    );
+  }
+  return request.headers.get("x-relay-internal-remote-address") ?? "unknown";
 }
 
 class AuthRateLimiter {
@@ -848,6 +890,11 @@ async function readJson(
   logger: ReturnType<typeof createLogger>,
   path: string,
 ): Promise<unknown> {
+  const contentType = request.headers.get("content-type") ?? "";
+  const mime = contentType.split(';')[0].trim();
+  if (mime !== 'application/json') {
+    throw new GatewayError(400, "Content-Type must be application/json");
+  }
   const text = await request.text();
   try {
     const body = parseJson(text);
@@ -887,6 +934,7 @@ async function nodeRequestToWebRequest(
   const body = chunks.length > 0 ? Buffer.concat(chunks) : undefined;
   const headers = new Headers(req.headers as HeadersInit);
   headers.set("x-relay-internal-raw-body-bytes", String(totalBytes));
+  headers.set("x-relay-internal-remote-address", req.socket?.remoteAddress ?? "unknown");
   return new Request(`http://${config.host}:${config.port}${req.url ?? "/"}`, {
     method: req.method,
     headers,
@@ -975,10 +1023,17 @@ async function writeWebResponse(res: ServerResponse, response: Response) {
     return;
   }
   const reader = response.body.getReader();
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    res.write(value);
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const ok = res.write(value);
+      if (!ok) {
+        await new Promise<void>((resolve) => res.once('drain', resolve));
+      }
+    }
+  } finally {
+    reader.releaseLock();
+    res.end();
   }
-  res.end();
 }

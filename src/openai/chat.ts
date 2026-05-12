@@ -2,7 +2,7 @@ import type { AppConfig } from '../config.ts';
 import { GatewayError, invalidRequestError, jsonResponse, unsupportedCapabilityError, upstreamError } from '../errors.ts';
 import { applyFieldPolicy, withFieldWarning } from '../field-policy.ts';
 import { ensureOpenAIStreamDone, streamHeaders } from '../normalize/stream.ts';
-import { upstreamFetch, upstreamHttpError } from '../upstream/llama.ts';
+import { upstreamFetch, upstreamHttpError, readLimitedText } from '../upstream/llama.ts';
 import { createLogger } from '../logger.ts';
 import { logStreamingResponseDiagnostics, logUpstreamPayloadDiagnostics } from '../truncation-diagnostics.ts';
 import { canonicalToUpstreamChatRequest, openAIChatRequestToCanonical } from '../internal/openai-chat.ts';
@@ -20,8 +20,25 @@ export type StoredCompletion = {
 export class CompletionStore {
   private items = new Map<string, StoredCompletion>();
   private sequence = 0;
+  private maxEntries: number;
+
+  constructor(maxEntries = 1000) {
+    this.maxEntries = maxEntries;
+  }
 
   save(completion: JsonObject, messages: JsonObject[], ttlMs: number): void {
+    this.prune();
+    if (this.items.size >= this.maxEntries) {
+      let oldestId: string | undefined;
+      let oldestOrder = Infinity;
+      for (const [id, entry] of this.items) {
+        if (entry.createdOrder < oldestOrder) {
+          oldestOrder = entry.createdOrder;
+          oldestId = id;
+        }
+      }
+      if (oldestId) this.items.delete(oldestId);
+    }
     this.items.set(completion.id, {
       completion: structuredClone(completion),
       messages: structuredClone(messages),
@@ -72,7 +89,7 @@ export class CompletionStore {
   }
 }
 
-export async function createChatCompletion(config: AppConfig, store: CompletionStore, body: unknown): Promise<Response> {
+export async function createChatCompletion(config: AppConfig, store: CompletionStore, body: unknown, externalSignal?: AbortSignal): Promise<Response> {
   const logger = createLogger(config.logLevel);
   if (!isObject(body)) throw invalidRequestError('JSON body must be an object');
   const original = body;
@@ -83,15 +100,15 @@ export async function createChatCompletion(config: AppConfig, store: CompletionS
     payload: normalized,
   });
 
-  if (normalized.stream === true) return withFieldWarning(await streamChatCompletion(config, normalized), strippedFields, config);
+  if (normalized.stream === true) return withFieldWarning(await streamChatCompletion(config, normalized, externalSignal), strippedFields, config);
 
   const upstreamRes = await upstreamFetch(config, '/v1/chat/completions', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(normalized),
-  });
+  }, externalSignal);
   if (!upstreamRes.response.ok) throw await upstreamHttpError(upstreamRes.response, config);
-  const upstreamText = await upstreamRes.response.text();
+  const upstreamText = await readLimitedText(upstreamRes.response, config.maxUpstreamResponseBytes);
   const upstreamBytes = Buffer.byteLength(upstreamText);
   let upstream: unknown;
   try {
@@ -108,10 +125,10 @@ export async function createChatCompletion(config: AppConfig, store: CompletionS
   return response;
 }
 
-export async function createCompletionShim(config: AppConfig, store: CompletionStore, body: unknown): Promise<Response> {
+export async function createCompletionShim(config: AppConfig, store: CompletionStore, body: unknown, externalSignal?: AbortSignal): Promise<Response> {
   if (!isObject(body)) throw invalidRequestError('JSON body must be an object');
   const chatBody = completionRequestToChat(body);
-  const chatResponse = await createChatCompletion(config, store, chatBody);
+  const chatResponse = await createChatCompletion(config, store, chatBody, externalSignal);
   if (chatBody.stream === true) return chatResponse;
   const chat = await chatResponse.json();
   return jsonResponse(chatCompletionToTextCompletion(chat, body));
@@ -203,7 +220,7 @@ function normalizeChatRequest(input: JsonObject, config: AppConfig): { body: Jso
   return { body: upstreamBody, strippedFields };
 }
 
-async function streamChatCompletion(config: AppConfig, body: JsonObject): Promise<Response> {
+async function streamChatCompletion(config: AppConfig, body: JsonObject, externalSignal?: AbortSignal): Promise<Response> {
   const logger = createLogger(config.logLevel);
   const includeUsage = isObject(body.stream_options) && body.stream_options.include_usage === true;
   const upstream = await upstreamFetch(config, '/v1/chat/completions', {
@@ -213,7 +230,7 @@ async function streamChatCompletion(config: AppConfig, body: JsonObject): Promis
       'content-type': 'application/json',
     },
     body: JSON.stringify(body),
-  });
+  }, externalSignal);
   if (!upstream.response.ok) {
     throw await upstreamHttpError(upstream.response, config);
   }

@@ -2,7 +2,7 @@ import type { AppConfig } from '../config.ts';
 import { GatewayError, invalidRequestError, jsonResponse, unsupportedCapabilityError, upstreamError } from '../errors.ts';
 import { applyFieldPolicy, withFieldWarning } from '../field-policy.ts';
 import { parseSSEJson, parseSSEStream, streamHeaders } from '../normalize/stream.ts';
-import { upstreamFetch, upstreamHttpError } from '../upstream/llama.ts';
+import { upstreamFetch, upstreamHttpError, readLimitedText } from '../upstream/llama.ts';
 import { canonicalToUpstreamChatRequest } from '../internal/openai-chat.ts';
 import { responsesRequestToCanonical } from '../internal/openai-responses.ts';
 import { canonicalToOpenAIResponse, upstreamChatCompletionToCanonical } from '../internal/response.ts';
@@ -13,8 +13,25 @@ type JsonObject = Record<string, any>;
 
 export class ResponseStore {
   private items = new Map<string, { response: JsonObject; expiresAt: number }>();
+  private maxEntries: number;
+
+  constructor(maxEntries = 1000) {
+    this.maxEntries = maxEntries;
+  }
 
   save(response: JsonObject, ttlMs: number): void {
+    this.prune();
+    if (this.items.size >= this.maxEntries) {
+      let oldestId: string | undefined;
+      let oldestTime = Infinity;
+      for (const [id, entry] of this.items) {
+        if (entry.expiresAt < oldestTime) {
+          oldestTime = entry.expiresAt;
+          oldestId = id;
+        }
+      }
+      if (oldestId) this.items.delete(oldestId);
+    }
     this.items.set(response.id, { response: structuredClone(response), expiresAt: Date.now() + ttlMs });
   }
 
@@ -36,7 +53,7 @@ export class ResponseStore {
   }
 }
 
-export async function createResponse(config: AppConfig, store: ResponseStore, body: unknown): Promise<Response> {
+export async function createResponse(config: AppConfig, store: ResponseStore, body: unknown, externalSignal?: AbortSignal): Promise<Response> {
   const logger = createLogger(config.logLevel);
   if (!isObject(body)) throw invalidRequestError('JSON body must be an object');
   const { body: normalized, strippedFields } = applyFieldPolicy('openai_responses', body, config);
@@ -45,15 +62,15 @@ export async function createResponse(config: AppConfig, store: ResponseStore, bo
   }
   const chatRequest = responseRequestToChat(normalized, config);
   logUpstreamPayloadDiagnostics(logger, { route: '/v1/responses', upstream_route: '/v1/chat/completions', payload: chatRequest });
-  if (normalized.stream === true) return withFieldWarning(await streamResponse(config, chatRequest), strippedFields, config);
+  if (normalized.stream === true) return withFieldWarning(await streamResponse(config, chatRequest, externalSignal), strippedFields, config);
 
   const upstreamRes = await upstreamFetch(config, '/v1/chat/completions', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(chatRequest),
-  });
+  }, externalSignal);
   if (!upstreamRes.response.ok) throw await upstreamHttpError(upstreamRes.response, config);
-  const upstreamText = await upstreamRes.response.text();
+  const upstreamText = await readLimitedText(upstreamRes.response, config.maxUpstreamResponseBytes);
   const upstreamBytes = Buffer.byteLength(upstreamText);
   let chat: unknown;
   try {
@@ -94,7 +111,7 @@ function chatCompletionToResponse(chat: unknown, request: JsonObject): JsonObjec
   return canonicalToOpenAIResponse(canonical, request);
 }
 
-async function streamResponse(config: AppConfig, chatRequest: JsonObject): Promise<Response> {
+async function streamResponse(config: AppConfig, chatRequest: JsonObject, externalSignal?: AbortSignal): Promise<Response> {
   const logger = createLogger(config.logLevel);
   const upstream = await upstreamFetch(config, '/v1/chat/completions', {
     method: 'POST',
@@ -103,7 +120,7 @@ async function streamResponse(config: AppConfig, chatRequest: JsonObject): Promi
       'content-type': 'application/json',
     },
     body: JSON.stringify(chatRequest),
-  });
+  }, externalSignal);
   if (!upstream.response.ok || !upstream.response.body) {
     throw upstream.response.body ? await upstreamHttpError(upstream.response, config) : upstreamError('bad_response', 'Upstream returned an empty stream');
   }

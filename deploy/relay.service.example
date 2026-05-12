@@ -9,9 +9,13 @@ User=relay
 Group=relay
 WorkingDirectory=/opt/relay
 EnvironmentFile=/etc/relay/relay.env
-ExecStart=/usr/bin/npm start
+ExecStart=/usr/bin/node --experimental-strip-types /opt/relay/src/main.ts
 Restart=always
 RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=yes
+ProtectHome=yes
 
 [Install]
 WantedBy=multi-user.target

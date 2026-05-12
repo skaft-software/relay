@@ -2,10 +2,10 @@ import type { AppConfig } from '../config.ts';
 import { GatewayError, jsonResponse } from '../errors.ts';
 import { upstreamJson } from '../upstream/llama.ts';
 
-export async function handleModels(config: AppConfig, model?: string): Promise<Response> {
+export async function handleModels(config: AppConfig, model?: string, externalSignal?: AbortSignal): Promise<Response> {
   try {
     const path = model ? `/v1/models/${encodeURIComponent(model)}` : '/v1/models';
-    const raw = await upstreamJson(config, path);
+    const raw = await upstreamJson(config, path, {}, externalSignal);
     const patched = enrichWithCtxSize(raw, config);
     return jsonResponse(patched);
   } catch (error) {

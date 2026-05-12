@@ -1,3 +1,5 @@
+import { GatewayError } from './errors.ts';
+
 /**
  * Sanitize lone UTF-16 surrogates in a string.
  *
@@ -40,8 +42,25 @@ export function sanitizeLoneSurrogates(value: unknown): unknown {
 
 /**
  * Parse a JSON string, applying surrogate sanitisation both before and
- * after parsing for defence-in-depth.
+ * after parsing for defence-in-depth. Throws if nesting depth exceeds 128.
  */
 export function parseJson(text: string): unknown {
-  return sanitizeLoneSurrogates(JSON.parse(replaceLoneSurrogates(text)));
+  const parsed = JSON.parse(replaceLoneSurrogates(text));
+  checkJsonDepth(parsed, 128);
+  return sanitizeLoneSurrogates(parsed);
+}
+
+function checkJsonDepth(value: unknown, maxDepth: number, depth = 0): void {
+  if (depth > maxDepth) {
+    throw new GatewayError(400, 'JSON nesting exceeds maximum depth of 128', 'invalid_request_error', 'invalid_json');
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      checkJsonDepth(item, maxDepth, depth + 1);
+    }
+  } else if (value !== null && typeof value === 'object') {
+    for (const entry of Object.values(value)) {
+      checkJsonDepth(entry, maxDepth, depth + 1);
+    }
+  }
 }

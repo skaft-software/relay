@@ -34,8 +34,6 @@ test('GET / returns gateway metadata for agent probes', async () => {
       '/v1/messages',
       '/v1/embeddings',
       '/v1/rerank',
-      '/relay/capabilities',
-      '/relay/stats',
     ]);
   });
 });
@@ -47,7 +45,7 @@ test('OPTIONS returns CORS-friendly probe response', async () => {
     });
 
     assert.equal(res.status, 204);
-    assert.equal(res.headers.get('access-control-allow-origin'), '*');
+    assert.equal(res.headers.get('access-control-allow-origin'), null);
     assert.match(res.headers.get('access-control-allow-methods') ?? '', /POST/);
   });
 });
@@ -63,8 +61,8 @@ test('OPTIONS reflects requested custom headers for tunnel and browser clients',
 
     assert.equal(res.status, 204);
     const allowed = res.headers.get('access-control-allow-headers') ?? '';
-    assert.match(allowed, /cf-access-client-id/);
-    assert.match(allowed, /cf-access-client-secret/);
+    assert.doesNotMatch(allowed, /cf-access-client-id/);
+    assert.doesNotMatch(allowed, /cf-access-client-secret/);
     assert.match(allowed, /content-type/);
     assert.match(allowed, /authorization/);
   });
@@ -933,6 +931,9 @@ function testConfig(upstreamBaseUrl: string): AppConfig {
     observabilityEnabled: true,
     logPrompts: false,
     requestHistoryLimit: 100,
+    maxStoreEntries: 1000,
+    trustProxy: false,
+    maxUpstreamResponseBytes: 16_777_216,
   };
 }
 

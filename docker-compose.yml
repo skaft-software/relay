@@ -3,7 +3,7 @@ services:
     build: .
     image: relay-gateway:local
     environment:
-      - HOST=${HOST:-0.0.0.0}
+      - HOST=${HOST:-127.0.0.1}
       - PORT=${PORT:-1234}
       - UPSTREAM_BASE_URL=${UPSTREAM_BASE_URL:-http://host.docker.internal:8080/v1}
       - DEFAULT_MODEL=${DEFAULT_MODEL:-}
