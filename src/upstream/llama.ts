@@ -1,6 +1,7 @@
 import { GatewayError, upstreamError } from '../errors.ts';
 import type { AppConfig } from '../config.ts';
 import { redactText } from '../redact.ts';
+import { parseJson } from '../json.ts';
 
 export type UpstreamResult = {
   response: Response;
@@ -83,13 +84,13 @@ export async function readLimitedText(response: Response, maxBytes: number): Pro
   } finally {
     reader.releaseLock();
   }
-  return new TextDecoder().decode(Buffer.concat(chunks.map((c) => Buffer.from(c))));
+  return new TextDecoder().decode(Buffer.concat(chunks));
 }
 
 export async function readLimitedJson(response: Response, maxBytes: number): Promise<unknown> {
   const text = await readLimitedText(response, maxBytes);
   try {
-    return JSON.parse(text);
+    return parseJson(text);
   } catch {
     throw upstreamError('bad_response', 'Upstream returned invalid JSON');
   }
