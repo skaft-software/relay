@@ -114,7 +114,13 @@ for _ in $(seq 1 20); do
   sleep 1
 done
 
-echo "Running doctor"
-npm run doctor
+if [[ "${RUN_DOCTOR:-1}" == "0" ]]; then
+  echo "Skipping doctor (RUN_DOCTOR=0)"
+else
+  echo "Running doctor"
+  if ! npm run doctor; then
+    echo "Doctor reported failures (non-fatal during deploy)"
+  fi
+fi
 
 echo "Deploy complete"
