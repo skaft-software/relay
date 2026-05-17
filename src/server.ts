@@ -40,6 +40,9 @@ import {
   ResponseStore,
 } from "./openai/responses.ts";
 import { createLogger } from "./logger.ts";
+import { LlmJobQueue } from "./jobs.ts";
+import type { JobQueueCounts } from "./jobs.ts";
+import { ModelLifecycle } from "./lifecycle.ts";
 import {
   captureRequest,
   classifyErrorSource,
@@ -60,21 +63,102 @@ type AppFetchInit = Omit<RequestInit, "body"> & { body?: unknown };
 export type App = {
   fetch: (path: string, init?: AppFetchInit) => Promise<Response>;
   handler: (request: Request, externalSignal?: AbortSignal) => Promise<Response>;
-  listen: () => Promise<{ close: () => Promise<void>; url: string }>;
+  listen: () => Promise<{ close: () => Promise<void>; url: string; server: import('node:http').Server }>;
+  counts: () => JobQueueCounts;
+  shutdown: () => void;
 };
 
 export function createApp(config: AppConfig): App {
   const logger = createLogger(config.logLevel);
-  const store = new CompletionStore(config.maxStoreEntries);
-  const responseStore = new ResponseStore(config.maxStoreEntries);
+  const store = new CompletionStore(config.maxStoreEntries, config.maxStoreBytes);
+  const responseStore = new ResponseStore(config.maxStoreEntries, config.maxStoreBytes);
   const capabilities = new CapabilityRegistry(config);
   const observability = new ObservabilityStore(config);
+  const lifecycle = new ModelLifecycle(config, {
+    log: (level, msg, meta) => {
+      if (level === "error") logger.error(`lifecycle: ${msg}`, meta);
+      else logger.info(`lifecycle: ${msg}`, { level, ...(meta ?? {}) });
+    },
+  });
+  const jobs = new LlmJobQueue(async (job, signal) => {
+    const availability = await lifecycle.ensureModelAvailable(signal);
+    if (!availability.ok) {
+      lifecycle.markJobDequeued();
+      return {
+        error: {
+          code: availability.code ?? "model_unavailable",
+          message: availability.message ?? "Model is unavailable",
+        },
+      };
+    }
+
+    lifecycle.markJobDequeued();
+    lifecycle.markJobStarted();
+    try {
+      if (job.kind === "anthropic.messages") {
+        const headers = new Headers({ "content-type": "application/json" });
+        const url = `http://${config.host}:${config.port}/v1/messages`;
+        const upstreamReq = new Request(url, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(job.request),
+        });
+        const response = await handleAnthropicMessages(config, upstreamReq, signal);
+        const payload: any = await response.clone().json().catch(async () => ({ text: await response.text() }));
+        if (!response.ok) {
+          return {
+            error: {
+              code: "upstream_error",
+              message: typeof payload?.error?.message === "string" ? payload.error.message : `HTTP ${response.status}`,
+              upstreamStatus: readUpstreamStatus(response) ?? undefined,
+            },
+          };
+        }
+        return { response: payload };
+      }
+      const response = await createChatCompletion(config, store, job.request, signal);
+      const payload: any = await response.clone().json().catch(async () => ({ text: await response.text() }));
+      if (!response.ok) {
+        return {
+          error: {
+            code: "upstream_error",
+            message: typeof payload?.error?.message === "string" ? payload.error.message : `HTTP ${response.status}`,
+            upstreamStatus: readUpstreamStatus(response) ?? undefined,
+          },
+        };
+      }
+      return { response: payload };
+    } finally {
+      lifecycle.markJobFinished();
+      lifecycle.maybeShutdownWhenIdle();
+    }
+  }, {
+    maxEntries: config.maxStoreEntries,
+    events: {
+      onJobEnqueued: (job) => {
+        lifecycle.markJobEnqueued();
+        logger.info('job enqueued', { job_id: job.id, source: job.source, kind: job.kind, status: job.status });
+      },
+      onJobStarted: (job) => {
+        logger.info('job started', { job_id: job.id, source: job.source, kind: job.kind });
+      },
+      onJobFinished: (job) => {
+        logger.info('job finished', { job_id: job.id, source: job.source, kind: job.kind, status: job.status, duration_ms: job.startedAt && job.finishedAt ? new Date(job.finishedAt).getTime() - new Date(job.startedAt).getTime() : undefined });
+      },
+      onJobCancelled: () => lifecycle.markJobDequeued(),
+    },
+  });
   const authRateLimiter = new AuthRateLimiter(
     config.rateLimitAuthMax ?? 20,
     config.rateLimitAuthWindowMs ?? 60_000,
   );
   const refreshRateLimiter = new AuthRateLimiter(1, 60_000);
+  const relayPostRateLimiter = new AuthRateLimiter(
+    config.rateLimitRelayPostMax ?? 50,
+    config.rateLimitRelayPostWindowMs ?? 60_000,
+  );
 
+  let shuttingDown = false;
   const bindHost = `${config.host}:${config.port}`;
 
   async function handler(request: Request, externalSignal?: AbortSignal): Promise<Response> {
@@ -154,6 +238,10 @@ export function createApp(config: AppConfig): App {
           name: "relay",
           endpoints: [
             "/health",
+            "/relay/jobs",
+            "/relay/lifecycle",
+            "/relay/status",
+            "/relay/metrics",
             "/v1/models",
             "/v1/chat/completions",
             "/v1/completions",
@@ -214,6 +302,164 @@ export function createApp(config: AppConfig): App {
           startedAtMs,
           requestModel,
         );
+      }
+      if (request.method === "POST" && path === "/relay/lifecycle/shutdown") {
+        const result = lifecycle.forceShutdown();
+        response = jsonResponse(result, result.ok ? 200 : 409);
+        return finalizeResponse(response, requestId, path, request.method, startedAt, startedAtMs, requestModel);
+      }
+      if (request.method === "GET" && path === "/relay/lifecycle") {
+        response = jsonResponse(lifecycle.getLifecycleStatus());
+        return finalizeResponse(
+          response,
+          requestId,
+          path,
+          request.method,
+          startedAt,
+          startedAtMs,
+          requestModel,
+        );
+      }
+      if (request.method === "GET" && path === "/relay/status") {
+        const lifecycleStatus = lifecycle.getLifecycleStatus();
+        response = jsonResponse({
+          queue: jobs.counts(),
+          lifecycle: lifecycleStatus,
+        });
+        return finalizeResponse(
+          response,
+          requestId,
+          path,
+          request.method,
+          startedAt,
+          startedAtMs,
+          requestModel,
+        );
+      }
+
+      if (request.method === "GET" && path === "/relay/metrics") {
+        const qCounts = jobs.counts();
+        const lStatus = lifecycle.getLifecycleStatus();
+        const lines: string[] = [
+          '# HELP relay_queue_pending Number of pending jobs in the queue',
+          '# TYPE relay_queue_pending gauge',
+          `relay_queue_pending ${qCounts.pending}`,
+          '',
+          '# HELP relay_queue_active Number of actively running jobs',
+          '# TYPE relay_queue_active gauge',
+          `relay_queue_active ${qCounts.active}`,
+          '',
+          '# HELP relay_queue_completed_recent Number of recently completed jobs',
+          '# TYPE relay_queue_completed_recent gauge',
+          `relay_queue_completed_recent ${qCounts.completedRecent}`,
+          '',
+          '# HELP relay_queue_failed_recent Number of recently failed jobs',
+          '# TYPE relay_queue_failed_recent gauge',
+          `relay_queue_failed_recent ${qCounts.failedRecent}`,
+          '',
+          '# HELP relay_lifecycle_state Current lifecycle state',
+          '# TYPE relay_lifecycle_state gauge',
+          `relay_lifecycle_state{state="${lStatus.state}"} 1`,
+          '',
+          '# HELP relay_lifecycle_model_available Whether the model is available (1=yes, 0=no)',
+          '# TYPE relay_lifecycle_model_available gauge',
+          `relay_lifecycle_model_available ${lStatus.modelAvailable === true ? 1 : 0}`,
+          '',
+          '# HELP relay_lifecycle_start_count Total number of model starts',
+          '# TYPE relay_lifecycle_start_count counter',
+          `relay_lifecycle_start_count ${lStatus.startCount ?? 0}`,
+          '',
+          '# HELP relay_lifecycle_stop_count Total number of model stops',
+          '# TYPE relay_lifecycle_stop_count counter',
+          `relay_lifecycle_stop_count ${lStatus.stopCount ?? 0}`,
+          '',
+          '# HELP relay_lifecycle_start_failure_count Total number of failed start attempts',
+          '# TYPE relay_lifecycle_start_failure_count counter',
+          `relay_lifecycle_start_failure_count ${lStatus.startFailureCount ?? 0}`,
+          '',
+        ];
+        response = new Response(lines.join('\n'), {
+          status: 200,
+          headers: { 'content-type': 'text/plain; charset=utf-8' },
+        });
+        return finalizeResponse(response, requestId, path, request.method, startedAt, startedAtMs, requestModel);
+      }
+      if (request.method === "GET" && path === "/relay/jobs") {
+        response = jsonResponse({ object: "list", data: jobs.list() });
+        return finalizeResponse(
+          response,
+          requestId,
+          path,
+          request.method,
+          startedAt,
+          startedAtMs,
+          requestModel,
+        );
+      }
+      if (request.method === "POST" && path === "/relay/jobs") {
+        if (shuttingDown) {
+          response = jsonResponse({ error: 'shutting_down', message: 'Server is shutting down, not accepting new jobs' }, 503);
+          return finalizeResponse(response, requestId, path, request.method, startedAt, startedAtMs, requestModel);
+        }
+        const relayIp = clientIp(request, config);
+        if (!relayPostRateLimiter.allow(relayIp)) {
+          response = openAIError(429, 'Too many requests to /relay/jobs', 'rate_limit_exceeded');
+          return finalizeResponse(response, requestId, path, request.method, startedAt, startedAtMs, requestModel);
+        }
+        if (config.jobQueueMaxPending && jobs.counts().pending >= config.jobQueueMaxPending) {
+          response = jsonResponse({ error: 'queue_full', message: `Job queue is full (max ${config.jobQueueMaxPending} pending)` }, 429);
+          return finalizeResponse(response, requestId, path, request.method, startedAt, startedAtMs, requestModel);
+        }
+        const body = await readJson(request, logger, path);
+        const idempotencyKey = request.headers.get('idempotency-key') ?? undefined;
+        response = jsonResponse(jobs.submitWithIdempotency(body as any, idempotencyKey), 202);
+        return finalizeResponse(
+          response,
+          requestId,
+          path,
+          request.method,
+          startedAt,
+          startedAtMs,
+          requestModel,
+        );
+      }
+      const jobMatch = path.match(/^\/relay\/jobs\/([^/]+)$/);
+      if (jobMatch) {
+        const jobId = decodeURIComponent(jobMatch[1]);
+        if (request.method === "DELETE") {
+          const cancelled = jobs.cancel(jobId);
+          if (!cancelled) throw new GatewayError(404, `Job ${jobId} was not found`);
+          response = jsonResponse(cancelled);
+          return finalizeResponse(response, requestId, path, request.method, startedAt, startedAtMs, requestModel);
+        }
+        if (request.method === "GET") {
+          // Long-poll support: ?wait=ms blocks until terminal or timeout.
+          const waitParam = parseInt(url.searchParams.get('wait') ?? '', 10);
+          if (Number.isFinite(waitParam) && waitParam > 0) {
+            const deadline = Date.now() + Math.min(waitParam, 60_000);
+            while (Date.now() < deadline) {
+              const snap = jobs.get(jobId);
+              if (!snap) throw new GatewayError(404, `Job ${jobId} was not found`);
+              if (snap.status === 'completed' || snap.status === 'failed' || snap.status === 'cancelled' || snap.status === 'timeout') {
+                response = jsonResponse(snap);
+                return finalizeResponse(response, requestId, path, request.method, startedAt, startedAtMs, requestModel);
+              }
+              await new Promise((resolve) => setTimeout(resolve, 200));
+            }
+            // Timeout — return current state
+            const snap = jobs.get(jobId);
+            if (!snap) throw new GatewayError(404, `Job ${jobId} was not found`);
+            response = jsonResponse(snap);
+            return finalizeResponse(response, requestId, path, request.method, startedAt, startedAtMs, requestModel);
+          }
+          const job = jobs.get(jobId);
+          if (!job) throw new GatewayError(404, `Job ${jobId} was not found`);
+          response = jsonResponse(job);
+          return finalizeResponse(response, requestId, path, request.method, startedAt, startedAtMs, requestModel);
+        }
+        if (request.method !== "GET" && request.method !== "DELETE") {
+          throw new GatewayError(405, `Method ${request.method} not allowed`);
+        }
       }
       if (request.method === "POST" && path === "/relay/capabilities/refresh") {
         const ip = clientIp(request, config);
@@ -305,8 +551,16 @@ export function createApp(config: AppConfig): App {
         );
       }
       if (path === "/v1/messages") {
-        if (request.method === "POST")
-          response = await handleAnthropicMessages(config, request, externalSignal);
+        if (request.method === "POST") {
+          // Read body clone for stream detection before handleAnthropicMessages consumes it.
+          const bodyPreview = await request.clone().text().catch(() => '');
+          const isStream = bodyPreview.includes('"stream":true') || bodyPreview.includes('"stream": true');
+          response = await withLifecycleForStreaming(
+            lifecycle,
+            () => handleAnthropicMessages(config, request, externalSignal),
+            isStream,
+          );
+        }
         else
           response = jsonResponse(
             {
@@ -387,7 +641,12 @@ export function createApp(config: AppConfig): App {
         if (request.method === "POST") {
           const body = await readJson(request, logger, path);
           requestModel = readRequestModel(body);
-          response = await createChatCompletion(config, store, body, externalSignal);
+          const isStream = isObject(body) && body.stream === true;
+          response = await withLifecycleForStreaming(
+            lifecycle,
+            () => createChatCompletion(config, store, body, externalSignal),
+            isStream,
+          );
           return finalizeResponse(
             response,
             requestId,
@@ -732,14 +991,20 @@ export function createApp(config: AppConfig): App {
       );
       const url = `http://${config.host}:${config.port}`;
       logger.info("server started", { url });
+
+      // Exposed so main.ts can close for graceful shutdown.
+      const origClose = () =>
+        new Promise<void>((resolve, reject) =>
+          server.close((error) => (error ? reject(error) : resolve())),
+        );
       return {
         url,
-        close: () =>
-          new Promise<void>((resolve, reject) =>
-            server.close((error) => (error ? reject(error) : resolve())),
-          ),
+        close: origClose,
+        server,
       };
     },
+    counts: () => jobs.counts(),
+    shutdown: () => { shuttingDown = true; },
   };
 }
 
@@ -1010,6 +1275,97 @@ function parseHeaderInt(value: string | null): number | undefined {
   if (!value) return undefined;
   const n = Number.parseInt(value, 10);
   return Number.isFinite(n) ? n : undefined;
+}
+
+/**
+ * Wrap a streaming or non-streaming API handler with lifecycle hooks:
+ * ensureModelAvailable before processing, mark started/finished around the
+ * actual work, and schedule idle shutdown after completion.
+ * When lifecycle is disabled, we pass through without any lifecycle overhead.
+ */
+async function withLifecycleForStreaming(
+  lifecycle: ModelLifecycle,
+  handler: () => Promise<Response>,
+  isStream: boolean,
+): Promise<Response> {
+  const enabled = lifecycle.getLifecycleStatus().enabled;
+
+  if (enabled) {
+    // Ensure model is available before processing.
+    const availability = await lifecycle.ensureModelAvailable();
+    if (!availability.ok) {
+      return jsonResponse({
+        error: {
+          message: availability.message ?? 'Model is unavailable',
+          code: availability.code ?? 'model_unavailable',
+        },
+      }, 503);
+    }
+  }
+
+  if (!isStream) {
+    // Non-streaming: simple start/finish around the handler.
+    if (enabled) lifecycle.markJobStarted();
+    try {
+      return await handler();
+    } finally {
+      if (enabled) {
+        lifecycle.markJobFinished();
+        lifecycle.maybeShutdownWhenIdle();
+      }
+    }
+  }
+
+  // Streaming: wrap the body to track completion.
+  if (enabled) lifecycle.markJobStarted();
+  let response: Response;
+  try {
+    response = await handler();
+  } catch (error) {
+    if (enabled) {
+      lifecycle.markJobFinished();
+      lifecycle.maybeShutdownWhenIdle();
+    }
+    throw error;
+  }
+
+  // Wrap the body to intercept stream completion.
+  const originalBody = response.body;
+  if (!originalBody) {
+    if (enabled) {
+      lifecycle.markJobFinished();
+      lifecycle.maybeShutdownWhenIdle();
+    }
+    return response;
+  }
+
+  const reader = originalBody.getReader();
+  const wrappedStream = new ReadableStream({
+    async start(controller) {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          controller.enqueue(value);
+        }
+        controller.close();
+      } catch (error) {
+        controller.error(error);
+      } finally {
+        reader.releaseLock();
+        if (enabled) {
+          lifecycle.markJobFinished();
+          lifecycle.maybeShutdownWhenIdle();
+        }
+      }
+    },
+  });
+
+  return new Response(wrappedStream, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
 }
 
 async function writeWebResponse(res: ServerResponse, response: Response) {

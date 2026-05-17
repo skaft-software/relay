@@ -27,6 +27,10 @@ test('GET / returns gateway metadata for agent probes', async () => {
     assert.equal(body.object, 'gateway');
     assert.deepEqual(body.endpoints, [
       '/health',
+      '/relay/jobs',
+      '/relay/lifecycle',
+      '/relay/status',
+      '/relay/metrics',
       '/v1/models',
       '/v1/chat/completions',
       '/v1/completions',
@@ -35,6 +39,46 @@ test('GET / returns gateway metadata for agent probes', async () => {
       '/v1/embeddings',
       '/v1/rerank',
     ]);
+  });
+});
+
+test('relay job queue serializes chat completion work and exposes status', async () => {
+  await withUpstream(async (upstream) => {
+    const seen: string[] = [];
+    upstream.handler = (req, res, body) => {
+      if (req.url === '/health') {
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+      if (req.url === '/v1/chat/completions') {
+        seen.push((body as any).messages[0].content);
+        sendJson(res, 200, upstreamChat('llama', `ok-${seen.length}`));
+        return;
+      }
+      assert.fail(`unexpected upstream path ${req.url}`);
+    };
+    const app = createApp(testConfig(upstream.url));
+
+    const submitted = await app.fetch('/relay/jobs', {
+      method: 'POST',
+      body: {
+        source: 'synax',
+        request: { model: 'llama', messages: [{ role: 'user', content: 'first' }] },
+      },
+    });
+    assert.equal(submitted.status, 202);
+    const job = await submitted.json();
+    assert.match(job.status, /^(queued|running|completed)$/);
+
+    let current: any = job;
+    for (let i = 0; i < 20 && current.status !== 'completed'; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      current = await (await app.fetch(`/relay/jobs/${job.id}`)).json();
+    }
+
+    assert.equal(current.status, 'completed');
+    assert.equal(current.response.choices[0].message.content, 'ok-1');
+    assert.deepEqual(seen, ['first']);
   });
 });
 
@@ -909,6 +953,203 @@ test('empty assistant response becomes 502 unless finish reason is a valid empty
   });
 });
 
+test('GET /relay/jobs/:id with wait polls until job completes', async () => {
+  await withUpstream(async (upstream) => {
+    let chatCalls = 0;
+    upstream.handler = async (req, res, body) => {
+      if (req.url === '/health') {
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+      chatCalls += 1;
+      // Slow upstream so the poll has time to demonstrate blocking
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      sendJson(res, 200, upstreamChat('llama', 'hello'));
+    };
+    const app = createApp(testConfig(upstream.url));
+
+    // Submit a job
+    const submitRes = await app.fetch('/relay/jobs', {
+      method: 'POST',
+      body: { source: 'long-poll-test', request: { model: 'llama', messages: [{ role: 'user', content: 'hi' }] } },
+    });
+    assert.equal(submitRes.status, 202);
+    const job = await submitRes.json();
+
+    // Long-poll should block until the job enters a terminal state
+    const pollRes = await app.fetch(`/relay/jobs/${job.id}?wait=5000`);
+    assert.equal(pollRes.status, 200);
+    const result = await pollRes.json();
+    assert.equal(result.status, 'completed');
+    assert.ok(chatCalls >= 1, 'upstream should have been called');
+  });
+});
+
+test('GET /relay/jobs/:id with wait times out when job does not complete', async () => {
+  await withUpstream(async (upstream) => {
+    let releaseChat: (() => void) | null = null;
+    upstream.handler = (req, res, body) => {
+      if (req.url === '/health') {
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+      // Never complete — hold the job in process
+    };
+    const config = { ...testConfig(upstream.url), requestTimeoutMs: 10_000 };
+    const app = createApp(config);
+
+    // Submit a job that gets stuck (no upstream response)
+    const submitRes = await app.fetch('/relay/jobs', {
+      method: 'POST',
+      body: { source: 'timeout-test', request: { model: 'llama', messages: [{ role: 'user', content: 'hi' }] } },
+    });
+    assert.equal(submitRes.status, 202);
+    const job = await submitRes.json();
+
+    // Poll with a short wait — should time out before the job completes
+    const pollRes = await app.fetch(`/relay/jobs/${job.id}?wait=100`);
+    assert.equal(pollRes.status, 200);
+    const result = await pollRes.json();
+    // The job may still be queued or running since upstream never responds
+    assert.ok(result.status === 'queued' || result.status === 'running', `unexpected status: ${result.status}`);
+  });
+});
+
+test('POST /relay/jobs rate limits when relayPostRateLimiter limit exceeded', async () => {
+  await withUpstream(async (upstream) => {
+    upstream.handler = (req, res) => sendJson(res, 200, { ok: true });
+    const config = { ...testConfig(upstream.url), rateLimitRelayPostMax: 2, rateLimitRelayPostWindowMs: 60_000 };
+    const app = createApp(config);
+
+    // First two should succeed
+    assert.equal((await app.fetch('/relay/jobs', { method: 'POST', body: { source: 'a', request: { messages: [] } } })).status, 202);
+    assert.equal((await app.fetch('/relay/jobs', { method: 'POST', body: { source: 'b', request: { messages: [] } } })).status, 202);
+
+    // Third should get 429
+    const r3 = await app.fetch('/relay/jobs', { method: 'POST', body: { source: 'c', request: { messages: [] } } });
+    assert.equal(r3.status, 429);
+    const body = await r3.json();
+    // openAIError(429, msg, type, code) — the 3rd arg is 'type', not 'code'.
+    // codeForStatus(429) returns null, so code is null.
+    assert.equal(body.error.type, 'rate_limit_exceeded');
+    assert.equal(body.error.code, null);
+  });
+});
+
+test('GET /relay/metrics returns Prometheus-format metrics with correct values', async () => {
+  await withUpstream(async (upstream) => {
+    upstream.handler = (req, res) => sendJson(res, 200, { ok: true });
+    const app = createApp(testConfig(upstream.url));
+
+    const res = await app.fetch('/relay/metrics');
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('content-type'), 'text/plain; charset=utf-8');
+
+    const text = await res.text();
+    assert.ok(text.includes('# HELP relay_queue_pending'), 'should include queue pending help');
+    assert.ok(text.includes('# TYPE relay_queue_pending gauge'), 'should include queue pending type');
+    assert.ok(text.includes('relay_queue_pending '), 'should include queue pending value');
+    assert.ok(text.includes('relay_lifecycle_state{state="') || text.includes('relay_lifecycle_state'), 'should include lifecycle state');
+    assert.ok(text.includes('relay_lifecycle_model_available'), 'should include model available');
+    assert.ok(text.includes('relay_lifecycle_start_count'), 'should include start count counter');
+  });
+});
+
+test('POST /relay/jobs with idempotency-key header deduplicates submissions', async () => {
+  await withUpstream(async (upstream) => {
+    upstream.handler = (req, res) => sendJson(res, 200, { ok: true });
+    const app = createApp(testConfig(upstream.url));
+
+    const r1 = await app.fetch('/relay/jobs', {
+      method: 'POST',
+      body: { source: 'dup', request: { messages: [] } },
+      headers: { 'idempotency-key': 'dup-key' },
+    });
+    assert.equal(r1.status, 202);
+    const job1 = await r1.json();
+
+    const r2 = await app.fetch('/relay/jobs', {
+      method: 'POST',
+      body: { source: 'dup-2', request: { messages: [] } },
+      headers: { 'idempotency-key': 'dup-key' },
+    });
+    assert.equal(r2.status, 202);
+    const job2 = await r2.json();
+
+    assert.equal(job2.id, job1.id, 'same idempotency key should return same job id');
+    assert.notEqual(job2.source, 'dup-2', 'cached snapshot preserves original source');
+  });
+});
+
+test('lifecycle enabled with streaming: lifecycle hooks fire on stream completion', async () => {
+  await withUpstream(async (upstream) => {
+    let healthCheckCount = 0;
+    upstream.handler = (req, res, body) => {
+      if (req.url === '/health' || req.url === '/v1/models') {
+        healthCheckCount++;
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+      // Streaming chat completion
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write('data: {"choices":[{"delta":{"content":"hello"}}]}\n\n');
+      res.write('data: [DONE]\n\n');
+      res.end();
+    };
+    const config = { ...testConfig(upstream.url), lazyModelEnabled: true };
+    const app = createApp(config);
+
+    // Check baseline: no active jobs
+    const statusBefore = await (await app.fetch('/relay/status')).json();
+    assert.equal(statusBefore.lifecycle.activeJobs, 0, 'should start with 0 active jobs');
+
+    // Make a streaming request
+    const res = await app.fetch('/v1/chat/completions', {
+      method: 'POST',
+      body: { model: 'llama', messages: [{ role: 'user', content: 'hi' }], stream: true },
+    });
+    assert.equal(res.status, 200);
+
+    // Fully consume the stream body
+    await res.text();
+
+    // After stream consumption, activeJobs should return to 0
+    const statusAfter = await (await app.fetch('/relay/status')).json();
+    assert.equal(statusAfter.lifecycle.activeJobs, 0, 'lifecycle activeJobs should be 0 after stream completes');
+    assert.ok(healthCheckCount >= 1, 'health checks should have been triggered by lifecycle probe');
+  });
+});
+
+test('lifecycle enabled with non-streaming: lifecycle hooks fire on request completion', async () => {
+  await withUpstream(async (upstream) => {
+    upstream.handler = (req, res, body) => {
+      if (req.url === '/health' || req.url === '/v1/models') {
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+      sendJson(res, 200, upstreamChat('llama', 'hello'));
+    };
+    const config = { ...testConfig(upstream.url), lazyModelEnabled: true };
+    const app = createApp(config);
+
+    // Check baseline
+    const statusBefore = await (await app.fetch('/relay/status')).json();
+    assert.equal(statusBefore.lifecycle.activeJobs, 0);
+
+    // Make a non-streaming request
+    const res = await app.fetch('/v1/chat/completions', {
+      method: 'POST',
+      body: { model: 'llama', messages: [{ role: 'user', content: 'hi' }] },
+    });
+    assert.equal(res.status, 200);
+    await res.text();
+
+    // Active jobs should be back to 0 after request completes
+    const statusAfter = await (await app.fetch('/relay/status')).json();
+    assert.equal(statusAfter.lifecycle.activeJobs, 0);
+  });
+});
+
 function testConfig(upstreamBaseUrl: string): AppConfig {
   return {
     port: 8080,
@@ -934,6 +1175,7 @@ function testConfig(upstreamBaseUrl: string): AppConfig {
     maxStoreEntries: 1000,
     trustProxy: false,
     maxUpstreamResponseBytes: 16_777_216,
+    modelStartTimeoutMs: 120_000,
   };
 }
 

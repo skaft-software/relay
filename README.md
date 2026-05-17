@@ -31,7 +31,7 @@ Local model servers are fast and private, but many agent clients are built aroun
 Relay currently supports practical compatibility for:
 
 - OpenAI-style: [`/v1/chat/completions`](https://developers.openai.com/api/reference/chat-completions/overview), [`/v1/completions`](https://platform.openai.com/docs/api-reference/completions/create), [`/v1/responses`](https://platform.openai.com/docs/api-reference/responses/create), [`/v1/embeddings`](https://platform.openai.com/docs/api-reference/embeddings/create), [`/v1/models`](https://platform.openai.com/docs/api-reference/models/list)
-- Anthropic-style: [`/v1/messages`](https://platform.claude.com/docs/en/api/messages), [`/v1/messages/count_tokens`](https://platform.claude.com/docs/en/api/messages/count_tokens)
+- Anthropic-style: `/v1/messages`, `/v1/messages/count_tokens`
 - Utility: `/health`, `/relay/capabilities`, `/relay/stats`, `/relay/requests`
 
 ## Non-Goals
@@ -153,7 +153,7 @@ Cline-style setup:
 - `curl /health` fails: verify Relay is running on `HOST:PORT`.
 - Upstream errors/timeouts: verify `UPSTREAM_BASE_URL` and upstream server health.
 - `model not found`: call [`GET /v1/models`](https://platform.openai.com/docs/api-reference/models/list) and use a returned model id.
-- Anthropic endpoint issues: ensure [`POST /v1/messages`](https://platform.claude.com/docs/en/api/messages) is enabled by relay capabilities and your client sends `anthropic-version`.
+- Anthropic endpoint issues: ensure `POST /v1/messages` is enabled by relay capabilities and your client sends `anthropic-version`.
 
 ## Status
 
