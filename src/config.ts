@@ -34,6 +34,25 @@ export type AppConfig = {
   maxStoreEntries: number;
   trustProxy: boolean;
   maxUpstreamResponseBytes: number;
+  lazyModelEnabled?: boolean;
+  llamaStartCommand?: string;
+  llamaStopCommand?: string;
+  llamaIdleShutdownMs?: number;
+  modelHealthUrl?: string;
+  modelStartTimeoutMs?: number;
+  jobQueueMaxPending?: number;
+  jobTtlMs?: number;
+  shutdownTimeoutMs?: number;
+  modelStartArgv?: string[];
+  modelShutdownArgv?: string[];
+  lifecycleCircuitBreakerThreshold?: number;
+  lifecycleCircuitBreakerWindowMs?: number;
+  lifecycleCircuitBreakerCooldownMs?: number;
+  lifecycleRingBufferBytes?: number;
+  lifecycleShutdownConfirmTimeoutMs?: number;
+  maxStoreBytes?: number;
+  rateLimitRelayPostMax?: number;
+  rateLimitRelayPostWindowMs?: number;
 };
 
 export type UnknownFieldPolicy = 'pass_through' | 'strip' | 'reject';
@@ -96,7 +115,41 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     maxStoreEntries: readInteger(env.MAX_STORE_ENTRIES, 1000, 'MAX_STORE_ENTRIES'),
     trustProxy: readBoolean(env.TRUST_PROXY, false),
     maxUpstreamResponseBytes: readInteger(env.MAX_UPSTREAM_RESPONSE_BYTES, 16_777_216, 'MAX_UPSTREAM_RESPONSE_BYTES'),
+    lazyModelEnabled: readBoolean(
+      env.RELAY_MODEL_LIFECYCLE_ENABLED ?? env.RELAY_LAZY_MODEL_ENABLED,
+      false,
+    ),
+    llamaStartCommand: readOptional(env.RELAY_MODEL_START_COMMAND ?? env.LLAMA_START_COMMAND),
+    llamaStopCommand: readOptional(env.RELAY_MODEL_SHUTDOWN_COMMAND ?? env.LLAMA_STOP_COMMAND),
+    llamaIdleShutdownMs: readIdleShutdownMs(env),
+    modelHealthUrl: readOptional(env.RELAY_MODEL_HEALTH_URL),
+    modelStartTimeoutMs: readInteger(env.RELAY_MODEL_START_TIMEOUT_MS, 120_000, 'RELAY_MODEL_START_TIMEOUT_MS'),
+    jobQueueMaxPending: readInteger(env.RELAY_JOB_QUEUE_MAX_PENDING, 100, 'RELAY_JOB_QUEUE_MAX_PENDING'),
+    jobTtlMs: readInteger(env.RELAY_JOB_TTL_SECONDS, 3600, 'RELAY_JOB_TTL_SECONDS') * 1000,
+    shutdownTimeoutMs: readInteger(env.RELAY_SHUTDOWN_TIMEOUT_MS, 30_000, 'RELAY_SHUTDOWN_TIMEOUT_MS'),
+    modelStartArgv: readJsonArray(env.RELAY_MODEL_START_ARGV),
+    modelShutdownArgv: readJsonArray(env.RELAY_MODEL_SHUTDOWN_ARGV),
+    lifecycleCircuitBreakerThreshold: readInteger(env.RELAY_LIFECYCLE_CIRCUIT_BREAKER_THRESHOLD, 3, 'RELAY_LIFECYCLE_CIRCUIT_BREAKER_THRESHOLD'),
+    lifecycleCircuitBreakerWindowMs: readInteger(env.RELAY_LIFECYCLE_CIRCUIT_BREAKER_WINDOW_MS, 300_000, 'RELAY_LIFECYCLE_CIRCUIT_BREAKER_WINDOW_MS'),
+    lifecycleCircuitBreakerCooldownMs: readInteger(env.RELAY_LIFECYCLE_CIRCUIT_BREAKER_COOLDOWN_MS, 120_000, 'RELAY_LIFECYCLE_CIRCUIT_BREAKER_COOLDOWN_MS'),
+    lifecycleRingBufferBytes: readInteger(env.RELAY_LIFECYCLE_RING_BUFFER_BYTES, 65536, 'RELAY_LIFECYCLE_RING_BUFFER_BYTES'),
+    lifecycleShutdownConfirmTimeoutMs: readInteger(env.RELAY_LIFECYCLE_SHUTDOWN_CONFIRM_TIMEOUT_MS, 10_000, 'RELAY_LIFECYCLE_SHUTDOWN_CONFIRM_TIMEOUT_MS'),
+    maxStoreBytes: readOptionalNumber(env.MAX_STORE_BYTES, 'MAX_STORE_BYTES'),
+    rateLimitRelayPostMax: readInteger(env.RATE_LIMIT_RELAY_POST_MAX, 50, 'RATE_LIMIT_RELAY_POST_MAX'),
+    rateLimitRelayPostWindowMs: readInteger(env.RATE_LIMIT_RELAY_POST_WINDOW_SECONDS, 60, 'RATE_LIMIT_RELAY_POST_WINDOW_SECONDS') * 1000,
   };
+}
+
+function readIdleShutdownMs(env: NodeJS.ProcessEnv): number {
+  const directMs = readOptional(env.RELAY_MODEL_IDLE_SHUTDOWN_MS);
+  if (directMs) {
+    const parsed = Number.parseInt(directMs, 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      throw new Error('RELAY_MODEL_IDLE_SHUTDOWN_MS must be a positive integer');
+    }
+    return parsed;
+  }
+  return readInteger(env.LLAMA_IDLE_SHUTDOWN_SECONDS, 600, 'LLAMA_IDLE_SHUTDOWN_SECONDS') * 1000;
 }
 
 function readSamplingDefaults(env: NodeJS.ProcessEnv): SamplingDefaults {
@@ -185,6 +238,20 @@ function readToolMode(value: string | undefined): RelayToolMode {
   const raw = readOptional(value) ?? 'auto';
   if (raw === 'auto' || raw === 'native' || raw === 'generic' || raw === 'off') return raw;
   throw new Error('RELAY_TOOL_MODE must be auto, native, generic, or off');
+}
+
+function readJsonArray(value: string | undefined): string[] | undefined {
+  const raw = readOptional(value);
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed) && parsed.every((item): item is string => typeof item === 'string')) {
+      return parsed;
+    }
+  } catch {
+    // not valid JSON, fall through to undefined
+  }
+  return undefined;
 }
 
 function readOptionalNumber(value: string | undefined, name: string): number | undefined {

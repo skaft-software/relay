@@ -21,30 +21,62 @@ export class CompletionStore {
   private items = new Map<string, StoredCompletion>();
   private sequence = 0;
   private maxEntries: number;
+  private maxBytes: number | undefined;
+  private totalBytes = 0;
 
-  constructor(maxEntries = 1000) {
+  constructor(maxEntries = 1000, maxBytes?: number) {
     this.maxEntries = maxEntries;
+    this.maxBytes = maxBytes;
   }
 
   save(completion: JsonObject, messages: JsonObject[], ttlMs: number): void {
     this.prune();
-    if (this.items.size >= this.maxEntries) {
-      let oldestId: string | undefined;
-      let oldestOrder = Infinity;
-      for (const [id, entry] of this.items) {
-        if (entry.createdOrder < oldestOrder) {
-          oldestOrder = entry.createdOrder;
-          oldestId = id;
-        }
-      }
-      if (oldestId) this.items.delete(oldestId);
-    }
-    this.items.set(completion.id, {
+    const entry = {
       completion: structuredClone(completion),
       messages: structuredClone(messages),
       expiresAt: Date.now() + ttlMs,
       createdOrder: this.sequence++,
-    });
+    };
+    const entryBytes = Buffer.byteLength(JSON.stringify(entry));
+    this.totalBytes += entryBytes;
+
+    // Count-based enforcement.
+    if (this.items.size >= this.maxEntries) {
+      let oldestId: string | undefined;
+      let oldestOrder = Infinity;
+      for (const [id, existing] of this.items) {
+        if (existing.createdOrder < oldestOrder) {
+          oldestOrder = existing.createdOrder;
+          oldestId = id;
+        }
+      }
+      if (oldestId) {
+        const removed = this.items.get(oldestId);
+        if (removed) this.totalBytes -= Buffer.byteLength(JSON.stringify(removed));
+        this.items.delete(oldestId);
+      }
+    }
+
+    // Byte-cap enforcement: remove oldest until under threshold.
+    if (this.maxBytes !== undefined) {
+      while (this.totalBytes > this.maxBytes && this.items.size > 0) {
+        let oldestId: string | undefined;
+        let oldestOrder = Infinity;
+        for (const [id, existing] of this.items) {
+          if (existing.createdOrder < oldestOrder) {
+            oldestOrder = existing.createdOrder;
+            oldestId = id;
+          }
+        }
+        if (oldestId) {
+          const removed = this.items.get(oldestId);
+          if (removed) this.totalBytes -= Buffer.byteLength(JSON.stringify(removed));
+          this.items.delete(oldestId);
+        } else break;
+      }
+    }
+
+    this.items.set(completion.id, entry);
   }
 
   get(id: string): StoredCompletion | undefined {
@@ -54,6 +86,11 @@ export class CompletionStore {
 
   delete(id: string): boolean {
     this.prune();
+    const removed = this.items.get(id);
+    if (removed) {
+      this.totalBytes -= Buffer.byteLength(JSON.stringify(removed));
+      if (this.totalBytes < 0) this.totalBytes = 0;
+    }
     return this.items.delete(id);
   }
 
@@ -84,7 +121,11 @@ export class CompletionStore {
   private prune() {
     const now = Date.now();
     for (const [id, entry] of this.items) {
-      if (entry.expiresAt <= now) this.items.delete(id);
+      if (entry.expiresAt <= now) {
+        this.totalBytes -= Buffer.byteLength(JSON.stringify(entry));
+        if (this.totalBytes < 0) this.totalBytes = 0;
+        this.items.delete(id);
+      }
     }
   }
 }

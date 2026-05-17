@@ -14,25 +14,57 @@ type JsonObject = Record<string, any>;
 export class ResponseStore {
   private items = new Map<string, { response: JsonObject; expiresAt: number }>();
   private maxEntries: number;
+  private maxBytes: number | undefined;
+  private totalBytes = 0;
 
-  constructor(maxEntries = 1000) {
+  constructor(maxEntries = 1000, maxBytes?: number) {
     this.maxEntries = maxEntries;
+    this.maxBytes = maxBytes;
   }
 
   save(response: JsonObject, ttlMs: number): void {
     this.prune();
+    const entry = { response: structuredClone(response), expiresAt: Date.now() + ttlMs };
+    const entryBytes = Buffer.byteLength(JSON.stringify(entry));
+
+    // Count-based enforcement.
     if (this.items.size >= this.maxEntries) {
       let oldestId: string | undefined;
       let oldestTime = Infinity;
-      for (const [id, entry] of this.items) {
-        if (entry.expiresAt < oldestTime) {
-          oldestTime = entry.expiresAt;
+      for (const [id, existing] of this.items) {
+        if (existing.expiresAt < oldestTime) {
+          oldestTime = existing.expiresAt;
           oldestId = id;
         }
       }
-      if (oldestId) this.items.delete(oldestId);
+      if (oldestId) {
+        const removed = this.items.get(oldestId);
+        if (removed) this.totalBytes -= Buffer.byteLength(JSON.stringify(removed));
+        this.items.delete(oldestId);
+      }
     }
-    this.items.set(response.id, { response: structuredClone(response), expiresAt: Date.now() + ttlMs });
+
+    // Byte-cap enforcement.
+    if (this.maxBytes !== undefined) {
+      while (this.totalBytes + entryBytes > this.maxBytes && this.items.size > 0) {
+        let oldestId: string | undefined;
+        let oldestTime = Infinity;
+        for (const [id, existing] of this.items) {
+          if (existing.expiresAt < oldestTime) {
+            oldestTime = existing.expiresAt;
+            oldestId = id;
+          }
+        }
+        if (oldestId) {
+          const removed = this.items.get(oldestId);
+          if (removed) this.totalBytes -= Buffer.byteLength(JSON.stringify(removed));
+          this.items.delete(oldestId);
+        } else break;
+      }
+    }
+
+    this.totalBytes += entryBytes;
+    this.items.set(response.id, entry);
   }
 
   get(id: string): JsonObject | undefined {
@@ -42,13 +74,22 @@ export class ResponseStore {
 
   delete(id: string): boolean {
     this.prune();
+    const removed = this.items.get(id);
+    if (removed) {
+      this.totalBytes -= Buffer.byteLength(JSON.stringify(removed));
+      if (this.totalBytes < 0) this.totalBytes = 0;
+    }
     return this.items.delete(id);
   }
 
   private prune() {
     const now = Date.now();
     for (const [id, entry] of this.items) {
-      if (entry.expiresAt <= now) this.items.delete(id);
+      if (entry.expiresAt <= now) {
+        this.totalBytes -= Buffer.byteLength(JSON.stringify(entry));
+        if (this.totalBytes < 0) this.totalBytes = 0;
+        this.items.delete(id);
+      }
     }
   }
 }
