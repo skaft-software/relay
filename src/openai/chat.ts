@@ -326,10 +326,11 @@ function normalizeCompletion(raw: unknown, requestedModel: unknown, metadata: un
 function validateAssistantChoice(choice: JsonObject): void {
   const message = choice.message ?? {};
   const hasContent = typeof message.content === 'string' ? message.content.length > 0 : message.content !== null && message.content !== undefined;
+  const hasReasoning = typeof message.reasoning_content === 'string' && message.reasoning_content.length > 0;
   const hasRefusal = typeof message.refusal === 'string' && message.refusal.length > 0;
   const hasTools = Array.isArray(message.tool_calls) && message.tool_calls.length > 0;
   const hasFunction = isObject(message.function_call);
-  if (!hasContent && !hasRefusal && !hasTools && !hasFunction && choice.finish_reason !== 'stop') {
+  if (!hasContent && !hasReasoning && !hasRefusal && !hasTools && !hasFunction && choice.finish_reason !== 'stop') {
     throw upstreamError('bad_response', 'Upstream returned an empty assistant response');
   }
 }
