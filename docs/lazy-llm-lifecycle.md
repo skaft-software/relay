@@ -133,10 +133,95 @@ RELAY_MODEL_START_TIMEOUT_MS=120000
 Do not hardcode paths in code; configure them through env or your process
 supervisor (systemd, launchd, docker compose, etc.).
 
+## Production deployment checklist
+
+This section captures the server-only setup required on temper-inference
+for the Qwen3.6-35B-A3B lazy lifecycle. These paths and permissions are
+**not** git-tracked \u2014 they live on the host filesystem.
+
+### Required directories
+
+```bash
+# Model and template files (readable by relay user)
+sudo mkdir -p /srv/llm/models/qwen3.6 /srv/llm/templates/qwen3.6
+sudo chown -R root:relay /srv/llm
+sudo chmod -R 750 /srv/llm
+
+# Relay cache (writable by relay user)
+sudo mkdir -p /var/cache/relay
+sudo chown relay:relay /var/cache/relay
+sudo chmod 750 /var/cache/relay
+```
+
+### Systemd override
+
+`/etc/systemd/system/relay.service.d/override.conf`:
+
+```ini
+[Service]
+Environment=XDG_CACHE_HOME=/var/cache/relay
+ExecStopPost=-/usr/bin/pkill -u relay -f ^/usr/local/bin/llama-server
+```
+
+- `XDG_CACHE_HOME` ensures relay places its cache outside `/home`.
+- `ExecStopPost=-` is non-fatal (the `-` prefix means systemd ignores
+  non-zero exit). It kills any lingering llama-server child process when
+  relay.service stops, freeing GPU VRAM.
+
+### Environment variables (in /opt/relay/.env)
+
+Key lifecycle vars for the Qwen model:
+
+```sh
+RELAY_MODEL_LIFECYCLE_ENABLED=true
+RELAY_MODEL_IDLE_SHUTDOWN_MS=900000
+RELAY_MODEL_START_TIMEOUT_MS=180000
+RELAY_MODEL_HEALTH_URL=http://127.0.0.1:8080/health
+RELAY_MODEL_START_ARGV=/usr/local/bin/llama-server,-m,/srv/llm/models/qwen3.6/Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf,--host,127.0.0.1,--port,8080,-fa,--jinja,--chat-template,/srv/llm/templates/qwen3.6/chat_template.jinja,-ngl,99,--ctx-size,32768,--parallel,4,--batch-size,512,--ubatch-size,256,--no-webui
+RELAY_MODEL_SHUTDOWN_ARGV=/usr/bin/pkill,-f,llama-server.*--port 8080
+```
+
+> **Note:** `RELAY_MODEL_START_ARGV` / `RELAY_MODEL_SHUTDOWN_ARGV` use
+> comma-separated argv (no shell interpretation) and are preferred over
+> the legacy `RELAY_MODEL_START_COMMAND` / `RELAY_MODEL_SHUTDOWN_COMMAND`.
+
+### Smoke test
+
+```bash
+# Confirm idle state
+curl -s http://127.0.0.1:1234/relay/lifecycle | python3 -m json.tool
+
+# Cold-start request - IMPORTANT: use max_tokens >= 256 (preferably 512)
+# Qwen reasoning mode can consume the entire token budget in reasoning_content,
+# producing empty visible content. max_tokens:64 causes misleading
+# upstream_bad_response when reasoning is active.
+curl -s http://127.0.0.1:1234/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"auto","messages":[{"role":"user","content":"hello"}],"max_tokens":512}'
+
+# Confirm lifecycle went to running
+curl -s http://127.0.0.1:1234/relay/lifecycle | python3 -m json.tool
+
+# Restart relay and verify VRAM returns to ~89 MB idle
+sudo systemctl restart relay.service
+curl -s http://127.0.0.1:1234/relay/lifecycle | python3 -m json.tool
+```
+
+### Rollback
+
+To disable lazy lifecycle:
+
+```bash
+# Comment out or set to false in /opt/relay/.env:
+# RELAY_MODEL_LIFECYCLE_ENABLED=false
+sudo systemctl restart relay.service
+# Start llama-server manually if needed
+```
+
 ## Known limitations
 
-- Relay does not track the PID of the upstream it spawned. It relies on the
-  shutdown command being able to find and kill the right process. Prefer
+- Relay does not track the PID of the upstream it spawned. The systemd
+  ExecStopPost override ensures cleanup on service stop. Prefer
   process-supervisor integration (systemd unit, launchd plist, k8s probe) for
   production deployments.
 - The current queue runs one job at a time. If you set
