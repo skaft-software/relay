@@ -177,13 +177,39 @@ RELAY_MODEL_LIFECYCLE_ENABLED=true
 RELAY_MODEL_IDLE_SHUTDOWN_MS=900000
 RELAY_MODEL_START_TIMEOUT_MS=180000
 RELAY_MODEL_HEALTH_URL=http://127.0.0.1:8080/health
-RELAY_MODEL_START_ARGV=/usr/local/bin/llama-server,-m,/srv/llm/models/qwen3.6/Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf,--host,127.0.0.1,--port,8080,-fa,--jinja,--chat-template,/srv/llm/templates/qwen3.6/chat_template.jinja,-ngl,99,--ctx-size,32768,--parallel,4,--batch-size,512,--ubatch-size,256,--no-webui
-RELAY_MODEL_SHUTDOWN_ARGV=/usr/bin/pkill,-f,llama-server.*--port 8080
+RELAY_MODEL_START_ARGV=/usr/local/bin/llama-server,-m,/srv/llm/models/qwen3.6/Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf,--host,127.0.0.1,--port,8080,--jinja,--chat-template-file,/srv/llm/templates/qwen3.6/chat_template.jinja,--ctx-size,131072,--n-predict,-2,--temp,1.0,--top-p,0.95,--top-k,20,--min-p,0.0,--presence-penalty,1.5,--repeat-penalty,1.0,--flash-attn,on,--cache-type-k,q8_0,--cache-type-v,q8_0,-ngl,999,--reasoning,on,--chat-template-kwargs,{"preserve_thinking": true},--batch-size,512,--ubatch-size,256,--parallel,1
+RELAY_MODEL_SHUTDOWN_ARGV=/usr/bin/pkill,-f,^/usr/local/bin/llama-server
 ```
 
 > **Note:** `RELAY_MODEL_START_ARGV` / `RELAY_MODEL_SHUTDOWN_ARGV` use
 > comma-separated argv (no shell interpretation) and are preferred over
 > the legacy `RELAY_MODEL_START_COMMAND` / `RELAY_MODEL_SHUTDOWN_COMMAND`.
+
+### Sampling profiles
+
+Relay applies these defaults for Suitcase (general tasks, thinking mode).
+Synax overrides them per-request with its own coding profile.
+
+| Parameter | Suitcase (general) | Synax (coding) |
+|---|---|---|
+| `temperature` | `1.0` | `0.6` |
+| `top_p` | `0.95` | `0.95` |
+| `top_k` | `20` | `20` |
+| `min_p` | `0.0` | `0.0` |
+| `presence_penalty` | `1.5` | `0.0` |
+| `repetition_penalty` | `1.0` | `1.0` |
+
+In `/opt/relay/.env`:
+
+```sh
+# ── Sampling defaults (Suitcase = general tasks, thinking mode) ──
+DEFAULT_TEMPERATURE=1.0
+DEFAULT_TOP_P=0.95
+DEFAULT_TOP_K=20
+DEFAULT_MIN_P=0.0
+DEFAULT_PRESENCE_PENALTY=1.5
+DEFAULT_REPETITION_PENALTY=1.0
+```
 
 ### Smoke test
 
