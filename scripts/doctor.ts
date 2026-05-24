@@ -10,6 +10,7 @@ const relayBaseUrl = (process.env.RELAY_BASE_URL ?? `http://${config.host}:${con
 const upstreamApiBaseUrl = config.upstreamBaseUrl.replace(/\/+$/, '');
 const upstreamRootUrl = upstreamApiBaseUrl.replace(/\/v1$/, '');
 const rows: Row[] = [];
+const diagnosticMaxTokens = 4096;
 
 const envModel = process.env.MODEL ?? process.env.DEFAULT_MODEL ?? config.defaultModel;
 rows.push({
@@ -92,7 +93,7 @@ async function checkOpenAIChat(name: string, model: string): Promise<void> {
       body: JSON.stringify({
         model,
         messages: [{ role: 'user', content: 'Reply with OK' }],
-        max_tokens: 64,
+        max_tokens: diagnosticMaxTokens,
         stop: ['OK', 'ok'],
       }),
       signal: controller.signal,
@@ -123,7 +124,7 @@ async function checkOpenAIStream(name: string, model: string): Promise<void> {
       body: JSON.stringify({
         model,
         messages: [{ role: 'user', content: 'Reply with OK' }],
-        max_tokens: 64,
+        max_tokens: diagnosticMaxTokens,
         stream: true,
         stop: ['OK', 'ok'],
       }),
@@ -170,7 +171,7 @@ async function checkAnthropicChat(name: string, model: string): Promise<void> {
       },
       body: JSON.stringify({
         model,
-        max_tokens: 64,
+        max_tokens: diagnosticMaxTokens,
         stop_sequences: ['OK', 'ok'],
         messages: [{ role: 'user', content: 'Reply with OK' }],
       }),

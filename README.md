@@ -87,9 +87,11 @@ curl http://127.0.0.1:1234/v1/chat/completions \
   -d '{
     "model": "local-model",
     "messages": [{"role": "user", "content": "Say hello."}],
-    "max_tokens": 64
+    "max_tokens": 4096
   }'
 ```
+
+Local reasoning models may need a `max_tokens` budget of at least `4096`, and often `8192`, before they emit final visible content.
 
 OpenAI client example:
 

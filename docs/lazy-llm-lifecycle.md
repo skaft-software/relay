@@ -217,13 +217,14 @@ DEFAULT_REPETITION_PENALTY=1.0
 # Confirm idle state
 curl -s http://127.0.0.1:1234/relay/lifecycle | python3 -m json.tool
 
-# Cold-start request - IMPORTANT: use max_tokens >= 256 (preferably 512)
+# Cold-start request - IMPORTANT: use max_tokens >= 4096
+# preferably 8192 for reasoning models.
 # Qwen reasoning mode can consume the entire token budget in reasoning_content,
-# producing empty visible content. max_tokens:64 causes misleading
-# upstream_bad_response when reasoning is active.
+# producing empty visible content. max_tokens:64 can falsely appear as an
+# empty upstream response when reasoning is active.
 curl -s http://127.0.0.1:1234/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"auto","messages":[{"role":"user","content":"hello"}],"max_tokens":512}'
+  -d '{"model":"auto","messages":[{"role":"user","content":"hello"}],"max_tokens":8192}'
 
 # Confirm lifecycle went to running
 curl -s http://127.0.0.1:1234/relay/lifecycle | python3 -m json.tool

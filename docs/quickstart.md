@@ -45,7 +45,7 @@ curl http://127.0.0.1:1234/v1/chat/completions \
   -d '{
     "model": "local-model",
     "messages": [{"role": "user", "content": "Reply with OK"}],
-    "max_tokens": 32
+    "max_tokens": 4096
   }'
 ```
 

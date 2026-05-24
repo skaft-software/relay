@@ -85,6 +85,8 @@ export class CapabilityRegistry {
       body: JSON.stringify({
         model: next.models.currentModel ?? this.config.defaultModel ?? 'local',
         messages: [{ role: 'user', content: 'ping' }],
+        // Endpoint/schema probe only. Do not treat this as a content-generation
+        // health check for reasoning models; tiny budgets can yield no visible content.
         max_tokens: 1,
       }),
     }, externalSignal);
