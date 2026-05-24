@@ -90,9 +90,16 @@ fi
 
 echo "Deploying $(git rev-parse --short HEAD) to $DEST_DIR"
 sudo mkdir -p "$DEST_DIR"
+
+# /opt/relay/.env is production-local and may be a symlink to
+# /etc/relay/relay.env.  Exclude env files and caches so
+# rsync --delete does not clobber production-local artifacts.
 sudo rsync -a --delete \
   --exclude '.git' \
   --exclude 'node_modules' \
+  --exclude '.env' \
+  --exclude '.env.*' \
+  --exclude '.cache' \
   "$REPO_ROOT/" "$DEST_DIR/"
 
 if [[ -f "$DEST_DIR/package-lock.json" ]]; then
