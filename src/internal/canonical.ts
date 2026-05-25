@@ -71,6 +71,7 @@ export type CanonicalChoice = {
 export type CanonicalAssistantMessage = {
   role: 'assistant';
   content: string | null;
+  reasoning_content?: string;
   tool_calls?: CanonicalToolCall[];
 };
 

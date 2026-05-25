@@ -106,6 +106,9 @@ function normalizeChoice(choice: unknown): CanonicalChoice {
     role: 'assistant',
     content: typeof messageRaw.content === 'string' ? messageRaw.content : null,
   };
+  if (typeof messageRaw.reasoning_content === 'string' && messageRaw.reasoning_content.length > 0) {
+    message.reasoning_content = messageRaw.reasoning_content;
+  }
   if (toolCalls) message.tool_calls = toolCalls as CanonicalToolCall[];
   return {
     index: typeof choice.index === 'number' ? choice.index : 0,
@@ -126,6 +129,7 @@ function normalizeFinishReason(value: unknown): CanonicalChoice['finish_reason']
 
 function toOpenAIMessage(message: CanonicalAssistantMessage): JsonObject {
   const out: JsonObject = { role: 'assistant', content: message.content };
+  if (message.reasoning_content) out.reasoning_content = message.reasoning_content;
   if (message.tool_calls) out.tool_calls = message.tool_calls;
   if (out.annotations === undefined) out.annotations = [];
   if (out.refusal === undefined) out.refusal = null;
