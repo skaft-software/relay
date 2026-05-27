@@ -163,4 +163,4 @@ Relay is `v0.1.x`: early, stable enough for local-agent workflows, and still evo
 
 ## License
 
-Apache-2.0
+[Apache License 2.0](LICENSE) © 2026 Achuthan Mukundan
