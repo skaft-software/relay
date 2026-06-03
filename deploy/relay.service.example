@@ -17,5 +17,16 @@ PrivateTmp=true
 ProtectSystem=yes
 ProtectHome=yes
 
+# GPU access — uncomment for Vulkan/RADV or ROCm:
+# DeviceAllow=/dev/dri/renderD128 rw
+# DeviceAllow=/dev/kfd rw
+#
+# Bind model directory so relay user can read GGUF files from a
+# non-/opt path while ProtectHome=yes is active:
+# BindReadOnlyPaths=/home/user/models:/srv/llm/models
+
+# Clean up lingering llama-server on service stop (lazy lifecycle):
+# ExecStopPost=-/usr/bin/pkill -9 -u relay -f '^/usr/local/bin/llama-server'
+
 [Install]
 WantedBy=multi-user.target

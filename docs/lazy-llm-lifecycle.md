@@ -123,12 +123,18 @@ A minimal local config:
 
 ```sh
 RELAY_MODEL_LIFECYCLE_ENABLED=true
-RELAY_MODEL_START_COMMAND="llama-server -m /path/to/model.gguf -ngl 99 --port 8080"
-RELAY_MODEL_SHUTDOWN_COMMAND="pkill -f 'llama-server.*--port 8080'"
 RELAY_MODEL_HEALTH_URL=http://127.0.0.1:8080/health
 RELAY_MODEL_IDLE_SHUTDOWN_MS=600000
 RELAY_MODEL_START_TIMEOUT_MS=120000
+
+# Prefer START_ARGV (JSON array) over START_COMMAND (shell string) — it avoids
+# shell injection and is easier to audit.
+RELAY_MODEL_START_ARGV=["/usr/local/bin/llama-server","-m","/path/to/model.gguf","--host","127.0.0.1","--port","8080","-ngl","99"]
+RELAY_MODEL_SHUTDOWN_ARGV=["/usr/bin/pkill","-f","^/usr/local/bin/llama-server"]
 ```
+
+> **Note:** `RELAY_MODEL_START_ARGV` is a JSON array of strings, **not**
+> comma-separated. This is handled by `readJsonArray()` in `config.ts`.
 
 Do not hardcode paths in code; configure them through env or your process
 supervisor (systemd, launchd, docker compose, etc.).

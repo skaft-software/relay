@@ -127,6 +127,32 @@ journalctl -u llama-server.service -n 200 --no-pager
 journalctl -u relay.service -n 200 --no-pager
 ```
 
+## GPU Access (Vulkan / ROCm)
+
+When running llama-server with GPU acceleration on AMD hardware:
+
+```ini
+# /etc/systemd/system/relay.service.d/override.conf (or inline in the unit)
+[Service]
+DeviceAllow=/dev/dri/renderD128 rw
+DeviceAllow=/dev/kfd rw
+```
+
+If models are stored outside `/opt` (e.g. `/home/user/models`) and
+`ProtectHome=yes` is active, add a read-only bind mount so the `relay` user
+can spawn llama-server with the GGUF files:
+
+```ini
+BindReadOnlyPaths=/home/user/models:/srv/llm/models
+```
+
+For lazy lifecycle, also add a cleanup hook so systemd kills any lingering
+llama-server when relay stops:
+
+```ini
+ExecStopPost=-/usr/bin/pkill -9 -u relay -f '^/usr/local/bin/llama-server'
+```
+
 ## Uninstall Flow
 
 Review the uninstall script:
