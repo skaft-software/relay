@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 
-import type { AppConfig } from './config.ts';
+import type { AppConfig, ModelEntry } from './config.ts';
 
 export type ModelAvailability = {
   ok: boolean;
@@ -55,6 +55,10 @@ export type LifecycleStatus = {
   startFailureCount?: number;
   /** ISO timestamp of last successful health check. */
   lastHealthyAt?: string;
+  /** Name of the currently loaded model, if known. */
+  currentModel?: string | null;
+  /** Configured model entries from RELAY_MODEL_MAP. */
+  modelEntries?: string[];
 };
 
 const DEFAULT_IDLE_SHUTDOWN_MS = 600_000;
@@ -85,6 +89,10 @@ export class ModelLifecycle {
   private circuitBreakerFailures: number[] = [];
   private circuitBreakerCooldownUntil: number | null = null;
   private shutdownConfirmTimeoutMs: number;
+  /** Name of the currently loaded model, if managed by modelEntries. */
+  private currentModelName: string | null = null;
+  /** Guard to serialize model switches. */
+  private switchInFlight: Promise<ModelAvailability> | null = null;
 
   constructor(config: AppConfig, hooks: LifecycleHooks = {}) {
     this.config = config;
@@ -98,8 +106,18 @@ export class ModelLifecycle {
    * Verify the upstream is reachable. When lifecycle is enabled and the upstream
    * is unavailable, attempt to start it via the configured start command and
    * poll the health endpoint until the start timeout elapses.
+   *
+   * If `modelName` is provided and `modelEntries` is configured, the lifecycle
+   * will automatically switch to the requested model if necessary (stopping the
+   * current one and starting the new one). Requests that arrive during a switch
+   * are queued transparently.
    */
-  async ensureModelAvailable(externalSignal?: AbortSignal): Promise<ModelAvailability> {
+  async ensureModelAvailable(modelName?: string, externalSignal?: AbortSignal): Promise<ModelAvailability> {
+    // If model switching is configured and a model name is given, handle it.
+    if (modelName && this.config.modelEntries) {
+      return this.ensureModelWithSwitching(modelName, externalSignal);
+    }
+
     const reachable = await this.probe(externalSignal);
     if (reachable) {
       this.modelAvailable = true;
@@ -150,11 +168,157 @@ export class ModelLifecycle {
     // Serialize concurrent start attempts.
     if (!this.startInFlight) {
       this.state = 'starting';
-      this.startInFlight = this.startAndWait(externalSignal).finally(() => {
+      this.startInFlight = this.startAndWait(undefined, externalSignal).finally(() => {
         this.startInFlight = null;
       });
     }
     return this.startInFlight;
+  }
+
+  /** Handle model switching through modelEntries config. */
+  private async ensureModelWithSwitching(modelName: string, externalSignal?: AbortSignal): Promise<ModelAvailability> {
+    const entries = this.config.modelEntries!;
+    let entry: ModelEntry | undefined = entries[modelName];
+    if (!entry) {
+      const lower = modelName.toLowerCase();
+      const match = Object.entries(entries).find(([k]) => k.toLowerCase() === lower);
+      if (match) {
+        modelName = match[0];
+        entry = match[1];
+      }
+    }
+
+    if (!entry) {
+      // Unknown model — if something is running, allow it through.
+      const reachable = await this.probe(externalSignal);
+      if (reachable) {
+        this.modelAvailable = true;
+        this.state = 'running';
+        return { ok: true };
+      }
+      return {
+        ok: false,
+        code: 'model_unknown',
+        message: `Unknown model "${modelName}". Known models: ${Object.keys(entries).join(', ')}`,
+      };
+    }
+
+    // Fast path: requested model is already loaded and healthy.
+    if (this.currentModelName === modelName && this.modelAvailable && this.state === 'running') {
+      const reachable = await this.probe(externalSignal);
+      if (reachable) {
+        this.lastHealthyAt = new Date().toISOString();
+        return { ok: true };
+      }
+      this.modelAvailable = false;
+      this.state = 'idle';
+    }
+
+    // If a different model is running, shut it down first.
+    if (this.currentModelName !== null && this.currentModelName !== modelName) {
+      if (this.switchInFlight) {
+        return this.switchInFlight;
+      }
+      this.switchInFlight = this.switchModel(modelName, entry, externalSignal).finally(() => {
+        this.switchInFlight = null;
+      });
+      return this.switchInFlight;
+    }
+
+    // Same model (or no model loaded) — start or restart it.
+    // If no model is tracked but upstream is reachable, kill the stale server
+    // first (e.g. leftover from a previous relay instance on same port).
+    if (this.currentModelName === null) {
+      const staleReachable = await this.probe(externalSignal);
+      if (staleReachable) {
+        this.log('info', 'lifecycle: stale upstream detected, killing before first start');
+        await this.killCurrentModel();
+        // Wait for the port to free up.
+        const deadline = this.now() + 10_000;
+        while (this.now() < deadline) {
+          const stillUp = await this.probe(externalSignal);
+          if (!stillUp) break;
+          await sleep(500);
+        }
+      }
+    }
+    if (this.startInFlight) {
+      return this.startInFlight;
+    }
+    this.state = 'starting';
+    this.log('info', 'starting model', { model: modelName });
+    this.startInFlight = this.startAndWait(entry, externalSignal).finally(() => {
+      this.startInFlight = null;
+    });
+    const result = await this.startInFlight;
+    if (result.ok) {
+      this.currentModelName = modelName;
+    }
+    return result;
+  }
+
+  /** Shut down current model and start the requested one. */
+  private async switchModel(modelName: string, entry: ModelEntry, externalSignal?: AbortSignal): Promise<ModelAvailability> {
+    this.log('info', 'switching model', { from: this.currentModelName, to: modelName });
+    this.state = 'stopping';
+
+    try {
+      await this.killCurrentModel();
+    } catch (error) {
+      this.log('warn', 'error during model stop', { error: error instanceof Error ? error.message : String(error) });
+    }
+
+    this.currentModelName = null;
+    this.modelAvailable = false;
+    this.stopCount += 1;
+    this.lastStopAt = new Date().toISOString();
+    this.child = null;
+    this.childPid = undefined;
+
+    const confirmed = await this.confirmShutdown();
+    if (!confirmed) {
+      this.log('warn', 'shutdown confirmation timed out, proceeding anyway');
+    }
+
+    this.state = 'starting';
+    this.lastError = undefined;
+    const result = await this.startAndWait(entry, externalSignal);
+    if (result.ok) {
+      this.currentModelName = modelName;
+    }
+    return result;
+  }
+
+  /** Kill the currently running model process. */
+  private async killCurrentModel(): Promise<void> {
+    if (this.child && typeof (this.child as any).kill === 'function') {
+      this.log('info', 'killing current model process', { pid: this.childPid });
+      try {
+        (this.child as any).kill('SIGTERM');
+        await new Promise<void>((resolve) => {
+          const timeout = setTimeout(() => resolve(), 3000);
+          if (typeof this.child!.on === 'function') {
+            this.child!.once('exit', () => { clearTimeout(timeout); resolve(); });
+          } else {
+            setTimeout(() => resolve(), 100);
+          }
+        });
+      } catch {
+        // already dead
+      }
+    }
+
+    // Fallback: kill any remaining llama-server processes.
+    try {
+      const proc = spawn('pkill', ['-f', 'llama-server'], {
+        detached: true,
+        stdio: 'ignore',
+      });
+      proc.unref();
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    } catch {
+      // pkill may not exist or may fail; that's fine.
+    }
   }
 
   /**
@@ -246,6 +410,8 @@ export class ModelLifecycle {
       stopCount: this.stopCount,
       startFailureCount: this.startFailureCount,
       lastHealthyAt: this.lastHealthyAt,
+      currentModel: this.currentModelName,
+      modelEntries: this.config.modelEntries ? Object.keys(this.config.modelEntries) : undefined,
     };
   }
 
@@ -341,18 +507,21 @@ export class ModelLifecycle {
     timer.unref();
   }
 
-  private async startAndWait(externalSignal?: AbortSignal): Promise<ModelAvailability> {
-    if (!this.config.llamaStartCommand && !this.config.modelStartArgv) {
+  private async startAndWait(entry?: ModelEntry, externalSignal?: AbortSignal): Promise<ModelAvailability> {
+    const startCmd = entry?.cmd ?? this.config.llamaStartCommand;
+    const argv = !entry ? this.config.modelStartArgv : undefined;
+    const timeoutMs = (entry?.timeout_sec != null ? entry.timeout_sec * 1000 : undefined)
+      ?? this.config.modelStartTimeoutMs
+      ?? DEFAULT_START_TIMEOUT_MS;
+    const healthUrl = entry?.health_url ?? this.config.modelHealthUrl;
+
+    if (!startCmd && !argv) {
       this.state = 'idle';
       return { ok: false, code: 'model_start_not_configured', message: 'start command missing' };
     }
-    this.log('info', 'lifecycle start command dispatched');
+    this.log('info', 'lifecycle start command dispatched', { cmd: startCmd ? '(script)' : 'argv' });
     try {
-      const argv = this.config.modelStartArgv;
-      const proc = this.runCommand(
-        this.config.llamaStartCommand ?? '',
-        argv,
-      );
+      const proc = this.runCommand(startCmd ?? '', entry ? undefined : argv);
       if (!proc) {
         const message = 'start command did not produce a child process';
         this.lastError = message;
@@ -395,14 +564,16 @@ export class ModelLifecycle {
       return { ok: false, code: 'model_start_failed', message: this.lastError };
     }
 
-    const startTimeoutMs = this.config.modelStartTimeoutMs ?? DEFAULT_START_TIMEOUT_MS;
+    const startTimeoutMs = timeoutMs;
     const deadline = this.now() + startTimeoutMs;
     while (this.now() < deadline) {
       if (externalSignal?.aborted) {
         this.state = 'idle';
         return { ok: false, code: 'model_start_aborted', message: 'start aborted by client' };
       }
-      const ok = await this.probe(externalSignal);
+      const ok = healthUrl
+        ? await this.probeUrl(healthUrl, externalSignal)
+        : await this.probe(externalSignal);
       if (ok) {
         this.modelAvailable = true;
         this.state = 'running';
@@ -461,7 +632,31 @@ export class ModelLifecycle {
         return false;
       }
     }
-    return defaultProbe(this.config, externalSignal);
+    return defaultProbe(this.config, undefined, externalSignal);
+  }
+
+  /** Probe a specific health URL. */
+  private async probeUrl(healthUrl: string, externalSignal?: AbortSignal): Promise<boolean> {
+    if (this.hooks.probe) {
+      try {
+        return await this.hooks.probe(externalSignal);
+      } catch {
+        return false;
+      }
+    }
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.config.probeTimeoutMs);
+    const signal = externalSignal
+      ? AbortSignal.any([controller.signal, externalSignal])
+      : controller.signal;
+    try {
+      const res = await fetch(healthUrl, { signal });
+      return res.ok;
+    } catch {
+      return false;
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   private runCommand(command: string, argv?: string[]): ChildProcess | null {
@@ -499,14 +694,14 @@ export class ModelLifecycle {
   }
 }
 
-async function defaultProbe(config: AppConfig, externalSignal?: AbortSignal): Promise<boolean> {
+async function defaultProbe(config: AppConfig, healthUrlOverride?: string, externalSignal?: AbortSignal): Promise<boolean> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), config.probeTimeoutMs);
   const signal = externalSignal ? AbortSignal.any([controller.signal, externalSignal]) : controller.signal;
   try {
-    if (config.modelHealthUrl) {
+    if (healthUrlOverride ?? config.modelHealthUrl) {
       try {
-        const res = await fetch(config.modelHealthUrl, { signal });
+        const res = await fetch((healthUrlOverride ?? config.modelHealthUrl)!, { signal });
         if (res.ok) return true;
       } catch {
         return false;

@@ -165,7 +165,7 @@ function initialCapabilities(config: AppConfig): RelayCapabilities {
       baseUrl: config.upstreamBaseUrl,
       reachable: false,
       health: 'unknown',
-      contextSize: config.upstreamCtxSize,
+      contextSize: defaultModelCtxSize(config),
     },
     models: {
       list: 'unknown',
@@ -212,4 +212,12 @@ function upstreamUrl(baseUrl: string, path: string): string {
 
 function isObject(value: unknown): value is Record<string, any> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function defaultModelCtxSize(config: AppConfig): number | undefined {
+  if (config.defaultModel && config.modelEntries) {
+    const entry = config.modelEntries[config.defaultModel];
+    if (entry?.ctx_size) return entry.ctx_size;
+  }
+  return config.upstreamCtxSize;
 }

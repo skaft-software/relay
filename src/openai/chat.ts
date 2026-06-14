@@ -2,6 +2,7 @@ import type { AppConfig } from '../config.ts';
 import { GatewayError, invalidRequestError, jsonResponse, unsupportedCapabilityError, upstreamError } from '../errors.ts';
 import { applyFieldPolicy, withFieldWarning } from '../field-policy.ts';
 import { ensureOpenAIStreamDone, streamHeaders } from '../normalize/stream.ts';
+import { injectLoadingEvents } from '../normalize/loading-events.ts';
 import { upstreamFetch, upstreamHttpError, readLimitedText } from '../upstream/llama.ts';
 import { createLogger } from '../logger.ts';
 import { logStreamingResponseDiagnostics, logUpstreamPayloadDiagnostics } from '../truncation-diagnostics.ts';
@@ -284,7 +285,8 @@ async function streamChatCompletion(config: AppConfig, body: JsonObject, externa
   let downstreamBytes = 0;
   let sawDone = false;
   let endedCleanly = false;
-  const instrumented = ensureOpenAIStreamDone(upstream.response.body, includeUsage, {
+  const streamBody = injectLoadingEvents(upstream.response.body, { model: String(body.model ?? 'unknown') });
+  const instrumented = ensureOpenAIStreamDone(streamBody, includeUsage, {
     onUpstreamFrame: (frame) => {
       upstreamEvents += 1;
       upstreamBytes += Buffer.byteLength(frame.data) + (frame.event ? Buffer.byteLength(frame.event) : 0);

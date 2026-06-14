@@ -3,6 +3,31 @@ import { GatewayError, jsonResponse } from '../errors.ts';
 import { upstreamJson } from '../upstream/llama.ts';
 
 export async function handleModels(config: AppConfig, model?: string, externalSignal?: AbortSignal): Promise<Response> {
+  // When modelEntries is configured, serve the list directly from relay config.
+  if (config.modelEntries) {
+    const allModels = Object.keys(config.modelEntries).map((id) => {
+      const entry = config.modelEntries![id];
+      const ctxSize = entry.ctx_size ?? config.upstreamCtxSize;
+      return {
+        id: entry.name ?? id,
+        object: 'model',
+        created: 0,
+        owned_by: 'local',
+        meta: ctxSize ? { n_ctx: ctxSize } : undefined,
+      };
+    });
+
+    if (model) {
+      const found = allModels.find(
+        (m) => m.id === model || m.id.toLowerCase() === model.toLowerCase()
+      );
+      if (!found) throw new GatewayError(404, `Model ${model} not found`);
+      return jsonResponse(found);
+    }
+    return jsonResponse({ object: 'list', data: allModels });
+  }
+
+  // Fallback: proxy to upstream.
   try {
     const path = model ? `/v1/models/${encodeURIComponent(model)}` : '/v1/models';
     const raw = await upstreamJson(config, path, {}, externalSignal);

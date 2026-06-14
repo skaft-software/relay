@@ -43,6 +43,7 @@ import { createLogger } from "./logger.ts";
 import { LlmJobQueue } from "./jobs.ts";
 import type { JobQueueCounts } from "./jobs.ts";
 import { ModelLifecycle } from "./lifecycle.ts";
+import { RequestMutex } from "./mutex.ts";
 import {
   captureRequest,
   classifyErrorSource,
@@ -80,8 +81,10 @@ export function createApp(config: AppConfig): App {
       else logger.info(`lifecycle: ${msg}`, { level, ...(meta ?? {}) });
     },
   });
+  const mutex = config.serializeRequests ? new RequestMutex() : undefined;
   const jobs = new LlmJobQueue(async (job, signal) => {
-    const availability = await lifecycle.ensureModelAvailable(signal);
+    const jobModel = typeof job.request?.model === 'string' ? job.request.model : undefined;
+    const availability = await lifecycle.ensureModelAvailable(jobModel, signal);
     if (!availability.ok) {
       lifecycle.markJobDequeued();
       return {
@@ -94,6 +97,8 @@ export function createApp(config: AppConfig): App {
 
     lifecycle.markJobDequeued();
     lifecycle.markJobStarted();
+    // Serialize with direct endpoint callers when mutex is enabled.
+    if (mutex) await mutex.acquire(signal);
     try {
       if (job.kind === "anthropic.messages") {
         const headers = new Headers({ "content-type": "application/json" });
@@ -129,6 +134,7 @@ export function createApp(config: AppConfig): App {
       }
       return { response: payload };
     } finally {
+      if (mutex) mutex.release();
       lifecycle.markJobFinished();
       lifecycle.maybeShutdownWhenIdle();
     }
@@ -160,6 +166,62 @@ export function createApp(config: AppConfig): App {
 
   let shuttingDown = false;
   const bindHost = `${config.host}:${config.port}`;
+
+  /**
+   * Wrap a handler with mutex serialization when enabled.
+   * Non-streaming responses release the mutex immediately after the response
+   * is produced. Streaming responses wrap the body so the mutex is released
+   * only after the SSE stream completes (or the client disconnects).
+   */
+  async function withMutex(
+    handler: () => Promise<Response>,
+    signal?: AbortSignal,
+  ): Promise<Response> {
+    if (!mutex) return handler();
+
+    await mutex.acquire(signal);
+
+    let response: Response;
+    try {
+      response = await handler();
+    } catch (e) {
+      mutex.release();
+      throw e;
+    }
+
+    const isStream = (response.headers.get('content-type') ?? '').includes('text/event-stream');
+    if (!isStream || !response.body) {
+      mutex.release();
+      return response;
+    }
+
+    // Wrap the stream body so the mutex isn't released until the SSE stream
+    // finishes (or the client disconnects).
+    const reader = response.body.getReader();
+    const wrappedStream = new ReadableStream({
+      async start(controller) {
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            controller.enqueue(value);
+          }
+          controller.close();
+        } catch (e) {
+          controller.error(e);
+        } finally {
+          reader.releaseLock();
+          mutex.release();
+        }
+      },
+    });
+
+    return new Response(wrappedStream, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+  }
 
   async function handler(request: Request, externalSignal?: AbortSignal): Promise<Response> {
     if (config.host !== "0.0.0.0" && config.host !== "::") {
@@ -325,6 +387,7 @@ export function createApp(config: AppConfig): App {
         response = jsonResponse({
           queue: jobs.counts(),
           lifecycle: lifecycleStatus,
+          mutex: mutex ? { active: mutex.active, waiting: mutex.waiting } : undefined,
         });
         return finalizeResponse(
           response,
@@ -552,13 +615,22 @@ export function createApp(config: AppConfig): App {
       }
       if (path === "/v1/messages") {
         if (request.method === "POST") {
-          // Read body clone for stream detection before handleAnthropicMessages consumes it.
+          // Read body clone for stream detection and model extraction before handleAnthropicMessages consumes it.
           const bodyPreview = await request.clone().text().catch(() => '');
           const isStream = bodyPreview.includes('"stream":true') || bodyPreview.includes('"stream": true');
-          response = await withLifecycleForStreaming(
-            lifecycle,
-            () => handleAnthropicMessages(config, request, externalSignal),
-            isStream,
+          let anthropicModel: string | undefined;
+          try {
+            const parsed = JSON.parse(bodyPreview);
+            anthropicModel = typeof parsed?.model === 'string' ? parsed.model : undefined;
+          } catch { /* ignore */ }
+          response = await withMutex(
+            () => withLifecycleForStreaming(
+              lifecycle,
+              anthropicModel,
+              () => handleAnthropicMessages(config, request, externalSignal),
+              isStream,
+            ),
+            externalSignal,
           );
         }
         else
@@ -642,10 +714,14 @@ export function createApp(config: AppConfig): App {
           const body = await readJson(request, logger, path);
           requestModel = readRequestModel(body);
           const isStream = isObject(body) && body.stream === true;
-          response = await withLifecycleForStreaming(
-            lifecycle,
-            () => createChatCompletion(config, store, body, externalSignal),
-            isStream,
+          response = await withMutex(
+            () => withLifecycleForStreaming(
+              lifecycle,
+              requestModel,
+              () => createChatCompletion(config, store, body, externalSignal),
+              isStream,
+            ),
+            externalSignal,
           );
           return finalizeResponse(
             response,
@@ -673,7 +749,10 @@ export function createApp(config: AppConfig): App {
       if (path === "/v1/completions" && request.method === "POST") {
         const body = await readJson(request, logger, path);
         requestModel = readRequestModel(body);
-        response = await createCompletionShim(config, store, body, externalSignal);
+        response = await withMutex(
+          () => createCompletionShim(config, store, body, externalSignal),
+          externalSignal,
+        );
         return finalizeResponse(
           response,
           requestId,
@@ -687,7 +766,10 @@ export function createApp(config: AppConfig): App {
       if (path === "/v1/responses" && request.method === "POST") {
         const body = await readJson(request, logger, path);
         requestModel = readRequestModel(body);
-        response = await createResponse(config, responseStore, body, externalSignal);
+        response = await withMutex(
+          () => createResponse(config, responseStore, body, externalSignal),
+          externalSignal,
+        );
         return finalizeResponse(
           response,
           requestId,
@@ -701,7 +783,10 @@ export function createApp(config: AppConfig): App {
       if (path === "/v1/embeddings" && request.method === "POST") {
         const body = await readJson(request, logger, path);
         requestModel = readRequestModel(body);
-        response = await createEmbedding(config, body, externalSignal);
+        response = await withMutex(
+          () => createEmbedding(config, body, externalSignal),
+          externalSignal,
+        );
         return finalizeResponse(
           response,
           requestId,
@@ -718,10 +803,13 @@ export function createApp(config: AppConfig): App {
       ) {
         const body = await readJson(request, logger, path);
         requestModel = readRequestModel(body);
-        response = await createRerank(config, {
-          ...(isObject(body) ? body : {}),
-          upstream_path: path,
-        }, externalSignal);
+        response = await withMutex(
+          () => createRerank(config, {
+            ...(isObject(body) ? body : {}),
+            upstream_path: path,
+          }, externalSignal),
+          externalSignal,
+        );
         return finalizeResponse(
           response,
           requestId,
@@ -1285,14 +1373,15 @@ function parseHeaderInt(value: string | null): number | undefined {
  */
 async function withLifecycleForStreaming(
   lifecycle: ModelLifecycle,
+  modelName: string | undefined,
   handler: () => Promise<Response>,
   isStream: boolean,
 ): Promise<Response> {
   const enabled = lifecycle.getLifecycleStatus().enabled;
 
   if (enabled) {
-    // Ensure model is available before processing.
-    const availability = await lifecycle.ensureModelAvailable();
+    // Ensure model is available (with optional model switching) before processing.
+    const availability = await lifecycle.ensureModelAvailable(modelName);
     if (!availability.ok) {
       return jsonResponse({
         error: {

@@ -1,3 +1,16 @@
+export type ModelEntry = {
+  /** Shell command or script to start this model */
+  cmd: string;
+  /** Optional health URL (defaults to probing upstreamBaseUrl) */
+  health_url?: string;
+  /** Startup timeout in seconds (defaults to modelStartTimeoutMs / 1000) */
+  timeout_sec?: number;
+  /** Display name reported to clients (defaults to key) */
+  name?: string;
+  /** Running context size for this model (--ctx-size). Overrides global UPSTREAM_CTX_SIZE for model list and capabilities. */
+  ctx_size?: number;
+};
+
 export type AppConfig = {
   port: number;
   host: string;
@@ -53,6 +66,13 @@ export type AppConfig = {
   maxStoreBytes?: number;
   rateLimitRelayPostMax?: number;
   rateLimitRelayPostWindowMs?: number;
+  /** When true, serialize all LLM requests so exactly one runs at a time.
+   *  First caller gets zero-latency passthrough; simultaneous callers queue FCFS. */
+  serializeRequests?: boolean;
+  /** Mapping of model names (as clients request them) to start configs.
+   *  When a client requests a model in this map, the lifecycle will
+   *  automatically switch to it if the current model differs. */
+  modelEntries?: Record<string, ModelEntry>;
 };
 
 export type UnknownFieldPolicy = 'pass_through' | 'strip' | 'reject';
@@ -137,6 +157,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     maxStoreBytes: readOptionalNumber(env.MAX_STORE_BYTES, 'MAX_STORE_BYTES'),
     rateLimitRelayPostMax: readInteger(env.RATE_LIMIT_RELAY_POST_MAX, 50, 'RATE_LIMIT_RELAY_POST_MAX'),
     rateLimitRelayPostWindowMs: readInteger(env.RATE_LIMIT_RELAY_POST_WINDOW_SECONDS, 60, 'RATE_LIMIT_RELAY_POST_WINDOW_SECONDS') * 1000,
+    serializeRequests: readBoolean(env.RELAY_SERIALIZE_REQUESTS, true),
+    modelEntries: readModelEntries(env.RELAY_MODEL_MAP),
   };
 }
 
@@ -266,4 +288,24 @@ function readOptionalNumber(value: string | undefined, name: string): number | u
 
 function trimTrailingSlash(value: string): string {
   return value.replace(/\/+$/, '');
+}
+
+function readModelEntries(value: string | undefined): Record<string, ModelEntry> | undefined {
+  const raw = readOptional(value);
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const entries: Record<string, ModelEntry> = {};
+      for (const [key, entry] of Object.entries(parsed)) {
+        if (entry && typeof entry === 'object' && typeof (entry as any).cmd === 'string') {
+          entries[key] = entry as ModelEntry;
+        }
+      }
+      if (Object.keys(entries).length > 0) return entries;
+    }
+  } catch {
+    // invalid JSON, fall through
+  }
+  return undefined;
 }
