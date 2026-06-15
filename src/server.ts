@@ -1381,8 +1381,19 @@ async function withLifecycleForStreaming(
 ): Promise<Response> {
   const enabled = lifecycle.getLifecycleStatus().enabled;
 
-  // Streaming with lifecycle: send loading SSE events during model cold-start
+  // Streaming with lifecycle: send loading SSE events during model cold-start.
+  // If the model is already hot, skip loading events and stream directly.
   if (enabled && isStream && modelName) {
+    const status = lifecycle.getLifecycleStatus();
+    if (status.modelAvailable && status.state === 'running') {
+      lifecycle.markJobStarted();
+      try {
+        return await handler();
+      } finally {
+        lifecycle.markJobFinished();
+        lifecycle.maybeShutdownWhenIdle();
+      }
+    }
     return streamWithModelLoading(lifecycle, modelName, handler);
   }
 
