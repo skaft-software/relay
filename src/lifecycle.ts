@@ -93,6 +93,8 @@ export class ModelLifecycle {
   private currentModelName: string | null = null;
   /** Guard to serialize model switches. */
   private switchInFlight: Promise<ModelAvailability> | null = null;
+  /** Target model name for the in-progress switch (null when no switch active). */
+  private switchTargetModel: string | null = null;
 
   constructor(config: AppConfig, hooks: LifecycleHooks = {}) {
     this.config = config;
@@ -221,8 +223,30 @@ export class ModelLifecycle {
       }
       this.switchInFlight = this.switchModel(modelName, entry, externalSignal).finally(() => {
         this.switchInFlight = null;
+        this.switchTargetModel = null;
       });
       return this.switchInFlight;
+    }
+
+    // If a model switch is in progress:
+    // - Requests for the switch TARGET model wait for the switch to complete.
+    // - Requests for any OTHER model get a retryable error to avoid
+    //   ping-pong switching (switch A->B completes, request for A triggers
+    //   switch B->A, killing the in-progress model load).
+    if (this.switchInFlight) {
+      if (this.switchTargetModel === modelName) {
+        try {
+          await this.switchInFlight;
+        } catch {
+          // switch failed — fall through to normal start logic
+        }
+        return this.ensureModelWithSwitching(modelName, externalSignal);
+      }
+      return {
+        ok: false,
+        code: 'model_switching',
+        message: `Model switch to ${this.switchTargetModel} is in progress. Retry switching to ${modelName} after the switch completes.`,
+      };
     }
 
     // Same model (or no model loaded) — start or restart it.
@@ -260,6 +284,7 @@ export class ModelLifecycle {
   /** Shut down current model and start the requested one. */
   private async switchModel(modelName: string, entry: ModelEntry, externalSignal?: AbortSignal): Promise<ModelAvailability> {
     this.log('info', 'switching model', { from: this.currentModelName, to: modelName });
+    this.switchTargetModel = modelName;
     this.state = 'stopping';
 
     try {
