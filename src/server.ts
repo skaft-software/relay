@@ -190,7 +190,9 @@ export function createApp(config: AppConfig): App {
     }
 
     const isStream = (response.headers.get('content-type') ?? '').includes('text/event-stream');
-    if (!isStream || !response.body) {
+    // Skip wrapping when response already manages its own lifecycle
+    // (e.g. streamWithModelLoading, which carries x-relay-loading).
+    if (!isStream || !response.body || response.headers.has('x-relay-loading')) {
       mutex.release();
       return response;
     }
@@ -1379,8 +1381,13 @@ async function withLifecycleForStreaming(
 ): Promise<Response> {
   const enabled = lifecycle.getLifecycleStatus().enabled;
 
-  if (enabled) {
-    // Ensure model is available (with optional model switching) before processing.
+  // Streaming with lifecycle: send loading SSE events during model cold-start
+  if (enabled && isStream && modelName) {
+    return streamWithModelLoading(lifecycle, modelName, handler);
+  }
+
+  // Non-streaming with lifecycle: ensure model is available first
+  if (enabled && !isStream) {
     const availability = await lifecycle.ensureModelAvailable(modelName);
     if (!availability.ok) {
       return jsonResponse({
@@ -1390,71 +1397,22 @@ async function withLifecycleForStreaming(
         },
       }, 503);
     }
-  }
-
-  if (!isStream) {
-    // Non-streaming: simple start/finish around the handler.
-    if (enabled) lifecycle.markJobStarted();
+    lifecycle.markJobStarted();
     try {
       return await handler();
     } finally {
-      if (enabled) {
-        lifecycle.markJobFinished();
-        lifecycle.maybeShutdownWhenIdle();
-      }
-    }
-  }
-
-  // Streaming: wrap the body to track completion.
-  if (enabled) lifecycle.markJobStarted();
-  let response: Response;
-  try {
-    response = await handler();
-  } catch (error) {
-    if (enabled) {
       lifecycle.markJobFinished();
       lifecycle.maybeShutdownWhenIdle();
     }
-    throw error;
   }
 
-  // Wrap the body to intercept stream completion.
-  const originalBody = response.body;
-  if (!originalBody) {
-    if (enabled) {
-      lifecycle.markJobFinished();
-      lifecycle.maybeShutdownWhenIdle();
-    }
-    return response;
+  // Lifecycle disabled: skip all lifecycle management — passthrough
+  if (!enabled) {
+    return handler();
   }
 
-  const reader = originalBody.getReader();
-  const wrappedStream = new ReadableStream({
-    async start(controller) {
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          controller.enqueue(value);
-        }
-        controller.close();
-      } catch (error) {
-        controller.error(error);
-      } finally {
-        reader.releaseLock();
-        if (enabled) {
-          lifecycle.markJobFinished();
-          lifecycle.maybeShutdownWhenIdle();
-        }
-      }
-    },
-  });
-
-  return new Response(wrappedStream, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: response.headers,
-  });
+  // No lifecycle — simple passthrough (should not be reached)
+  return handler();
 }
 
 async function writeWebResponse(res: ServerResponse, response: Response) {
@@ -1480,4 +1438,82 @@ async function writeWebResponse(res: ServerResponse, response: Response) {
     reader.releaseLock();
     res.end();
   }
+}
+
+/**
+ * For streaming requests: immediately return an SSE response that emits
+ * loading events while the lifecycle ensures the model is available.
+ * Once ready, the real upstream stream is piped through transparently.
+ */
+async function streamWithModelLoading(
+  lifecycle: ModelLifecycle,
+  modelName: string,
+  handler: () => Promise<Response>,
+): Promise<Response> {
+  const encoder = new TextEncoder();
+  let loadingTimer: ReturnType<typeof setInterval> | null = null;
+  const startTime = Date.now();
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      // Emit loading events while we wait for the model.
+      const emitLoading = () => {
+        const elapsedMs = Date.now() - startTime;
+        const payload = JSON.stringify({ event: 'loading', model: modelName, elapsed_ms: elapsedMs });
+        controller.enqueue(encoder.encode(`data: ${payload}\n\n`));
+      };
+
+      // Emit first loading event immediately, then every 3s.
+      emitLoading();
+      loadingTimer = setInterval(emitLoading, 3000);
+
+      try {
+        // Model needs loading/switching — wait for it.
+        const availability = await lifecycle.ensureModelAvailable(modelName);
+
+        // Stop loading events
+        if (loadingTimer) clearInterval(loadingTimer);
+
+        if (!availability.ok) {
+          const errPayload = JSON.stringify({ event: 'error', message: availability.message ?? 'Model unavailable' });
+          controller.enqueue(encoder.encode(`data: ${errPayload}\n\n`));
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          controller.close();
+          return;
+        }
+
+        lifecycle.markJobStarted();
+        try {
+          const response = await handler();
+          const reader = response.body?.getReader();
+          if (!reader) {
+            controller.close();
+            return;
+          }
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            controller.enqueue(value);
+          }
+          controller.close();
+        } finally {
+          lifecycle.markJobFinished();
+          lifecycle.maybeShutdownWhenIdle();
+        }
+      } catch (err) {
+        if (loadingTimer) clearInterval(loadingTimer);
+        controller.error(err);
+      }
+    },
+  });
+
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache',
+      'connection': 'keep-alive',
+      'x-relay-loading': '1',
+    },
+  });
 }

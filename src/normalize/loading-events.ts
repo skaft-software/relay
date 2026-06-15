@@ -3,7 +3,7 @@
  * display a loading indicator instead of dead air.
  *
  * When the upstream llama.cpp server is loading/unloading a model,
- * the TCP connection is accepted but no data flows for 10–60s.
+ * the TCP connection is accepted but no data flows for 10-60s.
  * This wrapper detects the silence and emits periodic loading SSE
  * chunks so the client knows the request is still alive.
  */
@@ -39,10 +39,8 @@ export function injectLoadingEvents(
       const emitLoading = () => {
         if (firstByteReceived) return;
         const elapsedMs = Date.now() - startTime;
-        const chunk = encoder.encode(
-          ,
-        );
-        controller.enqueue(chunk);
+        const payload = JSON.stringify({ event: 'loading', model, elapsed_ms: elapsedMs });
+        controller.enqueue(encoder.encode(`data: ${payload}\n\n`));
       };
 
       // Probe: after probeMs, start emitting loading events if nothing arrived
