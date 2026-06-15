@@ -1390,12 +1390,48 @@ async function withLifecycleForStreaming(
     const status = lifecycle.getLifecycleStatus();
     if (status.modelAvailable && status.state === 'running' && status.currentModel === modelName) {
       lifecycle.markJobStarted();
-      try {
-        return await handler();
-      } finally {
-        lifecycle.markJobFinished();
-        lifecycle.maybeShutdownWhenIdle();
+      const response = await handler();
+      // Wrap the response body so markJobFinished/maybeShutdownWhenIdle
+      // fire when the SSE stream actually ends, not when the Response
+      // object is returned (which happens immediately for streaming).
+      if (response.body) {
+        const reader = response.body.getReader();
+        let streamDone = false;
+        const finish = () => {
+          if (streamDone) return;
+          streamDone = true;
+          lifecycle.markJobFinished();
+          lifecycle.maybeShutdownWhenIdle();
+        };
+        const wrapped = new ReadableStream({
+          async start(controller) {
+            try {
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                controller.enqueue(value);
+              }
+              controller.close();
+            } finally {
+              reader.releaseLock();
+              finish();
+            }
+          },
+          cancel() {
+            reader.cancel();
+            finish();
+          },
+        });
+        return new Response(wrapped, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers,
+        });
       }
+      // Non-streaming fallback: no body to wrap, fire immediately.
+      lifecycle.markJobFinished();
+      lifecycle.maybeShutdownWhenIdle();
+      return response;
     }
     return streamWithModelLoading(lifecycle, modelName, handler, externalSignal);
   }
