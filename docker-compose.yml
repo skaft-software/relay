@@ -7,6 +7,9 @@ services:
     # direct access to the upstream llama.cpp server on localhost.
     # Trade-off: no Docker network isolation; firewall rules apply directly.
     network_mode: host
+    # Share the host PID namespace so the lifecycle can kill/restart
+    # llama-server processes via pkill.
+    pid: host
     restart: unless-stopped
     volumes:
       - ${HOME}:${HOME}
