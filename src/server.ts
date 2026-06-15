@@ -1385,7 +1385,7 @@ async function withLifecycleForStreaming(
   // If the model is already hot, skip loading events and stream directly.
   if (enabled && isStream && modelName) {
     const status = lifecycle.getLifecycleStatus();
-    if (status.modelAvailable && status.state === 'running') {
+    if (status.modelAvailable && status.state === 'running' && status.currentModel === modelName) {
       lifecycle.markJobStarted();
       try {
         return await handler();
