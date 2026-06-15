@@ -593,6 +593,7 @@ export class ModelLifecycle {
     const deadline = this.now() + startTimeoutMs;
     while (this.now() < deadline) {
       if (externalSignal?.aborted) {
+        await this.killCurrentModel();
         this.state = 'idle';
         return { ok: false, code: 'model_start_aborted', message: 'start aborted by client' };
       }

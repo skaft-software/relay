@@ -631,6 +631,7 @@ export function createApp(config: AppConfig): App {
               anthropicModel,
               () => handleAnthropicMessages(config, request, externalSignal),
               isStream,
+              externalSignal,
             ),
             externalSignal,
           );
@@ -722,6 +723,7 @@ export function createApp(config: AppConfig): App {
               requestModel,
               () => createChatCompletion(config, store, body, externalSignal),
               isStream,
+              externalSignal,
             ),
             externalSignal,
           );
@@ -1378,6 +1380,7 @@ async function withLifecycleForStreaming(
   modelName: string | undefined,
   handler: () => Promise<Response>,
   isStream: boolean,
+  externalSignal?: AbortSignal,
 ): Promise<Response> {
   const enabled = lifecycle.getLifecycleStatus().enabled;
 
@@ -1394,7 +1397,7 @@ async function withLifecycleForStreaming(
         lifecycle.maybeShutdownWhenIdle();
       }
     }
-    return streamWithModelLoading(lifecycle, modelName, handler);
+    return streamWithModelLoading(lifecycle, modelName, handler, externalSignal);
   }
 
   // Non-streaming with lifecycle: ensure model is available first
@@ -1436,18 +1439,27 @@ async function writeWebResponse(res: ServerResponse, response: Response) {
     return;
   }
   const reader = response.body.getReader();
+  let disconnected = false;
+  const onClose = () => {
+    disconnected = true;
+    reader.cancel().catch(() => {});
+  };
+  res.once('close', onClose);
   try {
     while (true) {
       const { done, value } = await reader.read();
-      if (done) break;
+      if (done || disconnected) break;
       const ok = res.write(value);
       if (!ok) {
         await new Promise<void>((resolve) => res.once('drain', resolve));
       }
     }
   } finally {
+    res.removeListener('close', onClose);
     reader.releaseLock();
-    res.end();
+    if (!res.writableEnded) {
+      res.end();
+    }
   }
 }
 
@@ -1460,30 +1472,47 @@ async function streamWithModelLoading(
   lifecycle: ModelLifecycle,
   modelName: string,
   handler: () => Promise<Response>,
+  externalSignal?: AbortSignal,
 ): Promise<Response> {
   const encoder = new TextEncoder();
   let loadingTimer: ReturnType<typeof setInterval> | null = null;
   const startTime = Date.now();
 
+  const streamAbortController = new AbortController();
+  let cancelled = false;
+
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      streamAbortController.abort();
+      cancelled = true;
+    } else {
+      externalSignal.addEventListener('abort', () => {
+        streamAbortController.abort();
+        cancelled = true;
+      }, { once: true });
+    }
+  }
+
   const stream = new ReadableStream({
     async start(controller) {
-      // Emit loading events while we wait for the model.
       const emitLoading = () => {
         const elapsedMs = Date.now() - startTime;
         const payload = JSON.stringify({ event: 'loading', model: modelName, elapsed_ms: elapsedMs });
         controller.enqueue(encoder.encode(`data: ${payload}\n\n`));
       };
 
-      // Emit first loading event immediately, then every 3s.
       emitLoading();
       loadingTimer = setInterval(emitLoading, 3000);
 
       try {
-        // Model needs loading/switching — wait for it.
-        const availability = await lifecycle.ensureModelAvailable(modelName);
+        const availability = await lifecycle.ensureModelAvailable(modelName, streamAbortController.signal);
 
-        // Stop loading events
         if (loadingTimer) clearInterval(loadingTimer);
+
+        if (streamAbortController.signal.aborted) {
+          controller.close();
+          return;
+        }
 
         if (!availability.ok) {
           const errPayload = JSON.stringify({ event: 'error', message: availability.message ?? 'Model unavailable' });
@@ -1496,25 +1525,49 @@ async function streamWithModelLoading(
         lifecycle.markJobStarted();
         try {
           const response = await handler();
+          if (streamAbortController.signal.aborted) {
+            response.body?.cancel();
+            controller.close();
+            return;
+          }
           const reader = response.body?.getReader();
           if (!reader) {
             controller.close();
             return;
           }
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            controller.enqueue(value);
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              if (streamAbortController.signal.aborted) {
+                reader.cancel();
+                controller.close();
+                return;
+              }
+              controller.enqueue(value);
+            }
+            controller.close();
+          } finally {
+            reader.releaseLock();
           }
-          controller.close();
         } finally {
           lifecycle.markJobFinished();
           lifecycle.maybeShutdownWhenIdle();
         }
       } catch (err) {
         if (loadingTimer) clearInterval(loadingTimer);
-        controller.error(err);
+        if (!cancelled) {
+          controller.error(err);
+        } else {
+          try { controller.close(); } catch { /* already closed */ }
+        }
       }
+    },
+
+    cancel() {
+      cancelled = true;
+      if (loadingTimer) clearInterval(loadingTimer);
+      streamAbortController.abort();
     },
   });
 
