@@ -206,6 +206,15 @@ export class ModelLifecycle {
     }
 
     // Fast path: requested model is already loaded and healthy.
+    console.error('[TRACE:lifecycle-switch] fast-check', JSON.stringify({
+      currentModel: this.currentModelName,
+      reqModel: modelName,
+      modelAvailable: this.modelAvailable,
+      state: this.state,
+      switchInFlight: !!this.switchInFlight,
+      switchTarget: this.switchTargetModel,
+      startInFlight: !!this.startInFlight,
+    }));
     if (this.currentModelName === modelName && this.modelAvailable && this.state === 'running') {
       const reachable = await this.probe(externalSignal);
       if (reachable) {
@@ -217,6 +226,7 @@ export class ModelLifecycle {
     }
 
     // If a different model is running, shut it down first.
+    console.error('[TRACE:lifecycle-switch] different-model', JSON.stringify({from: this.currentModelName, to: modelName}));
     if (this.currentModelName !== null && this.currentModelName !== modelName) {
       if (this.switchInFlight) {
         return this.switchInFlight;
@@ -361,11 +371,13 @@ export class ModelLifecycle {
   }
 
   markJobStarted(): void {
+    console.error('[TRACE:lifecycle-job] markJobStarted activeJobs=' + (this.activeJobs + 1));
     this.activeJobs += 1;
     this.cancelIdleShutdown('job started');
   }
 
   markJobFinished(): void {
+    console.error('[TRACE:lifecycle-job] markJobFinished activeJobs=' + Math.max(0, this.activeJobs - 1));
     this.activeJobs = Math.max(0, this.activeJobs - 1);
     if (this.activeJobs === 0) this.lastIdleAt = this.now();
   }

@@ -1388,6 +1388,14 @@ async function withLifecycleForStreaming(
   // If the model is already hot, skip loading events and stream directly.
   if (enabled && isStream && modelName) {
     const status = lifecycle.getLifecycleStatus();
+    console.error('[TRACE:relay-fastpath]', JSON.stringify({
+      modelAvailable: status.modelAvailable,
+      state: status.state,
+      currentModel: status.currentModel,
+      reqModel: modelName,
+      activeJobs: status.activeJobs,
+      idleScheduled: status.idleShutdownScheduled,
+    }));
     if (status.modelAvailable && status.state === 'running' && status.currentModel === modelName) {
       lifecycle.markJobStarted();
       const response = await handler();
@@ -1433,6 +1441,7 @@ async function withLifecycleForStreaming(
       lifecycle.maybeShutdownWhenIdle();
       return response;
     }
+    console.error('[TRACE:relay-coldstart] falling to streamWithModelLoading for', modelName);
     return streamWithModelLoading(lifecycle, modelName, handler, externalSignal);
   }
 
@@ -1537,12 +1546,14 @@ async function streamWithModelLoading(
         controller.enqueue(encoder.encode(`data: ${payload}\n\n`));
       };
 
+      console.error('[TRACE:relay-loading] first loading event for', modelName);
       emitLoading();
       loadingTimer = setInterval(emitLoading, 3000);
 
       try {
         const availability = await lifecycle.ensureModelAvailable(modelName, streamAbortController.signal);
 
+        console.error('[TRACE:relay-loaded] model ready, stopping loading for', modelName);
         if (loadingTimer) clearInterval(loadingTimer);
 
         if (streamAbortController.signal.aborted) {
