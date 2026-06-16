@@ -20,7 +20,7 @@ Relay is configured via environment variables, typically in a .env file.
 | Variable | Default | Description |
 |---|---|---|
 | RELAY_MODEL_LIFECYCLE_ENABLED | false | Enable lazy model loading, switching, and idle shutdown |
-| RELAY_MODEL_MAP | (empty) | JSON map: model name to start config (see below) |
+| RELAY_MODEL_MAP | (empty) | JSON map: model name to start config |
 | RELAY_SWITCH_POLICY | eager | graceful (needs 2x VRAM) or eager (kill old first) |
 | RELAY_MODEL_PORT_BASE | 8081 | Starting port for dynamic model allocation |
 | RELAY_MODEL_IDLE_SHUTDOWN_MS | 3600000 | Idle timeout before unloading (1 hour) |
@@ -33,17 +33,16 @@ Relay is configured via environment variables, typically in a .env file.
 
 ### RELAY_MODEL_MAP Format
 
-JSON object mapping model names to their start configurations:
+JSON object mapping model names to their start configurations. Each entry needs:
+- cmd: shell script to start the model (must accept LLAMA_PORT env var)
+- ctx_size: context window size
+- timeout_sec (optional): startup timeout override
+- multimodal (optional): true if model supports vision
+- port (optional): fixed port override
+- switchGraceMs (optional): grace period before killing old instance
 
+Example:
 
-
-Each model entry:
-- cmd — shell script to start the model (must accept LLAMA_PORT env var)
-- ctx_size — context window size
-- timeout_sec (optional) — startup timeout override
-- multimodal (optional) — true if model supports vision
-- port (optional) — fixed port override
-- switchGraceMs (optional) — grace period before killing old instance
 
 ## Compatibility
 
@@ -51,7 +50,6 @@ Each model entry:
 |---|---|---|
 | RELAY_MODEL_PROFILE | qwen | Model family profile for defaults |
 | RELAY_FIELD_POLICY | pass_through | How unknown fields are handled |
-| RELAY_UNKNOWN_FIELD_POLICY | pass_through | Alias for RELAY_FIELD_POLICY |
 | RELAY_STRICT_COMPAT | false | Reject non-standard requests |
 | RELAY_WARN_ON_STRIPPED_FIELDS | true | Log warnings when fields are stripped |
 | RELAY_REASONING_MODE | preserve | How reasoning/thinking fields are handled |
