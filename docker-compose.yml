@@ -24,6 +24,8 @@ services:
       - /home/achu/start-llama-mtp.sh:/home/achu/start-llama-mtp.sh:ro
       - /home/achu/start-llama-glm47.sh:/home/achu/start-llama-glm47.sh:ro
       - /home/achu/start-llama-north.sh:/home/achu/start-llama-north.sh:ro
+      - /home/achu/start-llama-qwen27b.sh:/home/achu/start-llama-qwen27b.sh:ro
+      - /home/achu/start-llama-gemma31b.sh:/home/achu/start-llama-gemma31b.sh:ro
       # Mount llama.cpp build and Jinja templates so child processes
       # can find the server binary and chat templates.
       - /home/achu/llama.cpp:/home/achu/llama.cpp:ro
