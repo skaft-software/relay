@@ -97,7 +97,7 @@ async function readJson(request: Request, logLevel: string): Promise<JsonObject>
 }
 
 function anthropicRequestToChat(input: JsonObject, config: AppConfig): JsonObject {
-  const canonical = anthropicMessagesRequestToCanonical(input, config);
+  const canonical = anthropicMessagesRequestToCanonical(input, config, input.model);
   const chat = canonicalToUpstreamChatRequest(canonical);
   return chat;
 }

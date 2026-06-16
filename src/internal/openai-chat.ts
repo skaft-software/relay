@@ -17,7 +17,7 @@ export function openAIChatRequestToCanonical(input: JsonObject, config: AppConfi
   delete body.max_completion_tokens;
 
   applySamplingDefaults(body, samplingDefaultsFor(config));
-  body.messages = normalizeMessages(body.messages, config);
+  body.messages = normalizeMessages(body.messages, config, body.model);
   normalizeTools(body);
   normalizeOpenAIResponseFormat(body, config);
 

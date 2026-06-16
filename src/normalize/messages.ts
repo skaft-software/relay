@@ -3,17 +3,18 @@ import type { AppConfig } from '../config.ts';
 
 type JsonObject = Record<string, any>;
 
-export function normalizeMessages(messages: unknown, config: AppConfig): JsonObject[] {
+export function normalizeMessages(messages: unknown, config: AppConfig, model?: string): JsonObject[] {
+  const visionOk = model ? (config.modelEntries?.[model]?.multimodal ?? config.upstreamVisionOk ?? false) : (config.upstreamVisionOk ?? false);
   if (!Array.isArray(messages)) {
     throw invalidRequestError('messages must be an array');
   }
   if (messages.length > 10000) {
     throw new GatewayError(400, 'Too many messages (max 10000)');
   }
-  return messages.map((raw, index) => normalizeMessage(raw, index, config));
+  return messages.map((raw, index) => normalizeMessage(raw, index, config, visionOk));
 }
 
-function normalizeMessage(raw: unknown, index: number, config: AppConfig): JsonObject {
+function normalizeMessage(raw: unknown, index: number, config: AppConfig, visionOk: boolean): JsonObject {
   if (!isObject(raw)) {
     throw new GatewayError(400, `messages[${index}] must be an object`);
   }
@@ -28,11 +29,11 @@ function normalizeMessage(raw: unknown, index: number, config: AppConfig): JsonO
   } else if (!['system', 'user', 'assistant', 'tool'].includes(String(message.role))) {
     throw new GatewayError(400, `messages[${index}].role is not supported`, 'invalid_request_error', 'unsupported_role');
   }
-  message.content = normalizeContent(message.content, message, config);
+  message.content = normalizeContent(message.content, message, config, visionOk);
   return message;
 }
 
-function normalizeContent(content: unknown, message: JsonObject, config: AppConfig): unknown {
+function normalizeContent(content: unknown, message: JsonObject, config: AppConfig, visionOk: boolean): unknown {
   if (content === null && message.role === 'assistant' && Array.isArray(message.tool_calls)) return null;
   if (typeof content === 'string' || content === null || content === undefined) return content;
   if (!Array.isArray(content)) {
@@ -57,7 +58,7 @@ function normalizeContent(content: unknown, message: JsonObject, config: AppConf
     if (part.type === 'refusal') {
       throw new GatewayError(400, 'refusal content parts cannot be sent upstream');
     }
-    if (part.type === 'image_url' && config.upstreamVisionOk) {
+    if (part.type === 'image_url' && visionOk) {
       hasPassthroughPart = true;
       continue;
     }

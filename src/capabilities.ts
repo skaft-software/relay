@@ -159,6 +159,15 @@ export class CapabilityRegistry {
   }
 }
 
+function initialMultimodalStatus(config: AppConfig): RelayCapabilityStatus {
+  if (!config.modelEntries) return config.upstreamVisionOk ? 'supported' : 'unknown';
+  const currentModel = config.defaultModel;
+  if (currentModel && config.modelEntries[currentModel]?.multimodal === true) return 'supported';
+  if (currentModel && config.modelEntries[currentModel]?.multimodal === false) return 'unsupported';
+  if (currentModel && config.modelEntries[currentModel]) return config.upstreamVisionOk ? 'supported' : 'unsupported';
+  return config.upstreamVisionOk ? 'supported' : 'unknown';
+}
+
 function initialCapabilities(config: AppConfig): RelayCapabilities {
   return {
     upstream: {
@@ -188,7 +197,7 @@ function initialCapabilities(config: AppConfig): RelayCapabilities {
       parallelToolCalls: 'unknown',
       jsonSchema: 'unknown',
       responseFormat: 'unknown',
-      multimodalInput: 'unknown',
+      multimodalInput: initialMultimodalStatus(config),
       reasoningContent: 'unknown',
       logprobs: 'unknown',
     },

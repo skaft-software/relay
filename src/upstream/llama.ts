@@ -21,12 +21,13 @@ export async function upstreamJson(config: AppConfig, path: string, init: Reques
   return readLimitedJson(result.response, config.maxUpstreamResponseBytes);
 }
 
-export async function upstreamFetch(config: AppConfig, path: string, init: RequestInit = {}, externalSignal?: AbortSignal): Promise<UpstreamResult> {
+export async function upstreamFetch(config: AppConfig, path: string, init: RequestInit = {}, externalSignal?: AbortSignal, upstreamBaseUrlOverride?: string): Promise<UpstreamResult> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), config.requestTimeoutMs);
   const signal = externalSignal ? AbortSignal.any([controller.signal, externalSignal]) : controller.signal;
+  const baseUrl = upstreamBaseUrlOverride ?? config.upstreamBaseUrl;
   try {
-    const response = await fetch(upstreamUrl(config.upstreamBaseUrl, path), {
+    const response = await fetch(upstreamUrl(baseUrl, path), {
       ...init,
       signal,
     });

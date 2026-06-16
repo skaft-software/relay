@@ -130,9 +130,19 @@ export class CompletionStore {
   }
 }
 
-export async function createChatCompletion(config: AppConfig, store: CompletionStore, body: unknown, externalSignal?: AbortSignal): Promise<Response> {
+export async function createChatCompletion(
+  config: AppConfig,
+  store: CompletionStore,
+  body: unknown,
+  externalSignal?: AbortSignal,
+  lifecycle?: ModelLifecycle,
+): Promise<Response> {
   const logger = createLogger(config.logLevel);
   if (!isObject(body)) throw invalidRequestError('JSON body must be an object');
+  // v2: resolve dynamic upstream URL based on model name
+  const upstreamBaseUrl = lifecycle && isObject(body) && typeof (body as any).model === 'string'
+    ? lifecycle.getUpstreamUrl((body as any).model)
+    : config.upstreamBaseUrl;
   const original = body;
   const { body: normalized, strippedFields } = normalizeChatRequest(original, config);
   logUpstreamPayloadDiagnostics(logger, {
@@ -141,13 +151,13 @@ export async function createChatCompletion(config: AppConfig, store: CompletionS
     payload: normalized,
   });
 
-  if (normalized.stream === true) return withFieldWarning(await streamChatCompletion(config, normalized, externalSignal), strippedFields, config);
+  if (normalized.stream === true) return withFieldWarning(await streamChatCompletion(config, normalized, upstreamBaseUrl, externalSignal), strippedFields, config);
 
   const upstreamRes = await upstreamFetch(config, '/v1/chat/completions', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(normalized),
-  }, externalSignal);
+  }, externalSignal, upstreamBaseUrl);
   if (!upstreamRes.response.ok) throw await upstreamHttpError(upstreamRes.response, config);
   const upstreamText = await readLimitedText(upstreamRes.response, config.maxUpstreamResponseBytes);
   const upstreamBytes = Buffer.byteLength(upstreamText);
@@ -261,7 +271,7 @@ function normalizeChatRequest(input: JsonObject, config: AppConfig): { body: Jso
   return { body: upstreamBody, strippedFields };
 }
 
-async function streamChatCompletion(config: AppConfig, body: JsonObject, externalSignal?: AbortSignal): Promise<Response> {
+async function streamChatCompletion(config: AppConfig, body: JsonObject, upstreamBaseUrl: string, externalSignal?: AbortSignal): Promise<Response> {
   const logger = createLogger(config.logLevel);
   const includeUsage = isObject(body.stream_options) && body.stream_options.include_usage === true;
   const upstream = await upstreamFetch(config, '/v1/chat/completions', {
@@ -271,7 +281,7 @@ async function streamChatCompletion(config: AppConfig, body: JsonObject, externa
       'content-type': 'application/json',
     },
     body: JSON.stringify(body),
-  }, externalSignal);
+  }, externalSignal, upstreamBaseUrl);
   if (!upstream.response.ok) {
     throw await upstreamHttpError(upstream.response, config);
   }

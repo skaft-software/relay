@@ -1,13 +1,67 @@
 # Lazy LLM Lifecycle
 
 Relay can optionally manage the lifecycle of the local llama.cpp upstream
-process so a model does not have to be resident in GPU memory 24/7. This is
-useful when several runtimes (Synax, Super, AutoCareer, …) share one GPU and
-only need the model intermittently.
+process so a model does not have to be resident in GPU memory 24/7.
 
-Lifecycle management is **disabled by default**. Default behavior is
-unchanged: Relay assumes the upstream is already running. The lifecycle path
-only activates when `RELAY_MODEL_LIFECYCLE_ENABLED=true` is set.
+## v2: Multi-model switching
+
+When `RELAY_MODEL_MAP` is configured, Relay supports dynamic model switching:
+
+- Each model gets a dedicated port allocated from `RELAY_MODEL_PORT_BASE`.
+- When a client requests a different model, Relay kills the current one and
+  starts the new one on its own port.
+- Upstream routing is per-model — requests for model A go to port X,
+  requests for model B go to port Y.
+- `/v1/models` reports per-model `ctx_size` and `multimodal` from the map.
+
+### RELAY_MODEL_MAP format
+
+JSON object mapping client-facing model names to start configs:
+
+```json
+{
+  "gemma-4-26b": {
+    "cmd": "/home/achu/start-llama-mtp.sh",
+    "health_url": "http://127.0.0.1:8080/health",
+    "timeout_sec": 300,
+    "ctx_size": 98304,
+    "multimodal": true
+  },
+  "devstral-2-24b": {
+    "cmd": "/home/achu/start-llama-devstral.sh",
+    "ctx_size": 65536,
+    "multimodal": true
+  }
+}
+```
+
+Each entry:
+
+| Field | Required | Purpose |
+|-------|----------|---------|
+| `cmd` | Yes | Shell command or script to start this model |
+| `health_url` | No | Health check URL (defaults to probing upstreamBaseUrl) |
+| `timeout_sec` | No | Startup timeout (defaults to `RELAY_MODEL_START_TIMEOUT_MS`) |
+| `ctx_size` | No | Running context size for this model, reported in `/v1/models` |
+| `multimodal` | No | Whether this model supports vision/audio (overrides `UPSTREAM_VISION_OK`) |
+| `name` | No | Display name reported to clients (defaults to key) |
+
+### Port allocation
+
+Scripts should use `${LLAMA_PORT:-8080}` for the `--port` argument. Relay
+sets `LLAMA_PORT` in the child process environment to the allocated port.
+The `PORT` env var is NOT used (it would collide with Relay's own `PORT`).
+
+```bash
+# In start scripts:
+exec ./llama-server --port ${LLAMA_PORT:-8080} ...
+```
+
+### Routing
+
+Relay resolves the upstream URL per-request using `getUpstreamUrl(modelName)`.
+When a model is running, requests route to `http://127.0.0.1:{allocated_port}/v1`.
+When a model is not running, Relay falls back to `UPSTREAM_BASE_URL`.
 
 ## Why Relay owns this
 

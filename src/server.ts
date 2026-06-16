@@ -43,6 +43,7 @@ import { createLogger } from "./logger.ts";
 import { LlmJobQueue } from "./jobs.ts";
 import type { JobQueueCounts } from "./jobs.ts";
 import { ModelLifecycle } from "./lifecycle.ts";
+import { resolveUpstreamUrl } from "./upstream/router.ts";
 import { RequestMutex } from "./mutex.ts";
 import {
   captureRequest,
@@ -121,7 +122,17 @@ export function createApp(config: AppConfig): App {
         }
         return { response: payload };
       }
-      const response = await createChatCompletion(config, store, job.request, signal);
+      const response = await createChatCompletion(config, store, job.request, signal, lifecycle);
+      // v2: cache conversation prefix for future pre-warming
+      if (config.switchPrewarm && isObject(job.request)) {
+        const msgs = (job.request as any).messages;
+        if (Array.isArray(msgs)) {
+          lifecycle.cachePrefix(msgs.map((m: any) => ({
+            role: typeof m.role === 'string' ? m.role : 'user',
+            content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? ''),
+          })));
+        }
+      }
       const payload: any = await response.clone().json().catch(async () => ({ text: await response.text() }));
       if (!response.ok) {
         return {
@@ -721,7 +732,7 @@ export function createApp(config: AppConfig): App {
             () => withLifecycleForStreaming(
               lifecycle,
               requestModel,
-              () => createChatCompletion(config, store, body, externalSignal),
+              () => createChatCompletion(config, store, body, externalSignal, lifecycle),
               isStream,
               externalSignal,
             ),

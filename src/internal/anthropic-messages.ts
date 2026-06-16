@@ -7,13 +7,13 @@ import type { CanonicalChatRequest } from './canonical.ts';
 
 type JsonObject = Record<string, any>;
 
-export function anthropicMessagesRequestToCanonical(input: JsonObject, config: AppConfig): CanonicalChatRequest {
+export function anthropicMessagesRequestToCanonical(input: JsonObject, config: AppConfig, requestModel?: string): CanonicalChatRequest {
   if (input.max_tokens === undefined) throw missingRequiredFieldError('max_tokens');
 
   const messages: JsonObject[] = [];
   const system = normalizeSystem(input.system);
   if (system) messages.push({ role: 'system', content: system });
-  messages.push(...normalizeAnthropicMessages(input.messages, config));
+  messages.push(...normalizeAnthropicMessages(input.messages, config, requestModel));
 
   const chat: JsonObject = { ...input, messages };
   if (input.stop_sequences !== undefined) chat.stop = input.stop_sequences;
@@ -69,7 +69,7 @@ function normalizeSystem(system: unknown): string | undefined {
   throw new GatewayError(400, 'system must be a string or text block array');
 }
 
-function normalizeAnthropicMessages(messages: unknown, config: AppConfig): JsonObject[] {
+function normalizeAnthropicMessages(messages: unknown, config: AppConfig, model?: string): JsonObject[] {
   if (!Array.isArray(messages)) throw new GatewayError(400, 'messages must be an array');
   const out: JsonObject[] = [];
   for (const message of messages) {
@@ -84,7 +84,7 @@ function normalizeAnthropicMessages(messages: unknown, config: AppConfig): JsonO
     if (message.role === 'assistant') {
       out.push(normalizeAssistantBlocks(message.content));
     } else {
-      out.push(...normalizeUserBlocks(message.content, config));
+      out.push(...normalizeUserBlocks(message.content, config, model));
     }
   }
   return out;
@@ -114,7 +114,7 @@ function normalizeAssistantBlocks(blocks: unknown[]): JsonObject {
   return message;
 }
 
-function normalizeUserBlocks(blocks: unknown[], config: AppConfig): JsonObject[] {
+function normalizeUserBlocks(blocks: unknown[], config: AppConfig, model?: string): JsonObject[] {
   const out: JsonObject[] = [];
   let pendingText: string[] = [];
   let pendingParts: JsonObject[] = [];
@@ -130,7 +130,7 @@ function normalizeUserBlocks(blocks: unknown[], config: AppConfig): JsonObject[]
       pendingText.push(block.text);
       pendingParts.push({ type: 'text', text: block.text });
     } else if (isImageBlock(block)) {
-      pendingParts.push(normalizeImageBlock(block, config));
+      pendingParts.push(normalizeImageBlock(block, config, model));
     } else if (isObject(block) && block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
       flushText();
       out.push({ role: 'tool', tool_call_id: block.tool_use_id, content: normalizeToolResultContent(block.content) });
@@ -171,8 +171,9 @@ function isImageBlock(value: unknown): value is { source: { type: string; media_
   return isObject(value) && value.type === 'image' && isObject(value.source) && value.source.type === 'base64';
 }
 
-function normalizeImageBlock(block: { source: { media_type?: string; data?: string } }, config: AppConfig): JsonObject {
-  if (!config.upstreamVisionOk) {
+function normalizeImageBlock(block: { source: { media_type?: string; data?: string } }, config: AppConfig, model?: string): JsonObject {
+  const visionOk = model ? (config.modelEntries?.[model]?.multimodal ?? config.upstreamVisionOk ?? false) : (config.upstreamVisionOk ?? false);
+  if (!visionOk) {
     throw unsupportedCapabilityError('Image content blocks are not supported by this upstream');
   }
   const mediaType = typeof block.source.media_type === 'string' ? block.source.media_type : 'image/png';

@@ -9,6 +9,14 @@ export type ModelEntry = {
   name?: string;
   /** Running context size for this model (--ctx-size). Overrides global UPSTREAM_CTX_SIZE for model list and capabilities. */
   ctx_size?: number;
+  /** Whether this model supports multimodal (vision/audio) input. When unset, falls back to upstreamVisionOk. */
+  multimodal?: boolean;
+  /** Fixed port for this model's upstream server. Auto-allocated if unset. */
+  port?: number;
+  /** Pre-warm this model with cached conversation prefixes on switch. */
+  prewarm?: boolean;
+  /** Grace period in ms to keep old model alive after switch. */
+  switchGraceMs?: number;
 };
 
 export type AppConfig = {
@@ -73,6 +81,18 @@ export type AppConfig = {
    *  When a client requests a model in this map, the lifecycle will
    *  automatically switch to it if the current model differs. */
   modelEntries?: Record<string, ModelEntry>;
+  /** Switch policy: graceful keeps old model warm, eager kills first. */
+  switchPolicy: 'graceful' | 'eager';
+  /** Starting port number for dynamic model port allocation. */
+  modelPortBase: number;
+  /** Enable prompt-cache pre-warming when switching models. */
+  switchPrewarm: boolean;
+  /** Maximum number of concurrent model processes to keep warm. */
+  switchMaxWarmModels: number;
+  /** Prefix cache: max number of cached conversation prefixes. */
+  prefixCacheMaxEntries: number;
+  /** Prefix cache: max combined size of cached prefixes in tokens. */
+  prefixCacheMaxTokens: number;
 };
 
 export type UnknownFieldPolicy = 'pass_through' | 'strip' | 'reject';
@@ -159,7 +179,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     rateLimitRelayPostWindowMs: readInteger(env.RATE_LIMIT_RELAY_POST_WINDOW_SECONDS, 60, 'RATE_LIMIT_RELAY_POST_WINDOW_SECONDS') * 1000,
     serializeRequests: readBoolean(env.RELAY_SERIALIZE_REQUESTS, true),
     modelEntries: readModelEntries(env.RELAY_MODEL_MAP),
+    switchPolicy: readSwitchPolicy(env.RELAY_SWITCH_POLICY),
+    modelPortBase: readInteger(env.RELAY_MODEL_PORT_BASE, 8081, 'RELAY_MODEL_PORT_BASE'),
+    switchPrewarm: readBoolean(env.RELAY_SWITCH_PREWARM, true),
+    switchMaxWarmModels: readInteger(env.RELAY_SWITCH_MAX_WARM_MODELS, 2, 'RELAY_SWITCH_MAX_WARM_MODELS'),
+    prefixCacheMaxEntries: readInteger(env.RELAY_PREFIX_CACHE_MAX_ENTRIES, 50, 'RELAY_PREFIX_CACHE_MAX_ENTRIES'),
+    prefixCacheMaxTokens: readInteger(env.RELAY_PREFIX_CACHE_MAX_TOKENS, 1_000_000, 'RELAY_PREFIX_CACHE_MAX_TOKENS'),
   };
+}
+
+
+function readSwitchPolicy(value: string | undefined): 'graceful' | 'eager' {
+  const raw = readOptional(value) ?? 'eager'  // eager is safe for single-GPU; graceful needs 2x VRAM;
+  if (raw === 'graceful' || raw === 'eager') return raw;
+  throw new Error('RELAY_SWITCH_POLICY must be graceful or eager');
 }
 
 function readIdleShutdownMs(env: NodeJS.ProcessEnv): number {
@@ -308,4 +341,17 @@ function readModelEntries(value: string | undefined): Record<string, ModelEntry>
     // invalid JSON, fall through
   }
   return undefined;
+}
+
+/**
+ * Check whether a given model supports multimodal input.
+ *
+ * Resolution order:
+ * 1. Per-model `multimodal` flag in modelEntries (explicit opt-in/opt-out)
+ * 2. Global `upstreamVisionOk` config flag (backward compat)
+ */
+export function isModelMultimodal(config: AppConfig, model?: string): boolean {
+  if (model && config.modelEntries?.[model]?.multimodal === true) return true;
+  if (model && config.modelEntries?.[model]?.multimodal === false) return false;
+  return config.upstreamVisionOk ?? false;
 }
