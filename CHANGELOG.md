@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.2.1 - 2026-06-16
+
+### Added
+
+- **Per-model thinking levels** — `ModelEntry.thinking_levels` advertises model-specific levels (e.g. `["low","med","high","xhigh"]` for North/Cohere, `["on","off"]` for Qwen/Gemma). Exposed in `/v1/models` meta and capabilities.
+- **Per-model context sizes** — `ModelEntry.ctx_size` reported in `/v1/models` meta, overrides global `UPSTREAM_CTX_SIZE`.
+- **Per-model multimodal flag** — `ModelEntry.multimodal` controls vision support per model in `/v1/models` and capabilities.
+- **Dynamic upstream routing** — chat handler passes per-model upstream URL to `upstreamFetch`, fixing model switching routing.
+- **Stale upstream detection** — probes and kills leftover servers on cold start before spawning new model.
+- **LLAMA_PORT env passing** — scripts use `${LLAMA_PORT:-8080}` instead of `${PORT}` to avoid collision with Relay's `PORT`.
+
+### Changed
+
+- Start scripts: port placeholder changed from `${PORT}` to `${LLAMA_PORT}` to prevent env collision.
+- `getUpstreamUrl` routes to process port as soon as process exists (not just when healthy).
+- Dockerfile: added `render` group (991) for Vulkan GPU access inside container.
+- Docs: `lazy-llm-lifecycle.md` updated for v2 model switching with `RELAY_MODEL_MAP`.
+
+### Fixed
+
+- 401 errors from `API_KEY` being set unexpectedly.
+- Model switch hanging due to `PORT=1234` leaking into child scripts.
+- Dynamic upstream URL computed but never passed to `upstreamFetch`.
+- `startAndWait` removed in v2 refactor but still called in legacy path.
+
 ## v0.2.0 - 2026-06-16
 
 ### Added

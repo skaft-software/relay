@@ -1,7 +1,7 @@
 # Relay Job Queue
 
 Relay owns LLM request brokering for local llama.cpp-style upstreams. It
-exposes a minimal, serialized job queue that agent runtimes (Synax, Super,
+exposes a minimal, serialized job queue that agent runtimes (Hamr, Super,
 AutoCareer, etc.) can submit work to instead of hammering the upstream
 directly. Existing OpenAI- and Anthropic-compatible HTTP routes keep working
 exactly as before; the queue is an additional surface, not a replacement.
@@ -33,7 +33,7 @@ authentication as the rest of Relay.
 ```json
 POST /relay/jobs
 {
-  "source": "synax",
+  "source": "hamr",
   "kind": "openai.chat",
   "priority": "normal",
   "request": {
@@ -61,7 +61,7 @@ with the existing API.
 ```jsonc
 {
   "id": "…uuid…",
-  "source": "synax",
+  "source": "hamr",
   "kind": "openai.chat",
   "priority": "normal",
   "stream": false,
@@ -102,7 +102,7 @@ with the existing API.
 ## What Relay does *not* do
 
 Relay is not an agent runtime. It does not implement task planning, memory,
-tool dispatch, Super logic, AutoCareer logic, or Synax orchestration. Those
+tool dispatch, Super logic, AutoCareer logic, or Hamr orchestration. Those
 runtimes are expected to call Relay just like any other OpenAI/Anthropic-
 compatible gateway, with the option of using the queue when they need
 serialization and lifecycle.

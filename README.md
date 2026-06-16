@@ -1,7 +1,7 @@
 # Relay
 
-[![License](https://img.shields.io/github/license/achuthanmukundan00/relay)](https://github.com/achuthanmukundan00/relay/blob/main/LICENSE)
-[![Latest Release](https://img.shields.io/github/v/release/achuthanmukundan00/relay)](https://github.com/achuthanmukundan00/relay/releases/latest)
+[![License](https://img.shields.io/github/license/skaft/relay)](https://github.com/skaft/relay/blob/main/LICENSE)
+[![Latest Release](https://img.shields.io/github/v/release/skaft/relay)](https://github.com/skaft/relay/releases/latest)
 
 Relay is a lightweight, agent-focused gateway that makes local LLM servers look like hosted OpenAI- and Anthropic-style APIs. It sits between clients and local upstream model servers (like llama.cpp), normalizes request/response shapes, and manages model lifecycles.
 

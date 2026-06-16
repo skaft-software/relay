@@ -59,6 +59,8 @@ export type LifecycleStatus = {
   lastHealthyAt?: string;
   currentModel?: string | null;
   modelEntries?: string[];
+  /** Model currently being loaded (name of the target of an in-progress switch). */
+  loadingModel?: string | null;
   /** Active model processes (v2: multi-model support). */
   activeModels?: Array<{ name: string; port: number; healthy: boolean; pid?: number }>;
 };
@@ -83,6 +85,10 @@ interface ModelProcess {
   startFailureCount: number;
   circuitBreakerFailures: number[];
   circuitBreakerCooldownUntil: number | null;
+  /** True once the child process has exited (before it is removed from activeProcesses). */
+  exited: boolean;
+  exitCode: number | null;
+  exitSignal: string | null;
 }
 
 const DEFAULT_IDLE_SHUTDOWN_MS = 600_000;
@@ -153,7 +159,9 @@ export class ModelLifecycle {
         }
         execFileSync('fuser', ['-k', ...portArgs], { timeout: 3000, stdio: 'ignore' });
       } catch {
-        // Best-effort — orphan cleanup failure shouldn't block startup
+        // Best-effort — orphan cleanup failure shouldn't block startup.
+        // Log at warn so permission/missing-binary issues are visible.
+        if (this.hooks.log) this.hooks.log('warn', 'startup orphan cleanup via fuser failed', {});
       }
     }
   }
@@ -350,20 +358,24 @@ export class ModelLifecycle {
           return { ok: false, code: 'model_start_failed', message: `Failed to start ${modelName}` };
         }
 
-        // 2. Pre-warm the new model's KV cache with cached prefixes
-        if (this.config.switchPrewarm && this.prefixCache.size > 0) {
+        // 2. Wait for the new model to become healthy
+        const startedProc = this.activeProcesses.get(modelName);
+        const healthy = await this.waitForHealthy(port,
+          entry.timeout_sec
+            ? entry.timeout_sec * 1000
+            : (this.config.modelStartTimeoutMs ?? DEFAULT_START_TIMEOUT_MS),
+          startedProc ?? undefined,
+          externalSignal,
+        );
+
+        // 3. Pre-warm the new model's KV cache with cached prefixes only after health is confirmed
+        if (healthy && this.config.switchPrewarm && this.prefixCache.size > 0) {
           this.log('info', 'pre-warming new model KV cache', {
             model: modelName,
             cachedPrefixes: this.prefixCache.size,
           });
           await this.prewarmModel(port, externalSignal);
         }
-
-        // 3. Wait for the new model to become healthy
-        const healthy = await this.waitForHealthy(port, entry.timeout_sec
-          ? entry.timeout_sec * 1000
-          : (this.config.modelStartTimeoutMs ?? DEFAULT_START_TIMEOUT_MS),
-        externalSignal);
 
         if (!healthy) {
           this.log('error', 'new model failed health check', { model: modelName, port });
@@ -460,8 +472,10 @@ export class ModelLifecycle {
           return { ok: false, code: 'model_start_failed', message: `Failed to start ${modelName}` };
         }
 
+        const startedProc = this.activeProcesses.get(modelName);
         const healthy = await this.waitForHealthy(port,
           entry.timeout_sec ? entry.timeout_sec * 1000 : (this.config.modelStartTimeoutMs ?? DEFAULT_START_TIMEOUT_MS),
+          startedProc ?? undefined,
           externalSignal,
         );
 
@@ -521,6 +535,8 @@ export class ModelLifecycle {
       execFileSync('fuser', ['-k', `${port}/tcp`], { timeout: 2000, stdio: 'ignore' });
     } catch {
       // Best-effort — orphan cleanup failure shouldn't block startup.
+      // Log at warn so permission/missing-binary issues are visible.
+      if (this.hooks.log) this.hooks.log('warn', 'per-port orphan cleanup via fuser failed', { port });
     }
     return port;
   }
@@ -553,7 +569,10 @@ export class ModelLifecycle {
     });
 
     try {
-      const child = this.runCommand(resolvedCmd, resolvedArgv);
+      const child = this.runCommand(resolvedCmd, resolvedArgv, {
+        LLAMA_PORT: String(port),
+        MODEL: modelName,
+      });
       if (!child) {
         this.log('error', 'start command produced no child process', { model: modelName });
         return null;
@@ -575,6 +594,9 @@ export class ModelLifecycle {
         startFailureCount: 0,
         circuitBreakerFailures: [],
         circuitBreakerCooldownUntil: null,
+        exited: false,
+        exitCode: null,
+        exitSignal: null,
       };
 
       this.captureProcessStdio(proc);
@@ -587,11 +609,17 @@ export class ModelLifecycle {
           });
           proc.healthy = false;
         });
-        child.on('exit', (code) => {
+        child.on('exit', (code, signal) => {
+          proc.exited = true;
+          proc.exitCode = code ?? null;
+          proc.exitSignal = signal ?? null;
+          const tail = proc.ringBuffer.toString('utf-8').slice(-1024);
           this.log('info', 'model process exited', {
             model: modelName,
             pid: child.pid,
             exitCode: code,
+            exitSignal: signal,
+            stdioTail: tail ? redact(tail) : undefined,
           });
           proc.healthy = false;
           if (this.currentModelName === modelName) {
@@ -616,11 +644,23 @@ export class ModelLifecycle {
   private async waitForHealthy(
     port: number,
     timeoutMs: number,
+    proc?: ModelProcess,
     externalSignal?: AbortSignal,
   ): Promise<boolean> {
     const deadline = this.now() + timeoutMs;
     while (this.now() < deadline) {
       if (externalSignal?.aborted) return false;
+      if (proc?.exited) {
+        const tail = proc.ringBuffer.toString('utf-8').slice(-1024);
+        this.lastError = `model process exited before becoming healthy (code=${proc.exitCode}, signal=${proc.exitSignal}); stdio tail: ${redact(tail)}`;
+        this.log('error', 'model process exited during startup', {
+          model: proc.name,
+          exitCode: proc.exitCode,
+          exitSignal: proc.exitSignal,
+          stdioTail: tail ? redact(tail) : undefined,
+        });
+        return false;
+      }
       const ok = await this.probePort(port, externalSignal);
       if (ok) return true;
       await sleep(500);
@@ -882,6 +922,7 @@ export class ModelLifecycle {
       startFailureCount: this.startFailureCount,
       lastHealthyAt: this.lastHealthyAt,
       currentModel: this.currentModelName,
+      loadingModel: this.switchTargetModel,
       modelEntries: this.config.modelEntries ? Object.keys(this.config.modelEntries) : undefined,
       activeModels: activeModels.length > 0 ? activeModels : undefined,
     };
@@ -1130,16 +1171,18 @@ export class ModelLifecycle {
     return defaultProbePort(port, externalSignal);
   }
 
-  private runCommand(command: string, argv?: string[]): ChildProcess | null {
+  private runCommand(command: string, argv?: string[], env?: Record<string, string>): ChildProcess | null {
     if (this.hooks.spawnProcess) {
       return this.hooks.spawnProcess(command, argv);
     }
+    const childEnv = env ? { ...process.env, ...env } : process.env;
     if (argv && argv.length > 0) {
       const [cmd, ...args] = argv;
       const child = spawn(cmd, args, {
         detached: true,
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
+        env: childEnv,
       });
       child.unref();
       return child;
@@ -1149,6 +1192,7 @@ export class ModelLifecycle {
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
+      env: childEnv,
     });
     child.unref();
     return child;

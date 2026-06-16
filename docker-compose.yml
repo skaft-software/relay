@@ -17,5 +17,16 @@ services:
       # Override RELAY_MODEL_DIR in .env to set your model path.
       - ${RELAY_MODEL_DIR:-${HOME}/models}:${RELAY_MODEL_DIR:-${HOME}/models}:ro
       - /usr/share/vulkan:/usr/share/vulkan:ro
+      # Mount start scripts so the lifecycle can spawn model servers.
+      # Keep these in sync with RELAY_MODEL_MAP entries in .env.
+      - /home/achu/start-llama-devstral.sh:/home/achu/start-llama-devstral.sh:ro
+      - /home/achu/start-llama-qwen36-mtp.sh:/home/achu/start-llama-qwen36-mtp.sh:ro
+      - /home/achu/start-llama-mtp.sh:/home/achu/start-llama-mtp.sh:ro
+      - /home/achu/start-llama-glm47.sh:/home/achu/start-llama-glm47.sh:ro
+      - /home/achu/start-llama-north.sh:/home/achu/start-llama-north.sh:ro
+      # Mount llama.cpp build and Jinja templates so child processes
+      # can find the server binary and chat templates.
+      - /home/achu/llama.cpp:/home/achu/llama.cpp:ro
+      - /home/achu/templates:/home/achu/templates:ro
     devices:
       - /dev/dri:/dev/dri

@@ -284,7 +284,7 @@
   color: var(--vp-c-text-1);
 }
 
-/* ---- Subtle callout (Synax note) ---- */
+/* ---- Subtle callout (Hamr note) ---- */
 .relay-note {
   background: rgba(var(--relay-steel-rgb) / 0.05);
   border: 1px solid rgba(var(--relay-steel-rgb) / 0.12);

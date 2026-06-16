@@ -1,7 +1,9 @@
 export type ModelEntry = {
   /** Shell command or script to start this model */
   cmd: string;
-  /** Optional health URL (defaults to probing upstreamBaseUrl) */
+  /** Optional health URL (defaults to probing upstreamBaseUrl).
+   *  @deprecated Per-model health checks always use http://127.0.0.1:${port}/health.
+   *  This field is parsed but not consulted by the lifecycle. */
   health_url?: string;
   /** Startup timeout in seconds (defaults to modelStartTimeoutMs / 1000) */
   timeout_sec?: number;
@@ -11,6 +13,8 @@ export type ModelEntry = {
   ctx_size?: number;
   /** Whether this model supports multimodal (vision/audio) input. When unset, falls back to upstreamVisionOk. */
   multimodal?: boolean;
+  /** Thinking levels this model supports. ["on"] for always-thinking models like North/Cohere. Overrides global RELAY_THINKING_LEVELS. */
+  thinking_levels?: string[];
   /** Fixed port for this model's upstream server. Auto-allocated if unset. */
   port?: number;
   /** Pre-warm this model with cached conversation prefixes on switch. */

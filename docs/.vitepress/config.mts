@@ -12,7 +12,7 @@ export default defineConfig({
       { text: 'Docs', link: '/' },
       { text: 'Quickstart', link: '/quickstart' },
       { text: 'Guide', link: '/configuration' },
-      { text: 'GitHub', link: 'https://github.com/achuthanmukundan00/relay' },
+      { text: 'GitHub', link: 'https://github.com/skaft/relay' },
     ],
     sidebar: [
       {
@@ -33,7 +33,7 @@ export default defineConfig({
       provider: 'local',
     },
     socialLinks: [
-      { icon: 'github', link: 'https://github.com/achuthanmukundan00/relay' },
+      { icon: 'github', link: 'https://github.com/skaft/relay' },
     ],
   },
 });

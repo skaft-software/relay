@@ -201,7 +201,7 @@ function initialCapabilities(config: AppConfig): RelayCapabilities {
       reasoningContent: 'unknown',
       logprobs: 'unknown',
     },
-    profile: activeProfile(config),
+    profile: activeProfile(config, config.defaultModel),
     checkedAt: new Date().toISOString(),
   };
 }

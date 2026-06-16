@@ -142,12 +142,16 @@ export function getModelProfile(config: AppConfig): RelayModelProfile {
   return PROFILES[config.modelProfile] ?? PROFILES.generic;
 }
 
-export function activeProfile(config: AppConfig) {
+export function activeProfile(config: AppConfig, modelName?: string) {
   const profile = getModelProfile(config);
+  // Per-model thinking levels override global config
+  const modelThinking = modelName ? config.modelEntries?.[modelName]?.thinking_levels : undefined;
   const thinking: { supported: boolean; levels: string[] } =
-    config.thinkingSupported && config.thinkingLevels?.length
-      ? { supported: true, levels: config.thinkingLevels }
-      : profile.thinking ?? { supported: false, levels: ['on', 'off'] };
+    modelThinking?.length
+      ? { supported: true, levels: modelThinking }
+      : config.thinkingSupported && config.thinkingLevels?.length
+        ? { supported: true, levels: config.thinkingLevels }
+        : profile.thinking ?? { supported: false, levels: ['on', 'off'] };
   return {
     id: profile.id,
     name: profile.displayName,

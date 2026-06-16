@@ -10,13 +10,16 @@ export async function handleModels(config: AppConfig, model?: string, externalSi
       const ctxSize = entry.ctx_size ?? config.upstreamCtxSize;
       const caps: string[] = ['completion'];
       if (entry.multimodal === true) caps.push('multimodal');
+      const meta: Record<string, unknown> = {};
+      if (ctxSize) meta.n_ctx = ctxSize;
+      if (entry.thinking_levels?.length) meta.thinking_levels = entry.thinking_levels;
       return {
         id: entry.name ?? id,
         object: 'model',
         created: 0,
         owned_by: 'local',
         capabilities: caps,
-        meta: ctxSize ? { n_ctx: ctxSize } : undefined,
+        meta: Object.keys(meta).length ? meta : undefined,
       };
     });
 

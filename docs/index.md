@@ -87,7 +87,7 @@ curl http://127.0.0.1:1234/v1/models
 </TerminalBlock>
 
 <div class="relay-note">
-  <strong>Using Synax?</strong> Relay can act as the local model gateway underneath it. Synax is the agent UX and runtime; Relay is the compatibility boundary that makes local inference actually work with it.
+  <strong>Using Hamr?</strong> Relay can act as the local model gateway underneath it. Hamr is the agent UX and runtime; Relay is the compatibility boundary that makes local inference actually work with it.
 </div>
 
 </div>

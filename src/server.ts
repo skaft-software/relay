@@ -202,6 +202,12 @@ export function createApp(config: AppConfig): App {
     const isStream = (response.headers.get('content-type') ?? '').includes('text/event-stream');
     // Skip wrapping when response already manages its own lifecycle
     // (e.g. streamWithModelLoading, which carries x-relay-loading).
+    // x-relay-loading responses are SSE heartbeats emitted while a model
+    // cold-starts.  Releasing the mutex immediately avoids holding it for
+    // the entire startup duration (potentially minutes).  Concurrent
+    // requests are protected against ping-pong model switches by the
+    // lifecycle's switchInFlight guard and the early rejection check in
+    // withLifecycleForStreaming.
     if (!isStream || !response.body || response.headers.has('x-relay-loading')) {
       mutex.release();
       return response;
@@ -639,10 +645,11 @@ export function createApp(config: AppConfig): App {
         if (request.method === "POST") {
           // Read body clone for stream detection and model extraction before handleAnthropicMessages consumes it.
           const bodyPreview = await request.clone().text().catch(() => '');
-          const isStream = bodyPreview.includes('"stream":true') || bodyPreview.includes('"stream": true');
+          let isStream = false;
           let anthropicModel: string | undefined;
           try {
             const parsed = JSON.parse(bodyPreview);
+            isStream = parsed?.stream === true;
             anthropicModel = typeof parsed?.model === 'string' ? parsed.model : undefined;
           } catch { /* ignore */ }
           response = await withMutex(
@@ -1408,6 +1415,16 @@ async function withLifecycleForStreaming(
   // If the model is already hot, skip loading events and stream directly.
   if (enabled && isStream && modelName) {
     const status = lifecycle.getLifecycleStatus();
+    // If a different model is currently loading via a graceful/eager switch,
+    // reject early to avoid ping-pong switches and potential OOM on single-GPU.
+    if (status.loadingModel && status.loadingModel !== modelName && status.state === 'starting') {
+      return jsonResponse({
+        error: {
+          message: `Model "${status.loadingModel}" is currently loading. Retry "${modelName}" later.`,
+          code: 'model_switching',
+        },
+      }, 503);
+    }
     if (status.modelAvailable && status.state === 'running' && status.currentModel === modelName) {
       lifecycle.markJobStarted();
       const response = await handler();
@@ -1548,8 +1565,9 @@ async function streamWithModelLoading(
     async start(controller) {
       const emitLoading = () => {
         const elapsedMs = Date.now() - startTime;
-        const payload = JSON.stringify({ event: 'loading', model: modelName, elapsed_ms: elapsedMs });
-        controller.enqueue(encoder.encode(`data: ${payload}\n\n`));
+        // Emit as SSE comment lines so OpenAI-compatible clients ignore them
+        // instead of trying to parse them as chat completion chunks.
+        controller.enqueue(encoder.encode(`: relay loading model=${modelName} elapsed_ms=${elapsedMs}\n\n`));
       };
 
       emitLoading();
@@ -1608,7 +1626,13 @@ async function streamWithModelLoading(
       } catch (err) {
         if (loadingTimer) clearInterval(loadingTimer);
         if (!cancelled) {
-          controller.error(err);
+          const message = err instanceof Error ? err.message : String(err);
+          const errPayload = JSON.stringify({ error: { message, type: 'upstream_error' } });
+          try {
+            controller.enqueue(encoder.encode(`data: ${errPayload}\n\n`));
+            controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          } catch { /* stream may already be closed */ }
+          try { controller.close(); } catch { /* already closed */ }
         } else {
           try { controller.close(); } catch { /* already closed */ }
         }
