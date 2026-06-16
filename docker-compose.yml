@@ -10,9 +10,12 @@ services:
     # Share the host PID namespace so the lifecycle can kill/restart
     # llama-server processes via pkill.
     pid: host
-    restart: unless-stopped
+    restart: on-failure:10
     volumes:
-      - ${HOME}:${HOME}
+      # Mount only model directories and config — avoid exposing the
+      # entire home directory (which contains .ssh, .aws, etc.).
+      # Override RELAY_MODEL_DIR in .env to set your model path.
+      - ${RELAY_MODEL_DIR:-${HOME}/models}:${RELAY_MODEL_DIR:-${HOME}/models}:ro
       - /usr/share/vulkan:/usr/share/vulkan:ro
     devices:
       - /dev/dri:/dev/dri

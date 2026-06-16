@@ -43,7 +43,6 @@ import { createLogger } from "./logger.ts";
 import { LlmJobQueue } from "./jobs.ts";
 import type { JobQueueCounts } from "./jobs.ts";
 import { ModelLifecycle } from "./lifecycle.ts";
-import { resolveUpstreamUrl } from "./upstream/router.ts";
 import { RequestMutex } from "./mutex.ts";
 import {
   captureRequest,
@@ -211,6 +210,12 @@ export function createApp(config: AppConfig): App {
     // Wrap the stream body so the mutex isn't released until the SSE stream
     // finishes (or the client disconnects).
     const reader = response.body.getReader();
+    let mutexReleased = false;
+    const releaseMutex = () => {
+      if (mutexReleased) return;
+      mutexReleased = true;
+      mutex.release();
+    };
     const wrappedStream = new ReadableStream({
       async start(controller) {
         try {
@@ -224,8 +229,12 @@ export function createApp(config: AppConfig): App {
           controller.error(e);
         } finally {
           reader.releaseLock();
-          mutex.release();
+          releaseMutex();
         }
+      },
+      cancel() {
+        reader.cancel().catch(() => {});
+        releaseMutex();
       },
     });
 
@@ -1399,14 +1408,6 @@ async function withLifecycleForStreaming(
   // If the model is already hot, skip loading events and stream directly.
   if (enabled && isStream && modelName) {
     const status = lifecycle.getLifecycleStatus();
-    console.error('[TRACE:relay-fastpath]', JSON.stringify({
-      modelAvailable: status.modelAvailable,
-      state: status.state,
-      currentModel: status.currentModel,
-      reqModel: modelName,
-      activeJobs: status.activeJobs,
-      idleScheduled: status.idleShutdownScheduled,
-    }));
     if (status.modelAvailable && status.state === 'running' && status.currentModel === modelName) {
       lifecycle.markJobStarted();
       const response = await handler();
@@ -1452,7 +1453,6 @@ async function withLifecycleForStreaming(
       lifecycle.maybeShutdownWhenIdle();
       return response;
     }
-    console.error('[TRACE:relay-coldstart] falling to streamWithModelLoading for', modelName);
     return streamWithModelLoading(lifecycle, modelName, handler, externalSignal);
   }
 
@@ -1476,12 +1476,7 @@ async function withLifecycleForStreaming(
     }
   }
 
-  // Lifecycle disabled: skip all lifecycle management — passthrough
-  if (!enabled) {
-    return handler();
-  }
-
-  // No lifecycle — simple passthrough (should not be reached)
+  // Lifecycle disabled or no model name: simple passthrough
   return handler();
 }
 
@@ -1557,14 +1552,12 @@ async function streamWithModelLoading(
         controller.enqueue(encoder.encode(`data: ${payload}\n\n`));
       };
 
-      console.error('[TRACE:relay-loading] first loading event for', modelName);
       emitLoading();
       loadingTimer = setInterval(emitLoading, 3000);
 
       try {
         const availability = await lifecycle.ensureModelAvailable(modelName, streamAbortController.signal);
 
-        console.error('[TRACE:relay-loaded] model ready, stopping loading for', modelName);
         if (loadingTimer) clearInterval(loadingTimer);
 
         if (streamAbortController.signal.aborted) {

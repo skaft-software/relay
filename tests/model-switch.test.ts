@@ -285,7 +285,7 @@ test('lifecycle: forceShutdown without models returns false', () => {
 
   const result = lifecycle.forceShutdown();
   assert.equal(result.ok, false);
-  assert.equal(result.reason, 'no models running');
+  assert.equal(result.reason, 'no shutdown command configured');
 });
 
 // ─── Redact function ──────────────────────────────────────────────────────

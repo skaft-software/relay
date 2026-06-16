@@ -14,7 +14,8 @@
  *  - Idle shutdown: per-model idle timers, cascading (least-recently-used first)
  */
 
-import { execSync, spawn, type ChildProcess } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 
 import type { AppConfig, ModelEntry } from './config.ts';
 
@@ -29,7 +30,7 @@ export type ModelAvailability = {
 export type LifecycleHooks = {
   log?: (level: 'info' | 'warn' | 'error', msg: string, meta?: Record<string, unknown>) => void;
   spawnProcess?: (command: string, argv?: string[]) => ChildProcess | null;
-  probe?: (port: number, signal?: AbortSignal) => Promise<boolean>;
+  probe?: (port?: number, signal?: AbortSignal) => Promise<boolean>;
   now?: () => number;
   setTimer?: (fn: () => void, ms: number) => unknown;
   clearTimer?: (handle: unknown) => void;
@@ -109,6 +110,10 @@ export class ModelLifecycle {
   private ringBuffer: Buffer = Buffer.alloc(0);
   private readonly ringBufferMaxBytes: number;
 
+  // ── Legacy circuit breaker (instance-level for non-modelEntries path) ──
+  private legacyCircuitBreakerFailures: number[] = [];
+  private legacyCircuitBreakerCooldownUntil: number | null = null;
+
   // ── v2: Multi-model support ──────────────────────────────────────────
 
   /** All active model processes, keyed by model name. */
@@ -142,15 +147,13 @@ export class ModelLifecycle {
     if (config.lazyModelEnabled) {
       try {
         const portBase = config.modelPortBase ?? 8081;
+        const portArgs: string[] = [];
         for (let p = portBase - 1; p < portBase + 10; p++) {
-          try {
-            execSync('fuser -k ' + p + '/tcp 2>/dev/null || true', { timeout: 1000 });
-          } catch {
-            // port may not be in use
-          }
+          portArgs.push(`${p}/tcp`);
         }
+        execFileSync('fuser', ['-k', ...portArgs], { timeout: 3000, stdio: 'ignore' });
       } catch {
-        // Best-effort
+        // Best-effort — orphan cleanup failure shouldn't block startup
       }
     }
   }
@@ -220,12 +223,20 @@ export class ModelLifecycle {
       return { ok: false, code: 'model_start_not_configured', message };
     }
 
-    if (!this.startInFlight) {
-      this.state = 'starting';
-      this.startInFlight = this.startAndWait(undefined, externalSignal).finally(() => {
-        this.startInFlight = null;
-      });
+    // Check legacy circuit breaker cooldown
+    if (this.checkCircuitBreaker()) {
+      return { ok: false, code: 'model_start_disabled', message: 'Too many recent start failures. Circuit breaker active.' };
     }
+
+    // Reject overlapping starts — if a start is already in-flight, don't wait for it
+    if (this.startInFlight) {
+      return { ok: false, code: 'model_start_in_progress', message: 'A model start is already in progress' };
+    }
+
+    this.state = 'starting';
+    this.startInFlight = this.startAndWait(undefined, externalSignal).finally(() => {
+      this.startInFlight = null;
+    });
     return this.startInFlight;
   }
 
@@ -439,7 +450,7 @@ export class ModelLifecycle {
         await this.killAllProcesses();
         this.currentModelName = null;
         this.modelAvailable = false;
-        this.stopCount += Object.keys(this.activeProcesses).length || 1;
+        this.stopCount += this.activeProcesses.size || 1;
 
         this.state = 'starting';
         const port = this.allocatePort(modelName);
@@ -507,8 +518,7 @@ export class ModelLifecycle {
     // Detached child processes survive restarts as init orphans — fuser -k
     // cleans them up before we bind.
     try {
-      // execSync imported at top of file
-      execSync('fuser -k ' + port + '/tcp 2>/dev/null || true', { timeout: 2000 });
+      execFileSync('fuser', ['-k', `${port}/tcp`], { timeout: 2000, stdio: 'ignore' });
     } catch {
       // Best-effort — orphan cleanup failure shouldn't block startup.
     }
@@ -792,7 +802,7 @@ export class ModelLifecycle {
   private async shutdownIdleModels(): Promise<void> {
     if (this.activeJobs > 0 || this.pendingJobs > 0) return;
 
-    // Kill all non-current, non-warm models
+    // Kill all non-current, non-warm v2 model processes
     for (const [name, proc] of this.activeProcesses) {
       if (name === this.currentModelName) continue;
       if (proc.keepWarm) continue;
@@ -807,18 +817,41 @@ export class ModelLifecycle {
       this.state = 'idle';
       this.modelAvailable = false;
       this.currentModelName = null;
+      return;
+    }
+
+    // Legacy idle shutdown: run stop command if no v2 processes remain
+    if (
+      this.activeProcesses.size === 0 &&
+      (this.config.llamaStopCommand || this.config.modelShutdownArgv)
+    ) {
+      this.log('info', 'idle shutdown: running legacy stop command');
+      this.state = 'stopping';
+      await this.attemptShutdown();
     }
   }
 
   forceShutdown(): { ok: boolean; reason?: string } {
     if (this.state === 'stopping') return { ok: false, reason: 'already stopping' };
-    if (this.activeProcesses.size === 0) return { ok: false, reason: 'no models running' };
-    void this.killAllProcesses().then(() => {
-      this.state = 'idle';
-      this.modelAvailable = false;
-      this.currentModelName = null;
-    });
-    return { ok: true };
+
+    // Fast path: kill active v2 model processes
+    if (this.activeProcesses.size > 0) {
+      void this.killAllProcesses().then(() => {
+        this.state = 'idle';
+        this.modelAvailable = false;
+        this.currentModelName = null;
+      });
+      return { ok: true };
+    }
+
+    // Legacy path: run stop command if configured
+    if (this.config.llamaStopCommand || this.config.modelShutdownArgv) {
+      this.state = 'stopping';
+      void this.attemptShutdown();
+      return { ok: true };
+    }
+
+    return { ok: false, reason: 'no shutdown command configured' };
   }
 
   getLifecycleStatus(): LifecycleStatus {
@@ -862,10 +895,204 @@ export class ModelLifecycle {
 
   private cancelIdleShutdown(reason: string): void {
     if (!this.idleTimer) return;
-    const clear = this.hooks.clearTimer ?? ((h: unknown) => clearTimeout(h as NodeJS.Timeout));
-    clear(this.idleTimer);
+    this.clearTimer(this.idleTimer);
     this.idleTimer = null;
     this.idleScheduledAt = null;
+  }
+
+  // ── Legacy start/wait (for non-modelEntries path) ────────────────
+
+  private async startAndWait(_entry: undefined, externalSignal?: AbortSignal): Promise<ModelAvailability> {
+    const startCmd = this.config.llamaStartCommand;
+    const argv = this.config.modelStartArgv;
+    const timeoutMs = this.config.modelStartTimeoutMs ?? DEFAULT_START_TIMEOUT_MS;
+
+    if (!startCmd && !argv) {
+      this.state = 'idle';
+      return { ok: false, code: 'model_start_not_configured', message: 'start command missing' };
+    }
+
+    this.log('info', 'lifecycle start command dispatched', { cmd: startCmd ? '(script)' : 'argv' });
+
+    try {
+      const proc = this.runCommand(startCmd ?? '', argv);
+      if (!proc) {
+        const message = 'start command did not produce a child process';
+        this.lastError = message;
+        this.state = 'failed';
+        this.recordStartFailure();
+        return { ok: false, code: 'model_start_failed', message };
+      }
+
+      this.startCount += 1;
+
+      // Capture child stdio to instance-level ring buffer
+      this.captureStdio(proc);
+
+      if (typeof proc.once === 'function') {
+        proc.once('error', (err) => {
+          this.lastError = `start failed: ${redact(err.message)}`;
+          this.log('error', 'lifecycle start process error', { error: redact(err.message) });
+        });
+      }
+      if (typeof proc.on === 'function') {
+        proc.on('exit', (code) => {
+          this.log('info', 'lifecycle start process exited', { pid: proc.pid, exitCode: code });
+          if (this.state === 'starting' || this.state === 'running') {
+            this.state = 'failed';
+            this.lastError = `process exited unexpectedly with code ${code ?? 'null'}`;
+            this.log('error', 'lifecycle child process exited unexpectedly', { exitCode: code });
+          }
+        });
+      }
+
+      this.lastStartAt = new Date().toISOString();
+      this.lastError = undefined;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.lastError = `start failed: ${redact(message)}`;
+      this.state = 'failed';
+      this.recordStartFailure();
+      return { ok: false, code: 'model_start_failed', message: this.lastError };
+    }
+
+    // Health polling loop
+    const deadline = this.now() + timeoutMs;
+    while (this.now() < deadline) {
+      if (externalSignal?.aborted) {
+        this.state = 'idle';
+        return { ok: false, code: 'model_start_aborted', message: 'start aborted by client' };
+      }
+      const ok = await this.probeDefault(externalSignal);
+      if (ok) {
+        this.modelAvailable = true;
+        this.state = 'running';
+        this.lastHealthyAt = new Date().toISOString();
+        this.legacyCircuitBreakerFailures = [];
+        this.legacyCircuitBreakerCooldownUntil = null;
+        return { ok: true };
+      }
+      await sleep(500);
+    }
+
+    const message = `model did not become healthy within ${timeoutMs}ms`;
+    this.lastError = message;
+    this.modelAvailable = false;
+    this.state = 'failed';
+    this.recordStartFailure();
+    return { ok: false, code: 'model_start_timeout', message };
+  }
+
+  private captureStdio(proc: ChildProcess): void {
+    const append = (chunk: Buffer) => {
+      this.ringBuffer = Buffer.concat([this.ringBuffer, chunk]);
+      if (this.ringBuffer.length > this.ringBufferMaxBytes) {
+        this.ringBuffer = this.ringBuffer.slice(this.ringBuffer.length - this.ringBufferMaxBytes);
+      }
+    };
+    proc.stdout?.on('data', (chunk: Buffer) => append(chunk));
+    proc.stderr?.on('data', (chunk: Buffer) => append(chunk));
+  }
+
+  private recordStartFailure(): void {
+    this.startFailureCount += 1;
+    const now = this.now();
+    this.legacyCircuitBreakerFailures.push(now);
+
+    // Prune failures outside the window
+    const windowMs = this.config.lifecycleCircuitBreakerWindowMs ?? 300_000;
+    this.legacyCircuitBreakerFailures = this.legacyCircuitBreakerFailures.filter(
+      (t) => now - t <= windowMs,
+    );
+
+    // Check threshold
+    const threshold = this.config.lifecycleCircuitBreakerThreshold ?? 3;
+    if (this.legacyCircuitBreakerFailures.length >= threshold) {
+      const cooldownMs = this.config.lifecycleCircuitBreakerCooldownMs ?? 120_000;
+      this.legacyCircuitBreakerCooldownUntil = now + cooldownMs;
+      this.log('warn', 'circuit breaker activated', {
+        failures: this.legacyCircuitBreakerFailures.length,
+        cooldownMs,
+      });
+    }
+  }
+
+  private checkCircuitBreaker(): boolean {
+    if (!this.legacyCircuitBreakerCooldownUntil) return false;
+    const now = this.now();
+    if (now < this.legacyCircuitBreakerCooldownUntil) return true;
+    // Cooldown expired — reset
+    this.legacyCircuitBreakerCooldownUntil = null;
+    this.legacyCircuitBreakerFailures = [];
+    return false;
+  }
+
+  // ── Legacy shutdown (for llamaStopCommand path) ─────────────────
+
+  private async attemptShutdown(): Promise<void> {
+    if (this.state === 'stopping' && this.config.llamaStopCommand === undefined && !this.config.modelShutdownArgv) return;
+    if (!this.config.llamaStopCommand && !this.config.modelShutdownArgv) return;
+
+    this.log('info', 'lifecycle shutdown command dispatched');
+    try {
+      const proc = this.runCommand(
+        this.config.llamaStopCommand ?? '',
+        this.config.modelShutdownArgv,
+      );
+      if (proc) {
+        this.killChildOnTimeout(proc, this.config.lifecycleShutdownConfirmTimeoutMs ?? 10_000);
+        await new Promise<number | null>((resolve) => {
+          if (typeof proc.on === 'function') {
+            proc.on('exit', (code) => resolve(code));
+          } else {
+            resolve(null);
+          }
+        });
+      }
+
+      this.lastStopAt = new Date().toISOString();
+      this.modelAvailable = false;
+      this.lastError = undefined;
+
+      const confirmed = await this.confirmShutdown();
+      if (confirmed) {
+        this.state = 'idle';
+        this.stopCount += 1;
+        this.log('info', 'lifecycle shutdown confirmed (health went red)');
+      } else {
+        this.state = 'running';
+        this.modelAvailable = true;
+        this.log('warn', 'lifecycle shutdown confirmation timed out — model still appears healthy');
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.lastError = `shutdown failed: ${redact(message)}`;
+      this.log('error', 'lifecycle shutdown failed', { error: redact(message) });
+      this.state = 'failed';
+    }
+  }
+
+  private async confirmShutdown(): Promise<boolean> {
+    const timeoutMs = this.config.lifecycleShutdownConfirmTimeoutMs ?? 10_000;
+    const deadline = this.now() + timeoutMs;
+    while (this.now() < deadline) {
+      const ok = await this.probeDefault();
+      if (!ok) return true;
+      await sleep(200);
+    }
+    return false;
+  }
+
+  private killChildOnTimeout(proc: ChildProcess, timeoutMs: number): void {
+    if (timeoutMs <= 0) return;
+    const timer = setTimeout(() => {
+      if (typeof (proc as any).killed === 'boolean' && (proc as any).killed) return;
+      this.log('warn', 'killing process that exceeded timeout', { pid: proc.pid, timeoutMs });
+      if (typeof (proc as any).kill === 'function') {
+        (proc as any).kill('SIGKILL');
+      }
+    }, timeoutMs);
+    timer.unref();
   }
 
   private captureProcessStdio(proc: ModelProcess): void {
@@ -975,6 +1202,8 @@ class PrefixCache {
    */
   add(messages: Array<{ role: string; content: string }>): void {
     if (messages.length === 0) return;
+    // Guard against disabled cache (maxEntries/maxTokens <= 0)
+    if (this.maxEntries <= 0 || this.maxTokens <= 0) return;
 
     // Only cache the stable prefix (up to first user message + any system messages)
     const prefixLength = Math.min(messages.length, 10);
@@ -990,9 +1219,14 @@ class PrefixCache {
       return;
     }
 
-    // Evict if needed
-    while (this.entries.size >= this.maxEntries || this.totalTokens + tokenEstimate > this.maxTokens) {
+    // Evict if needed (guard against single entry exceeding maxTokens)
+    let evictAttempts = 0;
+    while (
+      (this.entries.size >= this.maxEntries || this.totalTokens + tokenEstimate > this.maxTokens) &&
+      evictAttempts < this.entries.size + 1
+    ) {
       this.evictOldest();
+      evictAttempts++;
     }
 
     this.entries.set(key, {
@@ -1014,10 +1248,13 @@ class PrefixCache {
   }
 
   private hashPrefix(messages: Array<{ role: string; content: string }>): string {
-    // Simple hash: first 100 chars of each message role+content
-    return messages
-      .map((m) => `${m.role}:${m.content.slice(0, 100)}`)
-      .join('|');
+    const hash = createHash('sha256');
+    for (const m of messages) {
+      hash.update(`${m.role}:`);
+      hash.update(m.content ?? '');
+      hash.update('\0');
+    }
+    return hash.digest('hex');
   }
 
   private estimateTokens(messages: Array<{ role: string; content: string }>): number {
@@ -1049,13 +1286,16 @@ async function defaultProbe(config: AppConfig, _healthUrlOverride?: string, exte
   const timeout = setTimeout(() => controller.abort(), config.probeTimeoutMs);
   const signal = externalSignal ? AbortSignal.any([controller.signal, externalSignal]) : controller.signal;
   try {
-    const healthUrl = config.modelHealthUrl ?? `${config.upstreamBaseUrl.replace(/\/+$/, '')}/health`;
+    // Resolve health URL, stripping /v1 suffix since llama.cpp serves /health at root
+    const cleanBase = config.upstreamBaseUrl.replace(/\/+$/, '');
+    const rootBase = cleanBase.endsWith('/v1') ? cleanBase.slice(0, -3) : cleanBase;
+    const healthUrl = config.modelHealthUrl ?? `${rootBase}/health`;
     try {
       const res = await fetch(healthUrl, { signal });
       if (res.ok) return true;
     } catch { /* try /v1/models */ }
     try {
-      const res = await fetch(`${config.upstreamBaseUrl}/models`, { signal });
+      const res = await fetch(`${cleanBase}/models`, { signal });
       return res.ok;
     } catch {
       return false;
