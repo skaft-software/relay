@@ -3,7 +3,7 @@ FROM ubuntu:26.04
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates xz-utils bash procps psmisc libvulkan1 libgomp1 libatomic1 \
+    curl ca-certificates xz-utils bash procps psmisc libvulkan1 libgomp1 libatomic1 mesa-vulkan-drivers \
     && curl -fsSL https://nodejs.org/dist/v25.9.0/node-v25.9.0-linux-x64.tar.xz | tar -xJ -C /usr/local --strip-components=1 \
     && rm -rf /var/lib/apt/lists/*
 

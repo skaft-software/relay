@@ -17,6 +17,8 @@ services:
       # Override RELAY_MODEL_DIR in .env to set your model path.
       - ${RELAY_MODEL_DIR:-${HOME}/models}:${RELAY_MODEL_DIR:-${HOME}/models}:ro
       - /usr/share/vulkan:/usr/share/vulkan:ro
+      - /usr/lib/x86_64-linux-gnu/libvulkan_radeon.so:/usr/lib/x86_64-linux-gnu/libvulkan_radeon.so:ro
+      - /usr/lib/x86_64-linux-gnu/libvulkan_lvp.so:/usr/lib/x86_64-linux-gnu/libvulkan_lvp.so:ro
       # Mount start scripts so the lifecycle can spawn model servers.
       # Keep these in sync with RELAY_MODEL_MAP entries in .env.
       - /home/achu/start-llama-devstral.sh:/home/achu/start-llama-devstral.sh:ro
