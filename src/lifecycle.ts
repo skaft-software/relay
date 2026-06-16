@@ -14,7 +14,7 @@
  *  - Idle shutdown: per-model idle timers, cascading (least-recently-used first)
  */
 
-import { spawn, type ChildProcess } from 'node:child_process';
+import { execSync, spawn, type ChildProcess } from 'node:child_process';
 
 import type { AppConfig, ModelEntry } from './config.ts';
 
@@ -134,6 +134,25 @@ export class ModelLifecycle {
       config.prefixCacheMaxEntries ?? 50,
       config.prefixCacheMaxTokens ?? 1_000_000,
     );
+
+    // ── Startup orphan cleanup ─────────────────────────────────────
+    // Kill any llama-server processes from previous Relay instances
+    // that survived as init orphans (detached spawn). These would
+    // otherwise consume VRAM and collide with our port allocations.
+    if (config.lazyModelEnabled) {
+      try {
+        const portBase = config.modelPortBase ?? 8081;
+        for (let p = portBase - 1; p < portBase + 10; p++) {
+          try {
+            execSync('fuser -k ' + p + '/tcp 2>/dev/null || true', { timeout: 1000 });
+          } catch {
+            // port may not be in use
+          }
+        }
+      } catch {
+        // Best-effort
+      }
+    }
   }
 
   // ── Public: upstream URL resolution ──────────────────────────────────
@@ -153,7 +172,7 @@ export class ModelLifecycle {
         if (match) modelName = match[0];
       }
       const proc = this.activeProcesses.get(modelName);
-      if (proc) {
+      if (proc?.healthy) {
         return `http://127.0.0.1:${proc.port}/v1`;
       }
     }
@@ -203,23 +222,7 @@ export class ModelLifecycle {
 
     if (!this.startInFlight) {
       this.state = 'starting';
-      const port = this.allocatePort('default');
-      this.startInFlight = (async (): Promise<ModelAvailability> => {
-        const proc = await this.startModelProcess('default', { cmd: this.config.llamaStartCommand! }, port);
-        if (!proc) {
-          this.state = 'failed';
-          return { ok: false, code: 'model_start_failed', message: 'Failed to start model' };
-        }
-        const healthy = await this.waitForHealthy(port, this.config.modelStartTimeoutMs ?? DEFAULT_START_TIMEOUT_MS, externalSignal);
-        if (!healthy) {
-          this.state = 'failed';
-          return { ok: false, code: 'model_start_failed', message: 'Model did not become healthy in time' };
-        }
-        this.currentModelName = 'default';
-        this.modelAvailable = true;
-        this.state = 'running';
-        return { ok: true };
-      })().finally(() => {
+      this.startInFlight = this.startAndWait(undefined, externalSignal).finally(() => {
         this.startInFlight = null;
       });
     }
@@ -307,12 +310,9 @@ export class ModelLifecycle {
   }
 
   /**
-   * Graceful switch: start the new model on its own port while keeping the
-   * old model alive. Only kill the old model after the new one is confirmed
-   * healthy. Enables instant switch-back within the grace period.
-   *
-   * ⚠️ REQUIRES 2× VRAM: both models must fit in GPU memory simultaneously.
-   * With 16GB VRAM and models >8GB each, this will OOM. Use 'eager' instead.
+   * Graceful switch: start the new model on its own port.
+   * Keep the old model alive during the transition and for a grace period after.
+   * Only kill the old model after the new one is confirmed healthy.
    */
   private async gracefulSwitch(
     modelName: string,
@@ -460,15 +460,6 @@ export class ModelLifecycle {
           return { ok: false, code: 'model_start_timeout', message: `${modelName} unhealthy` };
         }
 
-        // v2: Pre-warm the new model's KV cache with cached prefixes
-        if (this.config.switchPrewarm && this.prefixCache.size > 0) {
-          this.log('info', 'pre-warming new model KV cache', {
-            model: modelName,
-            cachedPrefixes: this.prefixCache.size,
-          });
-          await this.prewarmModel(port, externalSignal);
-        }
-
         const newProc = this.activeProcesses.get(modelName);
         if (newProc) newProc.healthy = true;
 
@@ -512,6 +503,15 @@ export class ModelLifecycle {
     for (const proc of this.activeProcesses.values()) {
       if (proc.port === port) return this.allocatePort(modelName);
     }
+    // Kill any orphaned process from a previous Relay instance on this port.
+    // Detached child processes survive restarts as init orphans — fuser -k
+    // cleans them up before we bind.
+    try {
+      // execSync imported at top of file
+      execSync('fuser -k ' + port + '/tcp 2>/dev/null || true', { timeout: 2000 });
+    } catch {
+      // Best-effort — orphan cleanup failure shouldn't block startup.
+    }
     return port;
   }
 
@@ -528,12 +528,12 @@ export class ModelLifecycle {
       return null;
     }
 
-    // Inject port into command/args (handles ${PORT}, ${LLAMA_PORT}, ${PORT:-8080}, etc.)
+    // Inject port into command/args
     const resolvedCmd = startCmd
-      ? startCmd.replace(/\$\{(?:LLAMA_)?PORT(?::-[^}]*)?\}/g, String(port)).replace(/\$\{MODEL\}/g, modelName)
+      ? startCmd.replace(/\$\{PORT\}/g, String(port)).replace(/\$\{MODEL\}/g, modelName)
       : '';
     const resolvedArgv = argv
-      ? argv.map((a) => a.replace(/\$\{(?:LLAMA_)?PORT(?::-[^}]*)?\}/g, String(port)).replace(/\$\{MODEL\}/g, modelName))
+      ? argv.map((a) => a.replace(/\$\{PORT\}/g, String(port)).replace(/\$\{MODEL\}/g, modelName))
       : undefined;
 
     this.log('info', 'starting model process', {
@@ -543,7 +543,7 @@ export class ModelLifecycle {
     });
 
     try {
-      const child = this.runCommand(resolvedCmd, resolvedArgv, { LLAMA_PORT: String(port) });
+      const child = this.runCommand(resolvedCmd, resolvedArgv);
       if (!child) {
         this.log('error', 'start command produced no child process', { model: modelName });
         return null;
@@ -903,17 +903,15 @@ export class ModelLifecycle {
     return defaultProbePort(port, externalSignal);
   }
 
-  private runCommand(command: string, argv?: string[], extraEnv?: Record<string, string>): ChildProcess | null {
+  private runCommand(command: string, argv?: string[]): ChildProcess | null {
     if (this.hooks.spawnProcess) {
       return this.hooks.spawnProcess(command, argv);
     }
-    const spawnEnv = extraEnv ? { ...process.env, ...extraEnv } : process.env;
     if (argv && argv.length > 0) {
       const [cmd, ...args] = argv;
       const child = spawn(cmd, args, {
         detached: true,
         stdio: ['ignore', 'pipe', 'pipe'],
-        env: spawnEnv,
         windowsHide: true,
       });
       child.unref();
@@ -923,7 +921,6 @@ export class ModelLifecycle {
       shell: true,
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: spawnEnv,
       windowsHide: true,
     });
     child.unref();

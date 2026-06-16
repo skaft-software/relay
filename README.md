@@ -2,165 +2,66 @@
 
 [![License](https://img.shields.io/github/license/achuthanmukundan00/relay)](https://github.com/achuthanmukundan00/relay/blob/main/LICENSE)
 [![Latest Release](https://img.shields.io/github/v/release/achuthanmukundan00/relay)](https://github.com/achuthanmukundan00/relay/releases/latest)
-[![Docs Workflow](https://img.shields.io/github/actions/workflow/status/achuthanmukundan00/relay/docs.yml?label=docs)](https://github.com/achuthanmukundan00/relay/actions/workflows/docs.yml)
-[![Docs](https://img.shields.io/badge/docs-site-blue)](https://achuthanmukundan00.github.io/relay/)
 
-Relay is a lightweight, agent-focused gateway that makes local LLM servers look like hosted OpenAI- and Anthropic-style APIs.
+Relay is a lightweight, agent-focused gateway that makes local LLM servers look like hosted OpenAI- and Anthropic-style APIs. It sits between clients and local upstream model servers (like llama.cpp), normalizes request/response shapes, and manages model lifecycles.
 
-It sits between clients and a local upstream model server (like `llama.cpp`), normalizes request/response shapes, and preserves practical compatibility for tools that expect modern API conventions.
+## One-Line Install
 
-- Docs site: `https://achuthanmukundan00.github.io/relay/`
-- Latest release: `https://github.com/achuthanmukundan00/relay/releases/latest`
-- Current release tag (`v0.1.1`): `https://github.com/achuthanmukundan00/relay/releases/tag/v0.1.1`
 
-## Why Relay Exists
 
-Local model servers are fast and private, but many agent clients are built around hosted API contracts. Relay closes that gap so local models can work with existing OpenAI/Anthropic-compatible tooling without rewriting each client.
+This clones Relay, builds the Docker image, and starts the gateway. Requires Docker and curl. Works on macOS and Linux.
+
+## Why Relay
+
+Local model servers are fast and private, but agent clients expect hosted API contracts. Relay closes that gap and adds production features:
+
+- **Model lifecycle** — start, stop, and switch models on demand. No manual port management.
+- **Graceful switching** — new model warms up before old one shuts down. No dropped requests.
+- **Prefix-cache pre-warming** — cached conversation prefixes pre-fill the KV cache for instant first-token latency.
+- **Orphan cleanup** — stale model processes from previous sessions are killed on startup.
+- **Multi-model** — multiple models can run simultaneously (with enough VRAM).
 
 ## Key Capabilities
 
-- OpenAI-compatible endpoints for chat, responses, completions, embeddings, and model listing
-- Anthropic-compatible messages endpoint
-- Streaming compatibility and SSE normalization/repair
-- Request/response canonicalization across protocol variants
-- Lightweight observability endpoints for health, capabilities, and recent request stats
-- Configurable strictness for unknown/hosted-only fields
+- OpenAI-compatible: chat/completions, completions, responses, embeddings, models
+- Anthropic-compatible: messages, count_tokens
+- Streaming SSE normalization and repair
+- Request/response canonicalization
+- Observability: /health, /relay/capabilities, /relay/stats, /relay/status
+- Configurable field policies (strip, warn, pass-through, error)
 
-## Supported APIs
+## Quickstart (Docker)
 
-Relay currently supports practical compatibility for:
 
-- OpenAI-style: [`/v1/chat/completions`](https://developers.openai.com/api/reference/chat-completions/overview), [`/v1/completions`](https://platform.openai.com/docs/api-reference/completions/create), [`/v1/responses`](https://platform.openai.com/docs/api-reference/responses/create), [`/v1/embeddings`](https://platform.openai.com/docs/api-reference/embeddings/create), [`/v1/models`](https://platform.openai.com/docs/api-reference/models/list)
-- Anthropic-style: `/v1/messages`, `/v1/messages/count_tokens`
-- Utility: `/health`, `/relay/capabilities`, `/relay/stats`, `/relay/requests`
 
-## Non-Goals
-
-Relay does not currently implement full hosted feature parity, including:
-
-- Assistants/Threads/Runs-style orchestration APIs
-- Realtime APIs
-- Image/audio/file APIs
-- Hosted vendor control-plane features
-
-## Quickstart (5 Minutes)
-
-1. Start a local upstream model server (example: `llama.cpp`):
-
-```bash
-llama-server --model /path/to/model.gguf --host 127.0.0.1 --port 8080
-```
-
-2. Install and configure Relay:
-
-```bash
-npm install
-cp .env.example .env
-```
-
-3. Start Relay:
-
-```bash
-npm run dev
-```
-
-4. Verify health:
-
-```bash
-curl http://127.0.0.1:1234/health
-```
-
-5. Run smoke checks:
-
-```bash
-npm run smoke:openai
-npm run smoke:anthropic
-```
-
-## Example Usage
-
-OpenAI-compatible chat request:
-
-```bash
-curl http://127.0.0.1:1234/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{
-    "model": "local-model",
-    "messages": [{"role": "user", "content": "Say hello."}],
-    "max_tokens": 4096
-  }'
-```
-
-Local reasoning models may need a `max_tokens` budget of at least `4096`, and often `8192`, before they emit final visible content.
-
-OpenAI client example:
-
-```ts
-import OpenAI from 'openai';
-
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY ?? 'local-relay',
-  baseURL: 'http://127.0.0.1:1234/v1',
-});
-
-const out = await client.chat.completions.create({
-  model: 'local-model',
-  messages: [{ role: 'user', content: 'Hello from Relay' }],
-});
-
-console.log(out.choices[0]?.message?.content);
-```
-
-Cline-style setup:
-
-- Provider: OpenAI-compatible
-- Base URL: `http://127.0.0.1:1234/v1`
-- API key: any non-empty value unless Relay auth is enabled
-- Model: your local model id from [`GET /v1/models`](https://platform.openai.com/docs/api-reference/models/list)
-
-## Read The Docs
-
-- Hosted docs: `https://achuthanmukundan00.github.io/relay/`
-- Local docs source: [[docs/](/home/achu/relay/docs)](https://github.com/achuthanmukundan00/relay/tree/main/docs)
-
-## Environment Variables
+## Configuration
 
 | Variable | Default | Description |
 |---|---|---|
-| `HOST` | `127.0.0.1` | Relay bind address |
-| `PORT` | `1234` | Relay bind port |
-| `UPSTREAM_BASE_URL` | `http://127.0.0.1:8080/v1` | Upstream API root |
-| `UPSTREAM_CTX_SIZE` | _(empty)_ | Running upstream context size (for example llama.cpp `--ctx-size`), exposed via `/v1/models` metadata and `/relay/capabilities` |
-| `DEFAULT_MODEL` | _(empty)_ | Fallback model id when client omits `model` |
-| `REQUEST_TIMEOUT_SECONDS` | `600` | Upstream timeout per request |
-| `MAX_REQUEST_BODY_BYTES` | `1048576` | Request body limit |
-| `RELAY_PROBE_ON_STARTUP` | `true` | Probe upstream during startup |
-| `RELAY_STRICT_STARTUP` | `false` | Fail startup if probe fails |
-| `RELAY_OBSERVABILITY_ENABLED` | `true` | Enable `/relay/*` stats endpoints |
-| `RELAY_LOG_PROMPTS` | `false` | Include prompt content in logs |
-| `LOG_LEVEL` | `info` | Log verbosity |
-| `API_KEY` | _(empty)_ | Optional bearer/x-api-key required by Relay |
+| HOST | 127.0.0.1 | Bind address |
+| PORT | 1234 | Bind port |
+| UPSTREAM_BASE_URL | http://127.0.0.1:8080/v1 | Upstream API root |
+| RELAY_MODEL_LIFECYCLE_ENABLED | false | Enable lazy model loading |
+| RELAY_MODEL_MAP | (empty) | JSON: model names to start configs |
+| RELAY_SWITCH_POLICY | eager | graceful (needs 2x VRAM) or eager |
+| RELAY_MODEL_PORT_BASE | 8081 | Starting port for model allocation |
+| RELAY_MODEL_IDLE_SHUTDOWN_MS | 3600000 | Idle timeout (1 hour) |
 
-## Scripts
+See docs/configuration.md for full reference.
 
-- `npm run dev` - run Relay in watch mode for local development
-- `npm run build` - typecheck build gate
-- `npm test` - test suite
-- `npm run smoke:openai` - OpenAI compatibility smoke check
-- `npm run smoke:anthropic` - Anthropic compatibility smoke check
-- `npm run check:local` - local verification (`test` + `build`)
+## Example
 
-## Troubleshooting
 
-- `curl /health` fails: verify Relay is running on `HOST:PORT`.
-- Upstream errors/timeouts: verify `UPSTREAM_BASE_URL` and upstream server health.
-- `model not found`: call [`GET /v1/models`](https://platform.openai.com/docs/api-reference/models/list) and use a returned model id.
-- Anthropic endpoint issues: ensure `POST /v1/messages` is enabled by relay capabilities and your client sends `anthropic-version`.
 
-## Status
+## Docs
 
-Relay is `v0.1.x`: early, stable enough for local-agent workflows, and still evolving.
+- [Configuration](docs/configuration.md)
+- [API Compatibility](docs/api-compatibility.md)
+- [Architecture](docs/architecture.md)
+- [Model Lifecycle](docs/lazy-llm-lifecycle.md)
+- [Deployment](docs/deploy-systemd.md)
+- [Troubleshooting](docs/troubleshooting.md)
 
 ## License
 
-[Apache License 2.0](LICENSE) © 2026 Achuthan Mukundan
+[Apache License 2.0](LICENSE) (c) 2026 Achuthan Mukundan

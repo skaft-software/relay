@@ -1,65 +1,78 @@
 # Quickstart
 
-This quickstart gets Relay working in a few minutes.
+## One-Line Install
 
-## 1. Start A Local Model Server
 
-Example using `llama.cpp`:
 
-```bash
-llama-server --model /path/to/model.gguf --host 127.0.0.1 --port 8080
-```
+## Manual Docker Setup
 
-Your upstream must expose OpenAI-style endpoints at `http://127.0.0.1:8080/v1`.
 
-## 2. Install Relay
 
-```bash
-git clone https://github.com/achuthanmukundan00/relay.git
-cd relay
-npm install
-cp .env.example .env
-```
+## Configure Models
 
-## 3. Start Relay
+Edit .env and set RELAY_MODEL_MAP with your model start commands:
 
-```bash
-npm run dev
-```
+STARSHIP_SHELL=zsh
+MANPATH=:/usr/share/man:/usr/local/share/man:/Applications/Ghostty.app/Contents/Resources/ghostty/../man:
+REMOTE_RELAY_BASE_URL=https://ai.watchyourtemper.com
+GHOSTTY_RESOURCES_DIR=/Applications/Ghostty.app/Contents/Resources/ghostty
+DEEPSEEK_API_KEY=sk-REDACTED
+TERM_PROGRAM=ghostty
+SHELL=/bin/zsh
+TERM=xterm-ghostty
+HOMEBREW_REPOSITORY=/opt/homebrew
+TMPDIR=/var/folders/d1/k5vl2s3n5nggpnfg963q1vwr0000gn/T/
+TERM_PROGRAM_VERSION=1.3.1
+FPATH=/opt/homebrew/share/zsh/site-functions:/usr/local/share/zsh/site-functions:/usr/share/zsh/site-functions:/usr/share/zsh/5.9/functions
+PI_CODING_AGENT=true
+LOCAL_PROXY_PORT=1234
+USER=achumukundan
+OPENAI_API_KEY=sk-REDACTED
+COMMAND_MODE=unix2003
+SSH_AUTH_SOCK=/private/tmp/com.apple.launchd.cowldiFg6X/Listeners
+__CF_USER_TEXT_ENCODING=0x1F5:0x0:0x52
+PATH=/Users/achumukundan/.pi/agent/bin:/Users/achumukundan/.bun/bin:/Users/achumukundan/Library/Python/3.9/bin:/opt/homebrew/opt/openjdk@17/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin:/opt/pmk/env/global/bin:/Library/Apple/usr/bin:/Users/achumukundan/.cargo/bin:/Users/achumukundan/.local/bin:/Applications/Ghostty.app/Contents/MacOS
+_=/usr/bin/env
+GHOSTTY_SHELL_FEATURES=path,title
+__CFBundleIdentifier=com.mitchellh.ghostty
+CONTEXT7_API_KEY=ctx7sk-REDACTED
+CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000
+PWD=/Users/achumukundan/workspace/git/hamr
+OPENROUTER_API_KEY=sk-REDACTED
+LANG=en_CA.UTF-8
+XPC_FLAGS=0x0
+ANTHROPIC_API_KEY=sk-REDACTED
+XPC_SERVICE_NAME=0
+HOME=/Users/achumukundan
+SHLVL=2
+ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
+TERMINFO=/Applications/Ghostty.app/Contents/Resources/terminfo
+LLM_MODEL=Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf
+HOMEBREW_PREFIX=/opt/homebrew
+CF_ACCESS_CLIENT_ID=fe9181e1cad51b266dff2fda0306ec22.access
+STARSHIP_SESSION_KEY=2187211733128101
+XAI_API_KEY=xai-REDACTED
+LOGNAME=achumukundan
+LLM_BASE_URL=https://ai.watchyourtemper.com/v1
+XDG_DATA_DIRS=/usr/local/share:/usr/share:/Applications/Ghostty.app/Contents/Resources/ghostty/..
+GHOSTTY_BIN_DIR=/Applications/Ghostty.app/Contents/MacOS
+BUN_INSTALL=/Users/achumukundan/.bun
+CF_ACCESS_CLIENT_SECRET=2686515372b3f5de624c31bdd48bd3398ecb3c9d0999d7c6c9ac4448b788e767
+INFOPATH=/opt/homebrew/share/info:
+HOMEBREW_CELLAR=/opt/homebrew/Cellar
+OSLogRateLimit=64
+AUTOCAREER_USE_SYNAX=true
+COLORTERM=truecolor
 
-Relay starts on `http://127.0.0.1:1234` by default.
+Each model entry needs:
+- cmd — shell script to start the model server
+- ctx_size — context window size (exposed via /v1/models)
+- multimodal (optional) — true if model supports vision
 
-## 4. Verify Health
+The start script should accept LLAMA_PORT env var for port allocation:
 
-```bash
-curl http://127.0.0.1:1234/health
-```
 
-Expected response contains `{"ok":true}`.
 
-## 5. Run A Test Request
+## Verify
 
-```bash
-curl http://127.0.0.1:1234/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{
-    "model": "local-model",
-    "messages": [{"role": "user", "content": "Reply with OK"}],
-    "max_tokens": 4096
-  }'
-```
 
-## 6. Connect A Client (Cline)
-
-Use OpenAI-compatible mode:
-
-- Base URL: `http://127.0.0.1:1234/v1`
-- API key: any non-empty string (or your configured `API_KEY`)
-- Model: choose one from [`GET /v1/models`](https://platform.openai.com/docs/api-reference/models/list)
-
-## Optional Smoke Checks
-
-```bash
-npm run smoke:openai
-npm run smoke:anthropic
-```

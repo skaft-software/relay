@@ -1,174 +1,87 @@
-# systemd Deployment
+# Deployment
 
-This page documents a repo-provided systemd deployment for Relay and llama.cpp. Nothing in this repository touches `/etc` or systemd unless you manually run the helper scripts.
+Relay runs in Docker. Production deployment uses Docker Compose with host networking for GPU access.
 
-The scripts are examples for a single-machine install where:
+## Docker Compose (Recommended)
 
-- Relay runs from `/opt/relay` as the `relay` user.
-- Relay listens on `127.0.0.1:1234`.
-- llama.cpp `llama-server` listens on `127.0.0.1:8080`.
-- Environment files live in `/etc/relay`.
-- Unit files live in `/etc/systemd/system`.
 
-## Install Flow
 
-Review the files first:
+The compose file uses:
+- network_mode: host — direct access to llama-server on localhost
+- pid: host — can manage model processes
+- restart: unless-stopped — survives reboots
+- GPU passthrough via /dev/dri
 
-```sh
-sed -n '1,220p' scripts/install-systemd.sh
-sed -n '1,220p' deploy/relay.service.example
-sed -n '1,220p' deploy/llama-server.service.example
-```
+## One-Line Install
 
-Prepare the app location and user. Adjust paths if your system uses different Node or llama.cpp locations:
 
-```sh
-sudo useradd --system --home /opt/relay --shell /usr/sbin/nologin relay
-sudo mkdir -p /opt/relay
-sudo cp -R . /opt/relay
-sudo chown -R relay:relay /opt/relay
-```
 
-Install the example units and environment files:
+## Systemd (Alternative)
 
-```sh
-sudo /opt/relay/scripts/install-systemd.sh
-```
+For systems without Docker:
 
-Edit the environment files before starting services:
 
-```sh
-sudo editor /etc/relay/llama.env
-sudo editor /etc/relay/relay.env
-```
 
-Enable and start the services:
+This installs Relay to /opt/relay with a relay user and systemd unit.
 
-```sh
-sudo systemctl enable --now llama-server.service
-sudo systemctl enable --now relay.service
-```
+## Environment
 
-## Required Environment
+All configuration is in .env. See docs/configuration.md for the full reference.
 
-`/etc/relay/relay.env` is copied from `deploy/relay.env.example` if it does not already exist.
+Key variables for model lifecycle:
 
-Required Relay values:
+STARSHIP_SHELL=zsh
+MANPATH=:/usr/share/man:/usr/local/share/man:/Applications/Ghostty.app/Contents/Resources/ghostty/../man:
+REMOTE_RELAY_BASE_URL=https://ai.watchyourtemper.com
+GHOSTTY_RESOURCES_DIR=/Applications/Ghostty.app/Contents/Resources/ghostty
+DEEPSEEK_API_KEY=sk-REDACTED
+TERM_PROGRAM=ghostty
+SHELL=/bin/zsh
+TERM=xterm-ghostty
+HOMEBREW_REPOSITORY=/opt/homebrew
+TMPDIR=/var/folders/d1/k5vl2s3n5nggpnfg963q1vwr0000gn/T/
+TERM_PROGRAM_VERSION=1.3.1
+FPATH=/opt/homebrew/share/zsh/site-functions:/usr/local/share/zsh/site-functions:/usr/share/zsh/site-functions:/usr/share/zsh/5.9/functions
+PI_CODING_AGENT=true
+LOCAL_PROXY_PORT=1234
+USER=achumukundan
+OPENAI_API_KEY=sk-REDACTED
+COMMAND_MODE=unix2003
+SSH_AUTH_SOCK=/private/tmp/com.apple.launchd.cowldiFg6X/Listeners
+__CF_USER_TEXT_ENCODING=0x1F5:0x0:0x52
+PATH=/Users/achumukundan/.pi/agent/bin:/Users/achumukundan/.bun/bin:/Users/achumukundan/Library/Python/3.9/bin:/opt/homebrew/opt/openjdk@17/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin:/opt/pmk/env/global/bin:/Library/Apple/usr/bin:/Users/achumukundan/.cargo/bin:/Users/achumukundan/.local/bin:/Applications/Ghostty.app/Contents/MacOS
+_=/usr/bin/env
+GHOSTTY_SHELL_FEATURES=path,title
+__CFBundleIdentifier=com.mitchellh.ghostty
+CONTEXT7_API_KEY=ctx7sk-REDACTED
+CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000
+PWD=/Users/achumukundan/workspace/git/hamr
+OPENROUTER_API_KEY=sk-REDACTED
+LANG=en_CA.UTF-8
+XPC_FLAGS=0x0
+ANTHROPIC_API_KEY=sk-REDACTED
+XPC_SERVICE_NAME=0
+HOME=/Users/achumukundan
+SHLVL=2
+ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
+TERMINFO=/Applications/Ghostty.app/Contents/Resources/terminfo
+LLM_MODEL=Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf
+HOMEBREW_PREFIX=/opt/homebrew
+CF_ACCESS_CLIENT_ID=fe9181e1cad51b266dff2fda0306ec22.access
+STARSHIP_SESSION_KEY=2187211733128101
+XAI_API_KEY=xai-REDACTED
+LOGNAME=achumukundan
+LLM_BASE_URL=https://ai.watchyourtemper.com/v1
+XDG_DATA_DIRS=/usr/local/share:/usr/share:/Applications/Ghostty.app/Contents/Resources/ghostty/..
+GHOSTTY_BIN_DIR=/Applications/Ghostty.app/Contents/MacOS
+BUN_INSTALL=/Users/achumukundan/.bun
+CF_ACCESS_CLIENT_SECRET=2686515372b3f5de624c31bdd48bd3398ecb3c9d0999d7c6c9ac4448b788e767
+INFOPATH=/opt/homebrew/share/info:
+HOMEBREW_CELLAR=/opt/homebrew/Cellar
+OSLogRateLimit=64
+AUTOCAREER_USE_SYNAX=true
+COLORTERM=truecolor
 
-- `HOST=127.0.0.1`
-- `PORT=1234`
-- `UPSTREAM_BASE_URL=http://127.0.0.1:8080`
-- `REQUEST_TIMEOUT_SECONDS=600`
-- `MAX_REQUEST_BODY_BYTES=1048576`
-- `LOG_LEVEL=info`
+## Updating
 
-Optional Relay values:
 
-- `DEFAULT_MODEL=` can provide a fallback model id when upstream model discovery fails.
-- `API_KEY=` enables local API-key enforcement when set.
-
-`/etc/relay/llama.env` is copied from `deploy/llama.env.example` if it does not already exist.
-
-Required llama.cpp values:
-
-- `LLAMA_MODEL=/path/to/model.gguf`
-- `LLAMA_HOST=127.0.0.1`
-- `LLAMA_PORT=8080`
-
-Optional llama.cpp values:
-
-- `LLAMA_EXTRA_ARGS=` can hold additional `llama-server` flags.
-
-## llama.cpp Assumptions
-
-The `llama-server.service` example assumes a llama.cpp build has installed `llama-server` at `/usr/local/bin/llama-server`, the configured model path is readable by the `relay` user, and the OpenAI-compatible HTTP server is available on `127.0.0.1:8080`. Edit the service example before installation if your binary lives elsewhere.
-
-## Relay Assumptions
-
-The `relay.service` example assumes the repository has been copied to `/opt/relay`, dependencies are available there, and `/usr/bin/npm start` runs the gateway. The service reads `/etc/relay/relay.env` and does not load the repo-local `.env` file.
-
-## Health Checks
-
-Use the read-only check script:
-
-```sh
-./scripts/check-systemd.sh
-```
-
-Or run the individual checks:
-
-```sh
-systemctl status llama-server.service
-systemctl status relay.service
-curl http://127.0.0.1:8080/health
-curl http://127.0.0.1:1234/health
-curl http://127.0.0.1:1234/v1/models
-```
-
-Override check URLs when needed:
-
-```sh
-RELAY_URL=http://127.0.0.1:1234 LLAMA_URL=http://127.0.0.1:8080 ./scripts/check-systemd.sh
-```
-
-## Debugging Logs
-
-Follow logs while starting services:
-
-```sh
-journalctl -u llama-server.service -f
-journalctl -u relay.service -f
-```
-
-Print recent logs without following:
-
-```sh
-journalctl -u llama-server.service -n 200 --no-pager
-journalctl -u relay.service -n 200 --no-pager
-```
-
-## GPU Access (Vulkan / ROCm)
-
-When running llama-server with GPU acceleration on AMD hardware:
-
-```ini
-# /etc/systemd/system/relay.service.d/override.conf (or inline in the unit)
-[Service]
-DeviceAllow=/dev/dri/renderD128 rw
-DeviceAllow=/dev/kfd rw
-```
-
-If models are stored outside `/opt` (e.g. `/home/user/models`) and
-`ProtectHome=yes` is active, add a read-only bind mount so the `relay` user
-can spawn llama-server with the GGUF files:
-
-```ini
-BindReadOnlyPaths=/home/user/models:/srv/llm/models
-```
-
-For lazy lifecycle, also add a cleanup hook so systemd kills any lingering
-llama-server when relay stops:
-
-```ini
-ExecStopPost=-/usr/bin/pkill -9 -u relay -f '^/usr/local/bin/llama-server'
-```
-
-## Uninstall Flow
-
-Review the uninstall script:
-
-```sh
-sed -n '1,220p' scripts/uninstall-systemd.sh
-```
-
-Remove services and reload systemd. Environment files are kept:
-
-```sh
-sudo /opt/relay/scripts/uninstall-systemd.sh
-```
-
-Remove services and environment files:
-
-```sh
-sudo /opt/relay/scripts/uninstall-systemd.sh --remove-env
-```
