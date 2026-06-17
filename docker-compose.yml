@@ -23,6 +23,7 @@ services:
       # Keep these in sync with RELAY_MODEL_MAP entries in .env.
       - /home/achu/start-llama-devstral.sh:/home/achu/start-llama-devstral.sh:ro
       - /home/achu/start-llama-qwen36-mtp.sh:/home/achu/start-llama-qwen36-mtp.sh:ro
+      - /home/achu/start-llama-qwen36.sh:/home/achu/start-llama-qwen36.sh:ro
       - /home/achu/start-llama-mtp.sh:/home/achu/start-llama-mtp.sh:ro
       - /home/achu/start-llama-glm47.sh:/home/achu/start-llama-glm47.sh:ro
       - /home/achu/start-llama-north.sh:/home/achu/start-llama-north.sh:ro

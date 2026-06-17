@@ -688,15 +688,17 @@ export class ModelLifecycle {
     const proc = this.activeProcesses.get(modelName);
     if (!proc) return;
 
-    this.log('info', 'killing model process', { model: modelName, pid: proc.pid, port: proc.port });
+    const pid = proc.child.pid;
+    const port = proc.port;
+    this.log('info', 'killing model process', { model: modelName, pid, port });
 
     if (proc.graceTimer) {
       this.clearTimer(proc.graceTimer);
       proc.graceTimer = null;
     }
 
-    // Graceful SIGTERM
-    if (typeof (proc.child as any).kill === 'function') {
+    // Phase 1: Graceful SIGTERM
+    if (typeof (proc.child as any).kill === 'function' && pid) {
       try {
         (proc.child as any).kill('SIGTERM');
         await new Promise<void>((resolve) => {
@@ -710,6 +712,24 @@ export class ModelLifecycle {
       } catch {
         // already dead
       }
+    }
+
+    // Phase 2: Verify death + escalate via fuser on port
+    // shell:true + detached:true leaves model process alive in its own
+    // process group after the shell parent dies. fuser -k is the
+    // ground truth for whether anything is still listening.
+    if (port) {
+      try {
+        execFileSync('fuser', ['-k', '-TERM', port + '/tcp'], { timeout: 2000, stdio: 'ignore' });
+      } catch { /* fuser may not exist in Docker */ }
+      await sleep(500);
+      try {
+        execFileSync('fuser', ['-k', '-KILL', port + '/tcp'], { timeout: 2000, stdio: 'ignore' });
+      } catch { /* best-effort */ }
+    }
+    // Also kill the process group (negative PID) as last resort
+    if (pid) {
+      try { process.kill(-pid, 'SIGKILL'); } catch { /* already dead */ }
     }
 
     this.activeProcesses.delete(modelName);
