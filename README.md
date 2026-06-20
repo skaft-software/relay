@@ -3,7 +3,7 @@
 [![License](https://img.shields.io/github/license/achuthanmukundan00/relay)](https://github.com/achuthanmukundan00/relay/blob/main/LICENSE)
 [![Latest Release](https://img.shields.io/github/v/release/achuthanmukundan00/relay)](https://github.com/achuthanmukundan00/relay/releases/latest)
 
-A lightweight, agent-focused gateway that makes local LLM servers look like hosted OpenAI / Anthropic APIs. Sits between your coding agent (opencode, Cursor, etc.) and llama.cpp, normalizes request/response shapes, and manages model lifecycles.
+A protocol adapter that sits between your coding agent and your models — local llama.cpp servers or cloud APIs (OpenAI, Anthropic, DeepSeek, Groq). One endpoint, one API key, no glue code.
 
 ## Quick start
 

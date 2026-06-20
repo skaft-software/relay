@@ -2,7 +2,7 @@ import { defineConfig } from 'vitepress';
 
 export default defineConfig({
   title: 'Relay',
-  description: 'OpenAI/Anthropic-compatible gateway for local model servers',
+  description: 'Protocol adapter for local and cloud LLMs — OpenAI and Anthropic compatible',
   base: '/relay/',
   cleanUrls: true,
   appearance: 'dark',
@@ -20,15 +20,15 @@ export default defineConfig({
         items: [
           { text: 'Overview', link: '/' },
           { text: 'Quickstart', link: '/quickstart' },
-          { text: 'Model Setup', link: '/model-setup' },
+          { text: 'Setup Wizard', link: '/model-setup' },
           { text: 'Configuration', link: '/configuration' },
-          { text: 'Lazy LLM Lifecycle', link: '/lazy-llm-lifecycle' },
+          { text: 'Model Lifecycle', link: '/lazy-llm-lifecycle' },
           { text: 'API Compatibility', link: '/api-compatibility' },
+          { text: 'Agents & Clients', link: '/agents' },
           { text: 'Troubleshooting', link: '/troubleshooting' },
           { text: 'Public Deployment', link: '/deploy-public' },
-          { text: 'Systemd Deployment', link: '/deploy-systemd' },
+          { text: 'Deployment', link: '/deploy-systemd' },
           { text: 'Architecture', link: '/architecture' },
-          { text: 'Agents', link: '/agents' },
         ],
       },
     ],

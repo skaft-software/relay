@@ -1,130 +1,72 @@
-# Model Setup
+# Setup Wizard
 
-Relay includes a sizing engine (`size-model.py`) that computes optimal llama.cpp flags for any GGUF model on your specific hardware. It eliminates the guesswork around `--ctx-size`, `--n-cpu-moe`, and VRAM budgeting.
+Relay includes an interactive setup wizard and a headless CLI mode for agents and scripts.
 
-## Quick Start
+## Interactive (TUI)
 
 ```bash
-# Interactive TUI (recommended)
 python3 scripts/setup-tui.py
-
-# Or script it
-python3 scripts/setup-tui.py --no-tui --model apodex-2b
 ```
+
+Arrow keys to navigate, Enter to pick. The wizard:
+
+1. Auto-detects your GPU, VRAM, and RAM
+2. Shows supported modes: local models, cloud API proxy, or BYO (existing server)
+3. For local: finds your GGUF files, sizes them, generates start scripts with optimal flags
+4. For cloud: configures OpenAI, Anthropic, DeepSeek, or Groq as upstreams
+5. Writes `.env` and `docker-compose.yml`
+
+## Headless (CLI)
+
+```bash
+# Auto-detect everything, no questions — re-run anytime to regenerate configs
+python3 scripts/setup-tui.py --auto
+
+# Cloud mode
+python3 scripts/setup-tui.py --auto --mode cloud
+
+# Custom model directory
+python3 scripts/setup-tui.py --auto --models-dir /opt/models
+
+# Print model catalog and exit
+python3 scripts/setup-tui.py --list
+
+# Show all options
+python3 scripts/setup-tui.py --help
+```
+
+The `--auto` flag does the full local setup silently: detect hardware → find llama.cpp → size every GGUF → generate start scripts → write `.env` and `docker-compose.yml`. Start scripts go to `~/.relay/start-scripts/` (or the repo's `start-scripts/` if run from inside a relay checkout).
 
 ## The Sizing Engine
 
-`size-model.py` reads a GGUF file and computes the maximum safe context size for your GPU.
+`size-model.py` reads a GGUF file and computes the maximum safe context size for your specific hardware. The wizard calls this automatically. You can also run it standalone:
 
 ```bash
-python3 scripts/size-model.py /path/to/model.gguf
+python3 scripts/size-model.py /path/to/model.gguf --json
 ```
 
-### What it does
+Output includes:
 
-1. **Reads GGUF metadata**: architecture, layer count, tensor shapes, expert configuration
-2. **Computes per-token KV cost**: parses `attn_k.weight` and `attn_v.weight` tensors (or fused `attn_qkv.weight`), applies q4_0 ratio (0.5625 bytes/element)
-3. **Splits expert vs non-expert weights**: counts `_exps.`, `_shexp.` tensors or uses architecture-specific fractions (90-94% for MoE)
-4. **Scans offload levels**: tries `n_cpu_moe` from 0→n_layers, picks the one that maximizes context while keeping VRAM headroom ≥5%
-5. **Handles architecture quirks**: Gemma4 sliding window, DeepSeek MLA compressed latents, Qwen3.5 linear attention intervals
-6. **Checks DRAM**: ensures offloaded experts + draft model fit in available system RAM
+- `max_ctx` — maximum safe context window size
+- `launch_flags` — optimal llama-server flags (GPU layers, KV cache type, MoE offloading, `--jinja`)
+- `expert_flag` — MoE expert offloading flag (e.g. `--n-cpu-moe 25`)
+- `headroom_gb` — VRAM safety margin
+- `kv_gb` — KV cache memory estimate
+- `cache_type_k` / `cache_type_v` — recommended KV cache quantization
 
-### Output
+## Regenerating Configs
 
-```
-─── RESULT ───
-  max_ctx=202752  (train_ctx=202752)
-  experts: --n-cpu-moe 7
-
-  VRAM: budget=15.2  nonex=1.0  exp_gpu=10.4  KV=2.9GB
-  headroom=+0.9GB (5.5%)
-
-  ── Overhead tolerance ──
-  Extra %  Result ctx  Status
-       5%      202752  ✓ OK
-      10%      189355  ⚠ LOW
-      15%      135825  ⚠ LOW
-      20%       82295  ⚠ LOW
-      25%       28765  ⚠ LOW
-  Max overhead before degraded: ~8%
-```
-
-### Safety Modes
-
-| Flag | Safety margin | Compute buffers | Overhead | Headroom |
-|------|--------------|-----------------|----------|----------|
-| (default) | 256 MB | 500 MB | 5% | 5% |
-| `--conservative` | 384 MB | 750 MB | 7.5% | 5% |
-| `--safe` | 512 MB | 1000 MB | 10% | 5% |
-
-The solver **enforces** minimum headroom. If the best-ctx config has <5% headroom, it automatically increases expert offloading or reduces context.
-
-### Sensitivity Analysis
-
-The overhead tolerance table shows exactly how much unexpected memory overhead your config can absorb before degrading. "Max overhead before degraded" is the key number — if it's under 5%, the config is tight and you should use `--conservative` or `--safe`.
-
-## Architecture Support
-
-| Architecture | KV style | Expert detection | Notes |
-|-------------|----------|-----------------|-------|
-| `deepseek2` (GLM-4.7) | MLA compressed latent | ✓ | Single `attn_kv_a_mqa` per layer |
-| `qwen3moe` / `qwen35moe` | Standard GQA | ✓ | Fused QKV or split K/V |
-| `qwen3next` | Hybrid (12/48 layers) | ✓ | Only 12 sink layers cache full KV |
-| `gemma4` | SWA + global | ✓ | 5/6 layers sliding window (fixed cost), 1/6 global (growing) |
-| `mistral3` / `cohere2moe` | Standard GQA | ✓ | Split K and V tensors |
-| Dense models | Standard | N/A | All weights non-expert |
-
-## Runtime Verification
-
-After sizing, verify the model actually fits:
+After adding new GGUF files to your models directory:
 
 ```bash
-./scripts/verify-runtime.sh /path/to/model.gguf --ctx-size 202752 --n-cpu-moe 7
+# Backup existing config
+cp .env .env.bak
+
+# Regenerate everything
+python3 scripts/setup-tui.py --auto
+
+# Restart
+docker compose restart
 ```
 
-This launches the model, fills KV cache incrementally, monitors VRAM via `rocm-smi`/`nvidia-smi`, and reports peak usage vs prediction.
-
-## Relay Integration
-
-When relay is installed (systemd or `/opt/relay`), the setup TUI detects it and offers to register the model automatically:
-
-```
-Relay found: /etc/relay/relay.env (needs sudo)
-Register Apodex 2B with relay? [y/N]
-```
-
-If relay's env file is writable, it appends the model to `RELAY_MODEL_MAP` automatically. Otherwise it prints the exact `sudo tee -a` command.
-
-### Model Map Entry
-
-```bash
-RELAY_MODEL_MAP='{"apodex-2b": {"cmd":"/home/user/start-llama-apodex-2b.sh","ctx_size":262144}}'
-```
-
-See [Lazy LLM Lifecycle](/lazy-llm-lifecycle) and [Configuration](/configuration) for the full relay model switching setup.
-
-## Docker Output
-
-```bash
-python3 scripts/size-model.py model.gguf --docker
-# docker run -d --name llama-server \
-#   --device /dev/kfd --device /dev/dri \
-#   -v /path/to/models:/models:ro \
-#   -p 8080:8080 \
-#   ghcr.io/ggml-org/llama.cpp:full \
-#   --model /models/model.gguf \
-#   --ctx-size 202752 \
-#   -ngl 999 --parallel 1 --flash-attn on \
-#   --cache-type-k q4_0 --cache-type-v q4_0 \
-#   --n-cpu-moe 7
-```
-
-Docker output auto-detects AMD (`--device /dev/kfd --device /dev/dri`) vs NVIDIA (`--gpus all`) and selects the correct image tag.
-
-## Manual VRAM/DRAM Override
-
-For containers or headless servers where GPU tools aren't available:
-
-```bash
-python3 scripts/size-model.py model.gguf --vram 16 --dram 32 --conservative --docker
-```
+Your model files are never touched. Only `.env`, `docker-compose.yml`, and `start-scripts/` are regenerated.

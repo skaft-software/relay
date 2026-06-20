@@ -2,8 +2,8 @@
 layout: home
 
 hero:
-  text: Stop patching every agent for local models.
-  tagline: Relay is a lightweight compatibility gateway for llama.cpp and local inference servers. It exposes OpenAI- and Anthropic-compatible APIs, normalizes streaming, tools, models, and errors, and lets real agents talk to your local models without custom glue code.
+  text: One gateway. Any model. Local or cloud.
+  tagline: Relay is a protocol adapter that sits between your coding agent and your models — local llama.cpp servers or cloud APIs (OpenAI, Anthropic, DeepSeek, Groq). One endpoint, one API key, no glue code.
 ---
 
 <div class="relay-section">
@@ -17,70 +17,70 @@ hero:
 
 <p class="relay-section-label">What Relay Normalizes</p>
 
-<h2 class="relay-section-title">A single compatibility surface across protocols</h2>
+<h2 class="relay-section-title">Everything your agent expects, from any backend</h2>
 
 <div class="relay-norm-grid">
 
 <div class="relay-norm-card">
   <span class="relay-norm-card-icon">▸</span>
-  <span class="relay-norm-card-label">OpenAI chat completions</span>
+  <span class="relay-norm-card-label">OpenAI + Anthropic APIs</span>
 </div>
 
 <div class="relay-norm-card">
   <span class="relay-norm-card-icon">▸</span>
-  <span class="relay-norm-card-label">Anthropic messages</span>
+  <span class="relay-norm-card-label">Streaming SSE normalization</span>
 </div>
 
 <div class="relay-norm-card">
   <span class="relay-norm-card-icon">▸</span>
-  <span class="relay-norm-card-label">Streaming / SSE</span>
+  <span class="relay-norm-card-label">Tool call compatibility</span>
 </div>
 
 <div class="relay-norm-card">
   <span class="relay-norm-card-icon">▸</span>
-  <span class="relay-norm-card-label">Tool call shapes</span>
+  <span class="relay-norm-card-label">Error shape normalization</span>
 </div>
 
 <div class="relay-norm-card">
   <span class="relay-norm-card-icon">▸</span>
-  <span class="relay-norm-card-label">Model aliases &amp; capabilities</span>
+  <span class="relay-norm-card-label">Auto model start / stop / switch</span>
 </div>
 
 <div class="relay-norm-card">
   <span class="relay-norm-card-icon">▸</span>
-  <span class="relay-norm-card-label">Upstream errors &amp; status</span>
+  <span class="relay-norm-card-label">Session-aware context isolation</span>
 </div>
 
 <div class="relay-norm-card">
   <span class="relay-norm-card-icon">▸</span>
-  <span class="relay-norm-card-label">Health / readiness</span>
+  <span class="relay-norm-card-label">Cloud API proxy mode</span>
 </div>
 
 <div class="relay-norm-card">
   <span class="relay-norm-card-icon">▸</span>
-  <span class="relay-norm-card-label">Auto model lifecycle</span>
+  <span class="relay-norm-card-label">Hardware-aware auto-setup</span>
 </div>
 
 <div class="relay-norm-card">
   <span class="relay-norm-card-icon">▸</span>
-  <span class="relay-norm-card-label">Cloud API proxy</span>
+  <span class="relay-norm-card-label">HTML status dashboard</span>
 </div>
 
 <div class="relay-norm-card">
   <span class="relay-norm-card-icon">▸</span>
-  <span class="relay-norm-card-label">Session-aware context</span>
+  <span class="relay-norm-card-label">Health, metrics, observability</span>
 </div>
 
 <div class="relay-norm-card">
   <span class="relay-norm-card-icon">▸</span>
-  <span class="relay-norm-card-label">Status dashboard</span>
+  <span class="relay-norm-card-label">Docker + one-liner install</span>
 </div>
 
 </div>
 
 <div class="relay-callout">
-  <div class="relay-callout-label">Why not direct llama.cpp?</div>
-  <p><strong>llama.cpp is excellent at inference.</strong> Relay is not trying to replace it. Relay handles the compatibility layer around it: API shapes, streaming behavior, tool semantics, model metadata, and observability. Think of it as the protocol adapter that sits between <strong>raw inference</strong> and <strong>real-world agent tooling</strong>.</p>
+  <div class="relay-callout-label">Why Relay instead of wiring things up yourself?</div>
+  <p><strong>LLM backends are great at inference. Relay handles everything around it.</strong> API contract compliance, streaming event ordering, tool call shape normalization, error codes, model metadata, auto lifecycle, session isolation, rate limiting, and observability. One endpoint for any model — local or cloud — that your agent can actually talk to.</p>
 </div>
 
 <p class="relay-section-label">Quickstart</p>
@@ -88,23 +88,23 @@ hero:
 <TerminalBlock>
 
 ```bash
-# One command to install and launch the setup wizard
+# Install and run the setup wizard (auto-detects your hardware)
 curl -fsSL https://raw.githubusercontent.com/achuthanmukundan00/relay/main/scripts/install.sh | bash
 
-# Or run the wizard directly (headless auto-detect)
-python3 scripts/setup-tui.py --auto
+# After setup, start Relay
+npm start          # bare metal
+# or
+docker compose up -d   # Docker (recommended for Linux GPU)
 
-# Start Relay
-docker compose up -d
-
-# Verify
+# Verify it's working
 curl http://127.0.0.1:1234/v1/models
+open http://127.0.0.1:1234          # status dashboard
 ```
 
 </TerminalBlock>
 
 <div class="relay-note">
-  <strong>Using Hamr?</strong> Relay can act as the local model gateway underneath it. Hamr is the agent UX and runtime; Relay is the compatibility boundary that makes local inference actually work with it.
+  <strong>Already have an agent runtime?</strong> Relay works underneath any OpenAI or Anthropic-compatible client — opencode, Cursor, Claude Code, Continue, Aider, and more. Point them at <code>http://127.0.0.1:1234/v1</code>.
 </div>
 
 </div>
