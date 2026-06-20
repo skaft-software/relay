@@ -1,78 +1,92 @@
 # Quickstart
 
-## One-Line Install
+## One-Liner Install
 
+```bash
+curl -fsSL https://raw.githubusercontent.com/achuthanmukundan00/relay/main/scripts/install.sh | bash
+```
 
+The installer checks for Node.js, downloads Relay, and launches the setup wizard.
 
-## Manual Docker Setup
+## Setup Wizard
 
+The wizard auto-detects your hardware and has three modes:
 
+| Mode | What it does |
+|---|---|
+| **Local** | Finds your GGUF files, sizes them, generates start scripts with optimal GPU/CPU flags, writes `.env` |
+| **Cloud** | Configures relay to proxy OpenAI, Anthropic, DeepSeek, or Groq — no local GPU needed |
+| **BYO** | Point relay at an existing Ollama or llama.cpp server |
 
-## Configure Models
+### Interactive (TUI)
 
-Edit .env and set RELAY_MODEL_MAP with your model start commands:
+```bash
+python3 scripts/setup-tui.py
+```
 
-STARSHIP_SHELL=zsh
-MANPATH=:/usr/share/man:/usr/local/share/man:/Applications/Ghostty.app/Contents/Resources/ghostty/../man:
-REMOTE_RELAY_BASE_URL=https://ai.watchyourtemper.com
-GHOSTTY_RESOURCES_DIR=/Applications/Ghostty.app/Contents/Resources/ghostty
-DEEPSEEK_API_KEY=sk-REDACTED
-TERM_PROGRAM=ghostty
-SHELL=/bin/zsh
-TERM=xterm-ghostty
-HOMEBREW_REPOSITORY=/opt/homebrew
-TMPDIR=/var/folders/d1/k5vl2s3n5nggpnfg963q1vwr0000gn/T/
-TERM_PROGRAM_VERSION=1.3.1
-FPATH=/opt/homebrew/share/zsh/site-functions:/usr/local/share/zsh/site-functions:/usr/share/zsh/site-functions:/usr/share/zsh/5.9/functions
-PI_CODING_AGENT=true
-LOCAL_PROXY_PORT=1234
-USER=achumukundan
-OPENAI_API_KEY=sk-REDACTED
-COMMAND_MODE=unix2003
-SSH_AUTH_SOCK=/private/tmp/com.apple.launchd.cowldiFg6X/Listeners
-__CF_USER_TEXT_ENCODING=0x1F5:0x0:0x52
-PATH=/Users/achumukundan/.pi/agent/bin:/Users/achumukundan/.bun/bin:/Users/achumukundan/Library/Python/3.9/bin:/opt/homebrew/opt/openjdk@17/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin:/opt/pmk/env/global/bin:/Library/Apple/usr/bin:/Users/achumukundan/.cargo/bin:/Users/achumukundan/.local/bin:/Applications/Ghostty.app/Contents/MacOS
-_=/usr/bin/env
-GHOSTTY_SHELL_FEATURES=path,title
-__CFBundleIdentifier=com.mitchellh.ghostty
-CONTEXT7_API_KEY=ctx7sk-REDACTED
-CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000
-PWD=/Users/achumukundan/workspace/git/hamr
-OPENROUTER_API_KEY=sk-REDACTED
-LANG=en_CA.UTF-8
-XPC_FLAGS=0x0
-ANTHROPIC_API_KEY=sk-REDACTED
-XPC_SERVICE_NAME=0
-HOME=/Users/achumukundan
-SHLVL=2
-ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
-TERMINFO=/Applications/Ghostty.app/Contents/Resources/terminfo
-LLM_MODEL=Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf
-HOMEBREW_PREFIX=/opt/homebrew
-CF_ACCESS_CLIENT_ID=fe9181e1cad51b266dff2fda0306ec22.access
-STARSHIP_SESSION_KEY=2187211733128101
-XAI_API_KEY=xai-REDACTED
-LOGNAME=achumukundan
-LLM_BASE_URL=https://ai.watchyourtemper.com/v1
-XDG_DATA_DIRS=/usr/local/share:/usr/share:/Applications/Ghostty.app/Contents/Resources/ghostty/..
-GHOSTTY_BIN_DIR=/Applications/Ghostty.app/Contents/MacOS
-BUN_INSTALL=/Users/achumukundan/.bun
-CF_ACCESS_CLIENT_SECRET=2686515372b3f5de624c31bdd48bd3398ecb3c9d0999d7c6c9ac4448b788e767
-INFOPATH=/opt/homebrew/share/info:
-HOMEBREW_CELLAR=/opt/homebrew/Cellar
-OSLogRateLimit=64
-AUTOCAREER_USE_SYNAX=true
-COLORTERM=truecolor
+Arrow keys to navigate, Enter to pick. Shows your hardware, GPU/VRAM, and model catalog with fit markers.
 
-Each model entry needs:
-- cmd — shell script to start the model server
-- ctx_size — context window size (exposed via /v1/models)
-- multimodal (optional) — true if model supports vision
+### Headless (CLI)
 
-The start script should accept LLAMA_PORT env var for port allocation:
+```bash
+# Auto-detect everything, no questions
+python3 scripts/setup-tui.py --auto
 
+# Cloud mode
+python3 scripts/setup-tui.py --auto --mode cloud
 
+# Custom model directory
+python3 scripts/setup-tui.py --auto --models-dir /opt/models
+
+# Print catalog and exit
+python3 scripts/setup-tui.py --list
+
+# Show all options
+python3 scripts/setup-tui.py --help
+```
+
+Agents and scripts use `--auto`. Humans use the interactive TUI.
+
+## Start Relay
+
+```bash
+# Docker (recommended for Linux with GPU)
+docker compose up -d
+
+# Bare metal
+npm start
+```
 
 ## Verify
 
+```bash
+# Health check
+curl http://127.0.0.1:1234/health
 
+# List models
+curl http://127.0.0.1:1234/v1/models
+
+# HTML dashboard
+open http://127.0.0.1:1234
+
+# Test completion
+curl -X POST http://127.0.0.1:1234/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3.6-35b-a3b","messages":[{"role":"user","content":"Say OK"}],"max_tokens":10}'
+```
+
+## Point Your Agent Here
+
+```
+Base URL: http://127.0.0.1:1234/v1
+API Key:  (leave blank unless you set API_KEY in .env)
+```
+
+Works with opencode, Cursor, Claude Code, Continue, and any OpenAI/Anthropic-compatible client.
+
+## Next
+
+- [Configuration reference](configuration.md) — every env var
+- [Model lifecycle](lazy-llm-lifecycle.md) — auto start/stop, session-aware context
+- [Public deployment](deploy-public.md) — HTTPS, Cloudflare Tunnel, sharing
+- [API compatibility](api-compatibility.md) — endpoint reference

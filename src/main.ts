@@ -1,6 +1,12 @@
 import { loadConfig } from './config.ts';
 import { createApp } from './server.ts';
 import { createLogger } from './logger.ts';
+import { runSetup } from './setup.ts';
+
+if (process.argv[2] === 'setup') {
+  await runSetup();
+  process.exit(0);
+}
 
 const config = loadConfig();
 const logger = createLogger(config.logLevel);
@@ -22,12 +28,20 @@ process.on('uncaughtException', (error) => {
   process.exit(1);
 });
 
-if ((config.host === '0.0.0.0' || config.host === '::') && !config.apiKey) {
+if ((config.host === '0.0.0.0' || config.host === '::') && !config.apiKey && config.relayMode !== 'cloud') {
   logger.error('Relay is configured to bind to all interfaces without an API_KEY. Set API_KEY or bind to 127.0.0.1.');
   process.exit(1);
 }
 
 const app = createApp(config);
+
+if (config.relayMode === 'cloud') {
+  logger.info('relay cloud mode — proxying to external APIs', {
+    models: config.cloudModels ? Object.keys(config.cloudModels).join(', ') : 'none',
+  });
+} else {
+  logger.info('relay gateway mode — managing local models');
+}
 
 const { close: closeServer, server: httpServer } = await app.listen();
 

@@ -46,20 +46,26 @@ export function canonicalToOpenAIChatCompletion(canonical: CanonicalChatResponse
 
 export function canonicalToOpenAIResponse(canonical: CanonicalChatResponse, request: JsonObject): JsonObject {
   const choice = canonical.choices[0];
-  const output: JsonObject[] = [{
-    id: `msg_${crypto.randomUUID()}`,
-    type: 'message',
-    status: 'completed',
-    role: 'assistant',
-    content: [],
-  }];
-  if (choice?.message.content) output[0].content.push({ type: 'output_text', text: choice.message.content });
+  const output: JsonObject[] = [];
+  // Use reasoning_content as fallback when content is empty (DeepSeek V4 reasoning models).
+  const displayText = (choice?.message.content) || (choice?.message.reasoning_content) || null;
+  if (displayText) {
+    output.push({
+      id: `msg_${crypto.randomUUID()}`,
+      type: 'message',
+      status: 'completed',
+      role: 'assistant',
+      content: [{ type: 'output_text', text: displayText, annotations: [] }],
+    });
+  }
   for (const toolCall of choice?.message.tool_calls ?? []) {
-    output[0].content.push({
+    output.push({
+      id: `fc_${crypto.randomUUID()}`,
       type: 'function_call',
       call_id: toolCall.id,
       name: toolCall.function.name,
       arguments: toolCall.function.arguments,
+      status: 'completed',
     });
   }
 

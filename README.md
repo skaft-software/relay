@@ -1,57 +1,55 @@
 # Relay
 
-[![License](https://img.shields.io/github/license/skaft/relay)](https://github.com/skaft/relay/blob/main/LICENSE)
-[![Latest Release](https://img.shields.io/github/v/release/skaft/relay)](https://github.com/skaft/relay/releases/latest)
+[![License](https://img.shields.io/github/license/achuthanmukundan00/relay)](https://github.com/achuthanmukundan00/relay/blob/main/LICENSE)
+[![Latest Release](https://img.shields.io/github/v/release/achuthanmukundan00/relay)](https://github.com/achuthanmukundan00/relay/releases/latest)
 
-Relay is a lightweight, agent-focused gateway that makes local LLM servers look like hosted OpenAI- and Anthropic-style APIs. It sits between clients and local upstream model servers (like llama.cpp), normalizes request/response shapes, and manages model lifecycles.
+A lightweight, agent-focused gateway that makes local LLM servers look like hosted OpenAI / Anthropic APIs. Sits between your coding agent (opencode, Cursor, etc.) and llama.cpp, normalizes request/response shapes, and manages model lifecycles.
 
-## One-Line Install
+## Quick start
 
+```bash
+curl -fsSL https://raw.githubusercontent.com/achuthanmukundan00/relay/main/scripts/install.sh | bash
+```
 
+That's it. The installer checks for Node.js, downloads Relay, and launches the setup wizard. The wizard auto-detects your hardware, helps you pick a model (or set up cloud providers like OpenAI/DeepSeek), and writes your config.
 
-This clones Relay, builds the Docker image, and starts the gateway. Requires Docker and curl. Works on macOS and Linux.
+Once setup finishes, start Relay:
+
+```bash
+# Docker (recommended for Linux with GPU)
+docker compose up -d
+
+# Or bare metal
+npm start
+```
+
+Your endpoint: `http://127.0.0.1:1234/v1`. Open the dashboard at `http://127.0.0.1:1234`.
 
 ## Why Relay
 
-Local model servers are fast and private, but agent clients expect hosted API contracts. Relay closes that gap and adds production features:
+Local model servers are fast and private, but agent clients expect hosted API contracts. Relay closes that gap:
 
-- **Model lifecycle** — start, stop, and switch models on demand. No manual port management.
-- **Graceful switching** — new model warms up before old one shuts down. No dropped requests.
-- **Prefix-cache pre-warming** — cached conversation prefixes pre-fill the KV cache for instant first-token latency.
-- **Orphan cleanup** — stale model processes from previous sessions are killed on startup.
-- **Multi-model** — multiple models can run simultaneously (with enough VRAM).
-
-## Key Capabilities
-
-- OpenAI-compatible: chat/completions, completions, responses, embeddings, models
-- Anthropic-compatible: messages, count_tokens
-- Streaming SSE normalization and repair
-- Request/response canonicalization
-- Observability: /health, /relay/capabilities, /relay/stats, /relay/status
-- Configurable field policies (strip, warn, pass-through, error)
-
-## Quickstart (Docker)
-
-
+- **OpenAI-compatible**: chat/completions, completions, responses, embeddings, models
+- **Anthropic-compatible**: messages, count_tokens
+- **Auto model lifecycle** — starts, stops, and switches models on demand. No manual port management.
+- **Session-aware** — resumes context on the same session, clears it on new sessions.
+- **Streaming SSE normalization** — repairs and normalizes streaming responses.
+- **Observability dashboard** — health, metrics, request history, model lifecycle status at `/relay/status`.
+- **Cloud fallback** — forward unknown models to Gemini, DeepSeek, etc.
+- **Two operating modes** — gateway (manage local models) or cloud (proxy to external APIs)
+- **One-liner install** — `curl \| bash` then `python3 scripts/setup-tui.py --auto`
 
 ## Configuration
 
+See [docs/configuration.md](docs/configuration.md) for the full reference. Key variables:
+
 | Variable | Default | Description |
 |---|---|---|
-| HOST | 127.0.0.1 | Bind address |
-| PORT | 1234 | Bind port |
-| UPSTREAM_BASE_URL | http://127.0.0.1:8080/v1 | Upstream API root |
-| RELAY_MODEL_LIFECYCLE_ENABLED | false | Enable lazy model loading |
-| RELAY_MODEL_MAP | (empty) | JSON: model names to start configs |
-| RELAY_SWITCH_POLICY | eager | graceful (needs 2x VRAM) or eager |
-| RELAY_MODEL_PORT_BASE | 8081 | Starting port for model allocation |
-| RELAY_MODEL_IDLE_SHUTDOWN_MS | 3600000 | Idle timeout (1 hour) |
-
-See docs/configuration.md for full reference.
-
-## Example
-
-
+| `RELAY_MODEL_MAP` | (empty) | JSON map of model names to generated start commands |
+| `RELAY_MODEL_LIFECYCLE_ENABLED` | `false` | Auto-start/stop models on demand |
+| `RELAY_MODE` | `gateway` | `gateway` (local models) or `cloud` (proxy to external APIs) |
+| `RELAY_CLOUD_FALLBACK_URL` | (none) | Gateway mode: forward unknown models here |
+| `RELAY_CLOUD_MODELS` | (none) | Cloud mode: JSON map of model → `{base_url, auth_env, ctx_size}` |
 
 ## Docs
 
@@ -59,7 +57,9 @@ See docs/configuration.md for full reference.
 - [API Compatibility](docs/api-compatibility.md)
 - [Architecture](docs/architecture.md)
 - [Model Lifecycle](docs/lazy-llm-lifecycle.md)
+- [Public Deployment](docs/deploy-public.md)
 - [Deployment](docs/deploy-systemd.md)
+- [Troubleshooting](docs/troubleshooting.md)
 - [Troubleshooting](docs/troubleshooting.md)
 
 ## License

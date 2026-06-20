@@ -7,6 +7,7 @@ import { createLogger } from '../logger.ts';
 import { logStreamingResponseDiagnostics, logUpstreamPayloadDiagnostics } from '../truncation-diagnostics.ts';
 import { canonicalToUpstreamChatRequest, openAIChatRequestToCanonical } from '../internal/openai-chat.ts';
 import { canonicalToOpenAIChatCompletion, upstreamChatCompletionToCanonical } from '../internal/response.ts';
+import type { ModelLifecycle } from '../lifecycle.ts';
 
 type JsonObject = Record<string, any>;
 

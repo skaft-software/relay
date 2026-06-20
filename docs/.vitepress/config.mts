@@ -12,7 +12,7 @@ export default defineConfig({
       { text: 'Docs', link: '/' },
       { text: 'Quickstart', link: '/quickstart' },
       { text: 'Guide', link: '/configuration' },
-      { text: 'GitHub', link: 'https://github.com/skaft/relay' },
+      { text: 'GitHub', link: 'https://github.com/achuthanmukundan00/relay' },
     ],
     sidebar: [
       {
@@ -23,7 +23,8 @@ export default defineConfig({
           { text: 'Configuration', link: '/configuration' },
           { text: 'API Compatibility', link: '/api-compatibility' },
           { text: 'Troubleshooting', link: '/troubleshooting' },
-          { text: 'Systemd Deployment', link: '/systemd' },
+          { text: 'Public Deployment', link: '/deploy-public' },
+          { text: 'Systemd Deployment', link: '/deploy-systemd' },
           { text: 'Architecture', link: '/architecture' },
           { text: 'Agents', link: '/agents' },
         ],
@@ -33,7 +34,7 @@ export default defineConfig({
       provider: 'local',
     },
     socialLinks: [
-      { icon: 'github', link: 'https://github.com/skaft/relay' },
+      { icon: 'github', link: 'https://github.com/achuthanmukundan00/relay' },
     ],
   },
 });

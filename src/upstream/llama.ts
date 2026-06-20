@@ -26,9 +26,17 @@ export async function upstreamFetch(config: AppConfig, path: string, init: Reque
   const timeout = setTimeout(() => controller.abort(), config.requestTimeoutMs);
   const signal = externalSignal ? AbortSignal.any([controller.signal, externalSignal]) : controller.signal;
   const baseUrl = upstreamBaseUrlOverride ?? config.upstreamBaseUrl;
+
+  // Inject cloud API auth header when set by cloud mode.
+  const headers = new Headers(init.headers);
+  if (config.upstreamAuthHeader && !headers.has('authorization')) {
+    headers.set('authorization', config.upstreamAuthHeader);
+  }
+
   try {
     const response = await fetch(upstreamUrl(baseUrl, path), {
       ...init,
+      headers,
       signal,
     });
     return { response };

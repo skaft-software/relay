@@ -6,8 +6,10 @@
   "scripts": {
     "dev": "node --env-file=.env --watch --experimental-strip-types src/main.ts",
     "start": "node --env-file=.env --experimental-strip-types src/main.ts",
+    "setup": "node --experimental-strip-types src/main.ts setup",
     "build": "npm run typecheck",
-    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "test": "node --experimental-strip-types --test tests/*.test.ts && python3 -m pytest tests/ -q",
+    "test:python": "python3 -m pytest tests/ -q",
     "typecheck": "tsc --noEmit",
     "smoke:openai": "node --env-file=.env --experimental-strip-types scripts/smoke-openai.ts",
     "smoke:anthropic": "node --env-file=.env --experimental-strip-types scripts/smoke-anthropic.ts",

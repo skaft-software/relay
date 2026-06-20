@@ -1,24 +1,45 @@
-# Agents And Client Compatibility
+# Agents and Client Compatibility
 
 Relay is designed for local-agent workflows where tools expect hosted API shapes.
 
-## Typical Agent Flow
+## Quick Connect
 
-1. Agent client sends OpenAI- or Anthropic-style request.
-2. Relay normalizes request fields to a canonical internal model.
-3. Relay forwards to upstream OpenAI-like chat endpoint.
-4. Relay maps upstream responses back to client protocol shape.
+After setup, point any OpenAI/Anthropic-compatible agent at:
 
-## Practical Compatibility Scope
+```
+Base URL: http://127.0.0.1:1234/v1
+API Key:  (leave blank unless API_KEY is set in .env)
+Model:    any model from /v1/models
+```
 
-Relay works best with clients that allow custom base URLs and model IDs.
+## Tested Clients
 
-- OpenAI-compatible clients: chat/responses/completions style workflows
-- Anthropic-compatible clients: messages workflows
-- Local agent tools (for example Cline) using OpenAI-compatible mode
+Relay works with any client that allows custom base URLs and model IDs:
+
+- **opencode** — set `provider.base_url` to `http://127.0.0.1:1234/v1`
+- **Cursor** — add as custom OpenAI-compatible provider
+- **Claude Code** — use `ANTHROPIC_BASE_URL=http://127.0.0.1:1234/v1`
+- **Continue** — add as OpenAI-compatible provider in config
+- **Aider** — `--openai-api-base http://127.0.0.1:1234/v1`
+
+## Session Affinity
+
+For multi-project setups, use the `session-id` header to keep conversations isolated:
+
+```bash
+# Project A
+curl -H "session-id: project-alpha" http://127.0.0.1:1234/v1/chat/completions ...
+
+# Project B — Relay restarts the model to clear context
+curl -H "session-id: project-beta" http://127.0.0.1:1234/v1/chat/completions ...
+```
+
+## Public Sharing
+
+See [Public Deployment](deploy-public.md) to share your relay with friends over HTTPS.
 
 ## Known Limits
 
-Relay intentionally does not implement full hosted platform orchestration APIs.
-
-See [API Compatibility](./api-compatibility.md) for explicit support boundaries.
+- Relay does not implement hosted platform orchestration (assistants, threads, runs)
+- Non-function tools (web search, code interpreter) are stripped
+- See [API Compatibility](api-compatibility.md) for full endpoint support

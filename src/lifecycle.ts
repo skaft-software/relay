@@ -1,20 +1,13 @@
 /**
- * ModelLifecycle — manages multiple concurrent model processes with
- * graceful switching and prefix-cache pre-warming.
+ * ModelLifecycle — manages model processes for local llama.cpp backends.
  *
  * v2 changes:
- *  - Multi-process: activeProcesses Map tracks all running models
- *  - Graceful switching: start new model on dedicated port, wait for health,
- *    THEN kill old model (configurable via switchPolicy)
+ *  - Multi-process bookkeeping: activeProcesses Map tracks running models
+ *  - Eager switching only: kill old model before starting the new one
  *  - Port allocation: each model gets a dedicated port from modelPortBase
- *  - Pre-warming: when switchPrewarm is enabled, cached conversation prefixes
- *    are sent to the new model immediately after health check to warm its KV cache
- *  - Fast switch-back: old model stays alive for switchGraceMs, enabling
- *    instant switch-back without cold start
  *  - Idle shutdown: per-model idle timers, cascading (least-recently-used first)
  */
 
-import { createHash } from 'node:crypto';
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 
 import type { AppConfig, ModelEntry } from './config.ts';
@@ -75,8 +68,6 @@ interface ModelProcess {
   healthy: boolean;
   startedAt: string;
   lastUsedAt: number;
-  /** Grace period timer — when this fires, the process can be killed. */
-  graceTimer: unknown | null;
   /** Whether this model should be kept warm (not killed during normal idle shutdown). */
   keepWarm: boolean;
   entry?: ModelEntry;
@@ -132,20 +123,14 @@ export class ModelLifecycle {
   private switchTargetModel: string | null = null;
   /** Next available port for dynamic allocation. */
   private nextPort: number;
-  /** Prefix cache for pre-warming new models. */
-  private prefixCache: PrefixCache;
-
+  /** Session ID currently associated with each loaded model. */
+  private modelSessions = new Map<string, string>();
   constructor(config: AppConfig, hooks: LifecycleHooks = {}) {
     this.config = config;
     this.hooks = hooks;
     this.lastIdleAt = this.now();
     this.ringBufferMaxBytes = config.lifecycleRingBufferBytes ?? 65536;
     this.nextPort = config.modelPortBase ?? 8081;
-    this.prefixCache = new PrefixCache(
-      config.prefixCacheMaxEntries ?? 50,
-      config.prefixCacheMaxTokens ?? 1_000_000,
-    );
-
     // ── Startup orphan cleanup ─────────────────────────────────────
     // Kill any llama-server processes from previous Relay instances
     // that survived as init orphans (detached spawn). These would
@@ -158,7 +143,8 @@ export class ModelLifecycle {
           portArgs.push(`${p}/tcp`);
         }
         execFileSync('fuser', ['-k', ...portArgs], { timeout: 3000, stdio: 'ignore' });
-      } catch {
+      } catch (error) {
+        if (isFuserNoMatch(error)) return;
         // Best-effort — orphan cleanup failure shouldn't block startup.
         // Log at warn so permission/missing-binary issues are visible.
         if (this.hooks.log) this.hooks.log('warn', 'startup orphan cleanup via fuser failed', {});
@@ -199,9 +185,9 @@ export class ModelLifecycle {
 
   // ── Public: ensure model available ───────────────────────────────────
 
-  async ensureModelAvailable(modelName?: string, externalSignal?: AbortSignal): Promise<ModelAvailability> {
+  async ensureModelAvailable(modelName?: string, externalSignal?: AbortSignal, sessionId?: string): Promise<ModelAvailability> {
     if (modelName && this.config.modelEntries) {
-      return this.ensureModelWithSwitching(modelName, externalSignal);
+      return this.ensureModelWithSwitching(modelName, externalSignal, sessionId);
     }
 
     const reachable = await this.probeDefault(externalSignal);
@@ -248,9 +234,9 @@ export class ModelLifecycle {
     return this.startInFlight;
   }
 
-  // ── v2: Model switching with graceful transition ────────────────────
+  // ── v2: Model switching ─────────────────────────────────────────────
 
-  private async ensureModelWithSwitching(modelName: string, externalSignal?: AbortSignal): Promise<ModelAvailability> {
+  private async ensureModelWithSwitching(modelName: string, externalSignal?: AbortSignal, sessionId?: string): Promise<ModelAvailability> {
     const entries = this.config.modelEntries!;
     let entry: ModelEntry | undefined = entries[modelName];
     if (!entry) {
@@ -279,22 +265,21 @@ export class ModelLifecycle {
     // Fast path: requested model is already loaded and healthy
     const existing = this.activeProcesses.get(modelName);
     if (existing?.healthy) {
-      existing.lastUsedAt = this.now();
-      // Cancel any grace timer (model is still in use)
-      if (existing.graceTimer) {
-        this.clearTimer(existing.graceTimer);
-        existing.graceTimer = null;
+      const prevSession = this.modelSessions.get(modelName);
+      if (sessionId && prevSession && prevSession !== sessionId) {
+        this.log('info', 'session changed, restarting model to clear context', {
+          model: modelName,
+          fromSession: prevSession,
+          toSession: sessionId,
+        });
+        return this.eagerSwitch(modelName, entry, externalSignal, sessionId);
       }
+      existing.lastUsedAt = this.now();
       this.currentModelName = modelName;
       this.modelAvailable = true;
       this.state = 'running';
       this.lastHealthyAt = new Date().toISOString();
 
-      this.log('info', 'model fast-path: already loaded', {
-        model: modelName,
-        port: existing.port,
-        pid: existing.pid,
-      });
       return { ok: true, port: existing.port };
     }
 
@@ -317,127 +302,7 @@ export class ModelLifecycle {
       };
     }
 
-    // ── Graceful switch: start new model BEFORE killing old ──
-    const policy = this.config.switchPolicy ?? 'graceful';
-
-    if (policy === 'graceful' && this.currentModelName && this.currentModelName !== modelName) {
-      return this.gracefulSwitch(modelName, entry, externalSignal);
-    }
-
-    // Eager switch: kill old first, then start new
-    return this.eagerSwitch(modelName, entry, externalSignal);
-  }
-
-  /**
-   * Graceful switch: start the new model on its own port.
-   * Keep the old model alive during the transition and for a grace period after.
-   * Only kill the old model after the new one is confirmed healthy.
-   */
-  private async gracefulSwitch(
-    modelName: string,
-    entry: ModelEntry,
-    externalSignal?: AbortSignal,
-  ): Promise<ModelAvailability> {
-    this.log('info', 'graceful switch starting', {
-      from: this.currentModelName,
-      to: modelName,
-    });
-
-    this.switchInFlight = (async (): Promise<ModelAvailability> => {
-      this.switchTargetModel = modelName;
-      this.state = 'starting';
-
-      try {
-        // 1. Start the new model on a fresh port
-        const port = this.allocatePort(modelName);
-        this.log('info', 'allocated port for new model', { model: modelName, port });
-
-        const proc = await this.startModelProcess(modelName, entry, port);
-        if (!proc) {
-          this.state = 'failed';
-          return { ok: false, code: 'model_start_failed', message: `Failed to start ${modelName}` };
-        }
-
-        // 2. Wait for the new model to become healthy
-        const startedProc = this.activeProcesses.get(modelName);
-        const healthy = await this.waitForHealthy(port,
-          entry.timeout_sec
-            ? entry.timeout_sec * 1000
-            : (this.config.modelStartTimeoutMs ?? DEFAULT_START_TIMEOUT_MS),
-          startedProc ?? undefined,
-          externalSignal,
-        );
-
-        // 3. Pre-warm the new model's KV cache with cached prefixes only after health is confirmed
-        if (healthy && this.config.switchPrewarm && this.prefixCache.size > 0) {
-          this.log('info', 'pre-warming new model KV cache', {
-            model: modelName,
-            cachedPrefixes: this.prefixCache.size,
-          });
-          await this.prewarmModel(port, externalSignal);
-        }
-
-        if (!healthy) {
-          this.log('error', 'new model failed health check', { model: modelName, port });
-          await this.killProcess(modelName);
-          this.state = 'failed';
-          return { ok: false, code: 'model_start_timeout', message: `${modelName} did not become healthy` };
-        }
-
-        // 4. Mark the new model as active
-        const newProc = this.activeProcesses.get(modelName);
-        if (newProc) {
-          newProc.healthy = true;
-          newProc.keepWarm = true; // Keep warm during grace period
-        }
-
-        // 5. Start grace timer for the OLD model (keep it alive for fast switch-back)
-        const oldModelName = this.currentModelName;
-        if (oldModelName && oldModelName !== modelName) {
-          const oldProc = this.activeProcesses.get(oldModelName);
-          if (oldProc) {
-            const graceMs = entry.switchGraceMs ?? DEFAULT_SWITCH_GRACE_MS;
-            this.log('info', 'old model entering grace period', {
-              model: oldModelName,
-              graceMs,
-            });
-            oldProc.keepWarm = false;
-            this.scheduleGraceKill(oldModelName, graceMs);
-          }
-        }
-
-        // 6. Switch active model
-        this.currentModelName = modelName;
-        this.modelAvailable = true;
-        this.state = 'running';
-        this.lastHealthyAt = new Date().toISOString();
-        this.startCount += 1;
-
-        // 7. Prune excess warm models (keep only switchMaxWarmModels)
-        this.pruneWarmModels();
-
-        this.log('info', 'graceful switch complete', {
-          model: modelName,
-          port,
-          oldModel: oldModelName,
-        });
-
-        return { ok: true, port };
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        this.lastError = message;
-        this.state = 'failed';
-        this.log('error', 'graceful switch failed', { error: redact(message) });
-        return { ok: false, code: 'model_switch_failed', message };
-      }
-    })();
-
-    try {
-      return await this.switchInFlight;
-    } finally {
-      this.switchInFlight = null;
-      this.switchTargetModel = null;
-    }
+    return this.eagerSwitch(modelName, entry, externalSignal, sessionId);
   }
 
   /**
@@ -447,6 +312,7 @@ export class ModelLifecycle {
     modelName: string,
     entry: ModelEntry,
     externalSignal?: AbortSignal,
+    sessionId?: string,
   ): Promise<ModelAvailability> {
     this.log('info', 'eager switch: killing old model first', {
       from: this.currentModelName,
@@ -493,6 +359,9 @@ export class ModelLifecycle {
         this.state = 'running';
         this.lastHealthyAt = new Date().toISOString();
         this.startCount += 1;
+        if (sessionId) {
+          this.modelSessions.set(modelName, sessionId);
+        }
 
         return { ok: true, port };
       } catch (error) {
@@ -533,7 +402,8 @@ export class ModelLifecycle {
     // cleans them up before we bind.
     try {
       execFileSync('fuser', ['-k', `${port}/tcp`], { timeout: 2000, stdio: 'ignore' });
-    } catch {
+    } catch (error) {
+      if (isFuserNoMatch(error)) return port;
       // Best-effort — orphan cleanup failure shouldn't block startup.
       // Log at warn so permission/missing-binary issues are visible.
       if (this.hooks.log) this.hooks.log('warn', 'per-port orphan cleanup via fuser failed', { port });
@@ -586,7 +456,6 @@ export class ModelLifecycle {
         healthy: false,
         startedAt: new Date().toISOString(),
         lastUsedAt: this.now(),
-        graceTimer: null,
         keepWarm: true,
         entry,
         ringBuffer: Buffer.alloc(0),
@@ -668,21 +537,6 @@ export class ModelLifecycle {
     return false;
   }
 
-  private scheduleGraceKill(modelName: string, graceMs: number): void {
-    const proc = this.activeProcesses.get(modelName);
-    if (!proc) return;
-
-    if (proc.graceTimer) this.clearTimer(proc.graceTimer);
-
-    const timer = (this.hooks.setTimer ?? setTimeout)(() => {
-      this.log('info', 'grace period expired, killing old model', { model: modelName });
-      void this.killProcess(modelName);
-    }, graceMs);
-
-    proc.graceTimer = timer;
-    const maybeUnref = (timer as { unref?: () => void } | null)?.unref;
-    if (typeof maybeUnref === 'function') maybeUnref.call(timer);
-  }
 
   private async killProcess(modelName: string): Promise<void> {
     const proc = this.activeProcesses.get(modelName);
@@ -692,10 +546,6 @@ export class ModelLifecycle {
     const port = proc.port;
     this.log('info', 'killing model process', { model: modelName, pid, port });
 
-    if (proc.graceTimer) {
-      this.clearTimer(proc.graceTimer);
-      proc.graceTimer = null;
-    }
 
     // Phase 1: Graceful SIGTERM
     if (typeof (proc.child as any).kill === 'function' && pid) {
@@ -742,77 +592,6 @@ export class ModelLifecycle {
     for (const name of names) {
       await this.killProcess(name);
     }
-  }
-
-  /**
-   * Prune excess warm models, keeping only switchMaxWarmModels.
-   * Kills least-recently-used models first.
-   */
-  private pruneWarmModels(): void {
-    const maxWarm = this.config.switchMaxWarmModels ?? 2;
-    const warmModels = [...this.activeProcesses.entries()]
-      .filter(([name, proc]) => proc.keepWarm && name !== this.currentModelName)
-      .sort(([, a], [, b]) => a.lastUsedAt - b.lastUsedAt);
-
-    while (warmModels.length > maxWarm) {
-      const [name] = warmModels.shift()!;
-      this.log('info', 'pruning excess warm model', { model: name });
-      void this.killProcess(name);
-    }
-  }
-
-  // ── Pre-warming ──────────────────────────────────────────────────────
-
-  /**
-   * Pre-warm a newly started model by sending cached conversation prefixes.
-   * This fills the model's KV cache so the first real request is fast.
-   */
-  private async prewarmModel(port: number, externalSignal?: AbortSignal): Promise<void> {
-    const prefixes = this.prefixCache.getTopPrefixes(3);
-    if (prefixes.length === 0) return;
-
-    for (const prefix of prefixes) {
-      try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 10_000);
-        const signal = externalSignal
-          ? AbortSignal.any([controller.signal, externalSignal])
-          : controller.signal;
-
-        const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            messages: prefix.messages,
-            max_tokens: 1, // Minimal — we just want to warm the KV cache
-            stream: false,
-          }),
-          signal,
-        });
-
-        clearTimeout(timeout);
-        // We don't care about the response content — just that it processed the prefix
-        this.log('info', 'pre-warmed model with cached prefix', {
-          port,
-          prefixMessages: prefix.messages.length,
-          status: response.status,
-        });
-      } catch {
-        // Pre-warming is best-effort
-        this.log('warn', 'pre-warming request failed', { port });
-      }
-    }
-  }
-
-  // ── Prefix cache management ──────────────────────────────────────────
-
-  /**
-   * Cache a conversation prefix for future pre-warming.
-   * Call this after every successful chat completion to build the cache.
-   */
-  cachePrefix(messages: Array<{ role: string; content: string }>): void {
-    if (!this.config.switchPrewarm) return;
-    this.prefixCache.add(messages);
   }
 
   // ── Idle shutdown (v2: per-model) ────────────────────────────────────
@@ -1232,117 +1011,6 @@ export class ModelLifecycle {
   }
 }
 
-// ─── Prefix cache ───────────────────────────────────────────────────────
-
-interface CachedPrefix {
-  messages: Array<{ role: string; content: string }>;
-  /** Approximate token count. */
-  tokenEstimate: number;
-  /** Number of times this prefix has been seen. */
-  hitCount: number;
-  /** Last time this prefix was used. */
-  lastUsed: number;
-}
-
-class PrefixCache {
-  private entries = new Map<string, CachedPrefix>();
-  private maxEntries: number;
-  private maxTokens: number;
-  private totalTokens = 0;
-
-  constructor(maxEntries: number, maxTokens: number) {
-    this.maxEntries = maxEntries;
-    this.maxTokens = maxTokens;
-  }
-
-  get size(): number {
-    return this.entries.size;
-  }
-
-  /**
-   * Add a conversation prefix to the cache.
-   * We cache the system prompt + first few user/assistant messages
-   * since these are stable across turns.
-   */
-  add(messages: Array<{ role: string; content: string }>): void {
-    if (messages.length === 0) return;
-    // Guard against disabled cache (maxEntries/maxTokens <= 0)
-    if (this.maxEntries <= 0 || this.maxTokens <= 0) return;
-
-    // Only cache the stable prefix (up to first user message + any system messages)
-    const prefixLength = Math.min(messages.length, 10);
-    const prefix = messages.slice(0, prefixLength);
-
-    const key = this.hashPrefix(prefix);
-    const tokenEstimate = this.estimateTokens(prefix);
-
-    const existing = this.entries.get(key);
-    if (existing) {
-      existing.hitCount += 1;
-      existing.lastUsed = Date.now();
-      return;
-    }
-
-    // Evict if needed (guard against single entry exceeding maxTokens)
-    let evictAttempts = 0;
-    while (
-      (this.entries.size >= this.maxEntries || this.totalTokens + tokenEstimate > this.maxTokens) &&
-      evictAttempts < this.entries.size + 1
-    ) {
-      this.evictOldest();
-      evictAttempts++;
-    }
-
-    this.entries.set(key, {
-      messages: prefix,
-      tokenEstimate,
-      hitCount: 1,
-      lastUsed: Date.now(),
-    });
-    this.totalTokens += tokenEstimate;
-  }
-
-  /**
-   * Get the most frequently used prefixes for pre-warming.
-   */
-  getTopPrefixes(limit: number): CachedPrefix[] {
-    return [...this.entries.values()]
-      .sort((a, b) => b.hitCount - a.hitCount)
-      .slice(0, limit);
-  }
-
-  private hashPrefix(messages: Array<{ role: string; content: string }>): string {
-    const hash = createHash('sha256');
-    for (const m of messages) {
-      hash.update(`${m.role}:`);
-      hash.update(m.content ?? '');
-      hash.update('\0');
-    }
-    return hash.digest('hex');
-  }
-
-  private estimateTokens(messages: Array<{ role: string; content: string }>): number {
-    // Rough estimate: 4 chars per token
-    return messages.reduce((sum, m) => sum + Math.ceil((m.content?.length ?? 0) / 4), 0);
-  }
-
-  private evictOldest(): void {
-    let oldestKey: string | undefined;
-    let oldestTime = Infinity;
-    for (const [key, entry] of this.entries) {
-      if (entry.lastUsed < oldestTime) {
-        oldestTime = entry.lastUsed;
-        oldestKey = key;
-      }
-    }
-    if (oldestKey) {
-      const entry = this.entries.get(oldestKey);
-      if (entry) this.totalTokens -= entry.tokenEstimate;
-      this.entries.delete(oldestKey);
-    }
-  }
-}
-
 // ─── Probe helpers ──────────────────────────────────────────────────────
 
 async function defaultProbe(config: AppConfig, _healthUrlOverride?: string, externalSignal?: AbortSignal): Promise<boolean> {
@@ -1392,6 +1060,15 @@ export function redact(value: string): string {
   return value
     .replace(/(api[_-]?key|token|secret|password|bearer)\s*[:=]\s*['\"]?[A-Za-z0-9._\-+/=]+/gi, '$1=[REDACTED]')
     .replace(/Bearer\s+[A-Za-z0-9._\-]+/gi, 'Bearer [REDACTED]');
+}
+
+function isFuserNoMatch(error: unknown): boolean {
+  return Boolean(
+    error
+    && typeof error === 'object'
+    && 'status' in error
+    && (error as { status?: number }).status === 1,
+  );
 }
 
 function sleep(ms: number): Promise<void> {

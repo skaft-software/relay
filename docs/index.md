@@ -58,7 +58,22 @@ hero:
 
 <div class="relay-norm-card">
   <span class="relay-norm-card-icon">▸</span>
-  <span class="relay-norm-card-label">Deployment config</span>
+  <span class="relay-norm-card-label">Auto model lifecycle</span>
+</div>
+
+<div class="relay-norm-card">
+  <span class="relay-norm-card-icon">▸</span>
+  <span class="relay-norm-card-label">Cloud API proxy</span>
+</div>
+
+<div class="relay-norm-card">
+  <span class="relay-norm-card-icon">▸</span>
+  <span class="relay-norm-card-label">Session-aware context</span>
+</div>
+
+<div class="relay-norm-card">
+  <span class="relay-norm-card-icon">▸</span>
+  <span class="relay-norm-card-label">Status dashboard</span>
 </div>
 
 </div>
@@ -73,14 +88,16 @@ hero:
 <TerminalBlock>
 
 ```bash
-# 1. Start your local model server
-llama-server --model ./model.gguf --host 127.0.0.1 --port 8080
+# One command to install and launch the setup wizard
+curl -fsSL https://raw.githubusercontent.com/achuthanmukundan00/relay/main/scripts/install.sh | bash
 
-# 2. Clone and start Relay
-git clone https://github.com/achuthanmukundan00/relay.git
-cd relay && npm install && cp .env.example .env && npm run dev
+# Or run the wizard directly (headless auto-detect)
+python3 scripts/setup-tui.py --auto
 
-# 3. Verify
+# Start Relay
+docker compose up -d
+
+# Verify
 curl http://127.0.0.1:1234/v1/models
 ```
 

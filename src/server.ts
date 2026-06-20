@@ -4,7 +4,7 @@ import {
   type ServerResponse,
 } from "node:http";
 
-import { hasValidApiKey } from "./auth.ts";
+import { hasValidApiKey, KeyRateLimiter } from "./auth.ts";
 import { parseJson } from "./json.ts";
 import { CapabilityRegistry } from "./capabilities.ts";
 import type { AppConfig } from "./config.ts";
@@ -43,6 +43,7 @@ import { createLogger } from "./logger.ts";
 import { LlmJobQueue } from "./jobs.ts";
 import type { JobQueueCounts } from "./jobs.ts";
 import { ModelLifecycle } from "./lifecycle.ts";
+import { CloudModelRegistry } from "./cloud.ts";
 import { RequestMutex } from "./mutex.ts";
 import {
   captureRequest,
@@ -58,8 +59,10 @@ import {
   logInboundDiagnostics,
   logNonStreamingResponseDiagnostics,
 } from "./truncation-diagnostics.ts";
+import { encodeSSE } from "./normalize/stream.ts";
 
 type AppFetchInit = Omit<RequestInit, "body"> & { body?: unknown };
+type StreamingProtocol = "anthropic" | "openai_chat" | "openai_responses";
 
 export type App = {
   fetch: (path: string, init?: AppFetchInit) => Promise<Response>;
@@ -75,12 +78,14 @@ export function createApp(config: AppConfig): App {
   const responseStore = new ResponseStore(config.maxStoreEntries, config.maxStoreBytes);
   const capabilities = new CapabilityRegistry(config);
   const observability = new ObservabilityStore(config);
+  const cloudRegistry = config.relayMode === "cloud" ? new CloudModelRegistry(config) : undefined;
   const lifecycle = new ModelLifecycle(config, {
     log: (level, msg, meta) => {
       if (level === "error") logger.error(`lifecycle: ${msg}`, meta);
       else logger.info(`lifecycle: ${msg}`, { level, ...(meta ?? {}) });
     },
   });
+  const isCloud = config.relayMode === "cloud";
   const mutex = config.serializeRequests ? new RequestMutex() : undefined;
   const jobs = new LlmJobQueue(async (job, signal) => {
     const jobModel = typeof job.request?.model === 'string' ? job.request.model : undefined;
@@ -122,16 +127,6 @@ export function createApp(config: AppConfig): App {
         return { response: payload };
       }
       const response = await createChatCompletion(config, store, job.request, signal, lifecycle);
-      // v2: cache conversation prefix for future pre-warming
-      if (config.switchPrewarm && isObject(job.request)) {
-        const msgs = (job.request as any).messages;
-        if (Array.isArray(msgs)) {
-          lifecycle.cachePrefix(msgs.map((m: any) => ({
-            role: typeof m.role === 'string' ? m.role : 'user',
-            content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? ''),
-          })));
-        }
-      }
       const payload: any = await response.clone().json().catch(async () => ({ text: await response.text() }));
       if (!response.ok) {
         return {
@@ -164,12 +159,14 @@ export function createApp(config: AppConfig): App {
       onJobCancelled: () => lifecycle.markJobDequeued(),
     },
   });
-  const authRateLimiter = new AuthRateLimiter(
+  // Per-key rate limiters — each unique API key gets its own bucket,
+  // so shared tokens don't interfere with each other.
+  const authRateLimiter = new KeyRateLimiter(
     config.rateLimitAuthMax ?? 20,
     config.rateLimitAuthWindowMs ?? 60_000,
   );
-  const refreshRateLimiter = new AuthRateLimiter(1, 60_000);
-  const relayPostRateLimiter = new AuthRateLimiter(
+  const refreshRateLimiter = new KeyRateLimiter(1, 60_000);
+  const relayPostRateLimiter = new KeyRateLimiter(
     config.rateLimitRelayPostMax ?? 50,
     config.rateLimitRelayPostWindowMs ?? 60_000,
   );
@@ -200,15 +197,7 @@ export function createApp(config: AppConfig): App {
     }
 
     const isStream = (response.headers.get('content-type') ?? '').includes('text/event-stream');
-    // Skip wrapping when response already manages its own lifecycle
-    // (e.g. streamWithModelLoading, which carries x-relay-loading).
-    // x-relay-loading responses are SSE heartbeats emitted while a model
-    // cold-starts.  Releasing the mutex immediately avoids holding it for
-    // the entire startup duration (potentially minutes).  Concurrent
-    // requests are protected against ping-pong model switches by the
-    // lifecycle's switchInFlight guard and the early rejection check in
-    // withLifecycleForStreaming.
-    if (!isStream || !response.body || response.headers.has('x-relay-loading')) {
+    if (!isStream || !response.body) {
       mutex.release();
       return response;
     }
@@ -323,24 +312,29 @@ export function createApp(config: AppConfig): App {
               requestModel,
             );
         }
-        response = jsonResponse({
-          object: "gateway",
-          name: "relay",
-          endpoints: [
-            "/health",
-            "/relay/jobs",
-            "/relay/lifecycle",
-            "/relay/status",
-            "/relay/metrics",
-            "/v1/models",
-            "/v1/chat/completions",
-            "/v1/completions",
-            "/v1/responses",
-            "/v1/messages",
-            "/v1/embeddings",
-            "/v1/rerank",
-          ],
-        });
+        const accept = request.headers.get("accept") ?? "";
+        if (accept.includes("text/html")) {
+          response = htmlResponse(renderStatusPage(config, lifecycle, jobs, mutex));
+        } else {
+          response = jsonResponse({
+            object: "gateway",
+            name: "relay",
+            endpoints: [
+              "/health",
+              "/relay/jobs",
+              "/relay/lifecycle",
+              "/relay/status",
+              "/relay/metrics",
+              "/v1/models",
+              "/v1/chat/completions",
+              "/v1/completions",
+              "/v1/responses",
+              "/v1/messages",
+              "/v1/embeddings",
+              "/v1/rerank",
+            ],
+          });
+        }
         return finalizeResponse(
           response,
           requestId,
@@ -647,21 +641,49 @@ export function createApp(config: AppConfig): App {
           const bodyPreview = await request.clone().text().catch(() => '');
           let isStream = false;
           let anthropicModel: string | undefined;
+          let parsedBody: unknown;
           try {
             const parsed = JSON.parse(bodyPreview);
+            parsedBody = parsed;
             isStream = parsed?.stream === true;
             anthropicModel = typeof parsed?.model === 'string' ? parsed.model : undefined;
           } catch { /* ignore */ }
-          response = await withMutex(
-            () => withLifecycleForStreaming(
-              lifecycle,
-              anthropicModel,
+          // Gateway: forward unknown models to cloud fallback
+          if (!isCloud && config.cloudFallbackUrl && anthropicModel && !config.modelEntries?.[anthropicModel]) {
+            response = await forwardToCloud(parsedBody ?? {}, path);
+            return finalizeResponse(
+              response, requestId, path, request.method, startedAt, startedAtMs, requestModel,
+            );
+          }
+          // Cloud mode: resolve upstream overrides per model
+          let upstreamOverrides: { baseUrl?: string; authHeader?: string } | undefined;
+          if (isCloud && cloudRegistry && anthropicModel) {
+            upstreamOverrides = cloudRegistry.upstreamOptionsFor(anthropicModel);
+            if (upstreamOverrides) {
+              config.upstreamBaseUrl = upstreamOverrides.baseUrl!;
+              config.upstreamAuthHeader = upstreamOverrides.authHeader;
+            }
+          }
+          if (isCloud) {
+            response = await withMutex(
               () => handleAnthropicMessages(config, request, externalSignal),
-              isStream,
               externalSignal,
-            ),
-            externalSignal,
-          );
+            );
+          } else {
+            const anthropicSessionId = extractSessionId(request);
+            response = await withMutex(
+              () => withLifecycleForStreaming(
+                lifecycle,
+                anthropicModel,
+                () => handleAnthropicMessages(config, request, externalSignal),
+                isStream,
+                "anthropic",
+                externalSignal,
+                anthropicSessionId,
+              ),
+              externalSignal,
+            );
+          }
         }
         else
           response = jsonResponse(
@@ -743,17 +765,44 @@ export function createApp(config: AppConfig): App {
         if (request.method === "POST") {
           const body = await readJson(request, logger, path);
           requestModel = readRequestModel(body);
+          // Gateway: forward unknown models to cloud fallback
+          if (!isCloud && config.cloudFallbackUrl && requestModel && !config.modelEntries?.[requestModel]) {
+            response = await forwardToCloud(body, path);
+            return finalizeResponse(
+              response, requestId, path, request.method, startedAt, startedAtMs, requestModel,
+            );
+          }
+          // Cloud mode: resolve upstream overrides per model
+          let upstreamOverrides: { baseUrl?: string; authHeader?: string } | undefined;
+          if (isCloud && cloudRegistry && requestModel) {
+            upstreamOverrides = cloudRegistry.upstreamOptionsFor(requestModel);
+            if (upstreamOverrides) {
+              config.upstreamBaseUrl = upstreamOverrides.baseUrl!;
+              config.upstreamAuthHeader = upstreamOverrides.authHeader;
+            }
+          }
           const isStream = isObject(body) && body.stream === true;
-          response = await withMutex(
-            () => withLifecycleForStreaming(
-              lifecycle,
-              requestModel,
+          if (isCloud) {
+            // Cloud mode: no lifecycle, call handler directly
+            response = await withMutex(
               () => createChatCompletion(config, store, body, externalSignal, lifecycle),
-              isStream,
               externalSignal,
-            ),
-            externalSignal,
-          );
+            );
+          } else {
+            const chatSessionId = extractSessionId(request);
+            response = await withMutex(
+              () => withLifecycleForStreaming(
+                lifecycle,
+                requestModel,
+                () => createChatCompletion(config, store, body, externalSignal, lifecycle),
+                isStream,
+                "openai_chat",
+                externalSignal,
+                chatSessionId,
+              ),
+              externalSignal,
+            );
+          }
           return finalizeResponse(
             response,
             requestId,
@@ -780,6 +829,13 @@ export function createApp(config: AppConfig): App {
       if (path === "/v1/completions" && request.method === "POST") {
         const body = await readJson(request, logger, path);
         requestModel = readRequestModel(body);
+        // Gateway: forward unknown models to cloud fallback
+        if (!isCloud && config.cloudFallbackUrl && requestModel && !config.modelEntries?.[requestModel]) {
+          response = await forwardToCloud(body, path);
+          return finalizeResponse(
+            response, requestId, path, request.method, startedAt, startedAtMs, requestModel,
+          );
+        }
         response = await withMutex(
           () => createCompletionShim(config, store, body, externalSignal),
           externalSignal,
@@ -797,10 +853,51 @@ export function createApp(config: AppConfig): App {
       if (path === "/v1/responses" && request.method === "POST") {
         const body = await readJson(request, logger, path);
         requestModel = readRequestModel(body);
-        response = await withMutex(
-          () => createResponse(config, responseStore, body, externalSignal),
-          externalSignal,
-        );
+        // Gateway: forward unknown models to cloud fallback
+        if (!isCloud && config.cloudFallbackUrl && requestModel && !config.modelEntries?.[requestModel]) {
+          const upstream = await forwardToCloud(body, path);
+          // Save response to local store so previous_response_id lookups work.
+          try {
+            const cloned = upstream.clone();
+            const payload = await cloned.json();
+            if (payload?.id && payload?.object === 'response') {
+              responseStore.save(payload, config.completionTtlMs);
+            }
+          } catch { /* best effort */ }
+          return finalizeResponse(
+            upstream, requestId, path, request.method, startedAt, startedAtMs, requestModel,
+          );
+        }
+        // Cloud mode: resolve upstream overrides per model
+        let upstreamOverrides: { baseUrl?: string; authHeader?: string } | undefined;
+        if (isCloud && cloudRegistry && requestModel) {
+          upstreamOverrides = cloudRegistry.upstreamOptionsFor(requestModel);
+          if (upstreamOverrides) {
+            config.upstreamBaseUrl = upstreamOverrides.baseUrl!;
+            config.upstreamAuthHeader = upstreamOverrides.authHeader;
+          }
+        }
+        const isStream = isObject(body) && body.stream === true;
+        if (isCloud) {
+          response = await withMutex(
+            () => createResponse(config, responseStore, body, externalSignal, lifecycle),
+            externalSignal,
+          );
+        } else {
+          const respSessionId = extractSessionId(request);
+          response = await withMutex(
+              () => withLifecycleForStreaming(
+                lifecycle,
+                requestModel,
+                () => createResponse(config, responseStore, body, externalSignal, lifecycle),
+                isStream,
+                "openai_responses",
+                externalSignal,
+                respSessionId,
+              ),
+            externalSignal,
+          );
+        }
         return finalizeResponse(
           response,
           requestId,
@@ -936,7 +1033,48 @@ export function createApp(config: AppConfig): App {
       );
     }
 
-    async function finalizeResponse(
+  /**
+   * Forward an already-parsed request body to the cloud fallback container.
+   * Used by gateway mode when a requested model is not in the local model map.
+   * The body parameter is the pre-parsed JSON object (request.body is already consumed).
+   */
+  async function forwardToCloud(body: unknown, path: string): Promise<Response> {
+    try {
+      const cloudPath = config.cloudFallbackUrl!.endsWith("/v1") && path.startsWith("/v1/")
+        ? path.slice(3)
+        : path;
+      const cloudUrl = config.cloudFallbackUrl!.replace(/\/+$/, "") + (cloudPath.startsWith("/") ? cloudPath : "/" + cloudPath);
+      logger.info("forwarding to cloud", { model: (body as any)?.model, cloudUrl, path });
+      const upstream = await fetch(cloudUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(config.requestTimeoutMs),
+      });
+      logger.info("cloud response", { status: upstream.status });
+      // Convert to plain headers object and clone to avoid immutable fetch Headers.
+      const plainHeaders: Record<string, string> = {};
+      upstream.headers.forEach((value, key) => { plainHeaders[key] = value; });
+      if (upstream.body) {
+        return new Response(upstream.body, {
+          status: upstream.status,
+          statusText: upstream.statusText,
+          headers: plainHeaders,
+        });
+      }
+      const bodyText = await upstream.text();
+      return new Response(bodyText, {
+        status: upstream.status,
+        statusText: upstream.statusText,
+        headers: plainHeaders,
+      });
+    } catch (err) {
+      logger.error("cloud forward failed", { error: err instanceof Error ? err.message : String(err) });
+      throw err;
+    }
+  }
+
+        async function finalizeResponse(
       currentResponse: Response,
       currentRequestId: string,
       currentPath: string,
@@ -1177,21 +1315,20 @@ function authorizeOpenAI(
   config: AppConfig,
   request: Request,
   path: string,
-  rateLimiter?: AuthRateLimiter,
+  rateLimiter?: KeyRateLimiter,
 ): Response | undefined {
   if (!config.apiKey || (!path.startsWith("/v1/") && path !== "/rerank"))
     return undefined;
-  const ip = clientIp(request, config);
-  if (rateLimiter && !rateLimiter.allow(ip)) {
-    return openAIError(429, "Too many requests", "rate_limit_exceeded");
-  }
   const bearer = request.headers
     .get("authorization")
     ?.match(/^Bearer\s+(.+)$/i)?.[1];
   const xKey = request.headers.get("x-api-key");
+  const credentials = bearer ?? xKey ?? clientIp(request, config);
   if (hasValidApiKey(config.apiKey, bearer, xKey)) {
-    if (rateLimiter) rateLimiter.reset(ip);
     return undefined;
+  }
+  if (rateLimiter && !rateLimiter.allow(credentials)) {
+    return openAIError(429, "Too many requests", "rate_limit_exceeded");
   }
   return openAIError(401, "Unauthorized", "authentication_error");
 }
@@ -1200,20 +1337,19 @@ function authorizeRelay(
   config: AppConfig,
   request: Request,
   path: string,
-  rateLimiter?: AuthRateLimiter,
+  rateLimiter?: KeyRateLimiter,
 ): Response | undefined {
   if (!config.apiKey || !path.startsWith("/relay/")) return undefined;
-  const ip = clientIp(request, config);
-  if (rateLimiter && !rateLimiter.allow(ip)) {
-    return openAIError(429, "Too many requests", "rate_limit_exceeded");
-  }
   const bearer = request.headers
     .get("authorization")
     ?.match(/^Bearer\s+(.+)$/i)?.[1];
   const xKey = request.headers.get("x-api-key");
+  const credentials = bearer ?? xKey ?? clientIp(request, config);
   if (hasValidApiKey(config.apiKey, bearer, xKey)) {
-    if (rateLimiter) rateLimiter.reset(ip);
     return undefined;
+  }
+  if (rateLimiter && !rateLimiter.allow(credentials)) {
+    return openAIError(429, "Too many requests", "rate_limit_exceeded");
   }
   return openAIError(401, "Unauthorized", "authentication_error");
 }
@@ -1228,44 +1364,6 @@ function clientIp(request: Request, config: AppConfig): string {
     );
   }
   return request.headers.get("x-relay-internal-remote-address") ?? "unknown";
-}
-
-class AuthRateLimiter {
-  private readonly max: number;
-  private readonly windowMs: number;
-  private readonly counters = new Map<
-    string,
-    { count: number; resetAt: number }
-  >();
-
-  constructor(max: number, windowMs: number) {
-    this.max = max;
-    this.windowMs = windowMs;
-  }
-
-  allow(key: string): boolean {
-    this.prune();
-    const now = Date.now();
-    const entry = this.counters.get(key);
-    if (!entry || now >= entry.resetAt) {
-      this.counters.set(key, { count: 1, resetAt: now + this.windowMs });
-      return true;
-    }
-    if (entry.count >= this.max) return false;
-    entry.count += 1;
-    return true;
-  }
-
-  reset(key: string): void {
-    this.counters.delete(key);
-  }
-
-  private prune(): void {
-    const now = Date.now();
-    for (const [key, entry] of this.counters) {
-      if (now >= entry.resetAt) this.counters.delete(key);
-    }
-  }
 }
 
 async function readJson(
@@ -1390,10 +1488,165 @@ function isObject(value: unknown): value is Record<string, any> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function extractSessionId(request: Request): string | undefined {
+  return request.headers.get("session-id")
+    ?? request.headers.get("session_id")
+    ?? request.headers.get("x-session-affinity")
+    ?? request.headers.get("x-client-request-id")
+    ?? undefined;
+}
+
 function parseHeaderInt(value: string | null): number | undefined {
   if (!value) return undefined;
   const n = Number.parseInt(value, 10);
   return Number.isFinite(n) ? n : undefined;
+}
+
+// ── Status page ────────────────────────────────────────────────────────
+
+/** Wraps an HTML string in a Response with text/html Content-Type. */
+function htmlResponse(body: string, status = 200): Response {
+  return new Response(body, {
+    status,
+    headers: { "content-type": "text/html; charset=utf-8" },
+  });
+}
+
+/** Render a human-readable status dashboard returned at the root endpoint. */
+function renderStatusPage(
+  config: AppConfig,
+  lifecycle: ModelLifecycle,
+  jobs: LlmJobQueue,
+  mutex: RequestMutex | undefined,
+): string {
+  const status = lifecycle.getLifecycleStatus();
+  const counts = jobs.counts();
+
+  const modelRows = config.modelEntries
+    ? Object.entries(config.modelEntries).map(([name, entry]) => {
+        const active = status.activeModels?.find((m) => m.name === name);
+        return `
+          <tr>
+            <td>${escHtml(name)}</td>
+            <td>${active ? escHtml(active.healthy ? "\u{1F7E2} loaded" : "\u{1F7E1} loading") : "\u26AA unloaded"}</td>
+            <td>${active ? escHtml(String(active.port)) : "\u2014"}</td>
+            <td>${entry.ctx_size ? escHtml(formatCtx(entry.ctx_size)) : "\u2014"}</td>
+            <td>${entry.multimodal ? "\u2705" : "\u274C"}</td>
+          </tr>`;
+      }).join("\n")
+    : '<tr><td colspan="5">No model entries configured</td></tr>';
+
+  const queueCards = [
+    { label: "Pending", value: counts.pending },
+    { label: "Active", value: counts.active },
+    { label: "Completed (5m)", value: counts.completedRecent },
+    { label: "Failed (5m)", value: counts.failedRecent },
+  ];
+
+  const lifecycleCards = [
+    { label: "State", value: status.state },
+    { label: "Current Model", value: status.currentModel ?? "\u2014" },
+    { label: "Loading", value: status.loadingModel ?? "\u2014" },
+    { label: "Starts / Stops", value: `${status.startCount ?? 0} / ${status.stopCount ?? 0}` },
+    { label: "Start Failures", value: String(status.startFailureCount ?? 0) },
+    { label: "Last Error", value: status.lastError ? escHtml(status.lastError) : "none" },
+    { label: "Idle Shutdown", value: status.idleShutdownScheduled ? escHtml(formatDuration(status.idleShutdownMs)) : "disabled" },
+    { label: "Mutex", value: mutex ? (mutex.active ? `busy (${mutex.waiting} waiting)` : "free") : "disabled" },
+  ];
+
+  const authBadge = config.apiKey ? "\u{1F510} key required" : "\u26A0\uFE0F no API key";
+  const lifecycleBadge = status.enabled ? "\u2705" : "\u274C";
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Relay \u00B7 ${escHtml(config.host)}:${config.port}</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #0d1117; color: #e6edf3; margin: 0; padding: 2rem 1rem;
+    line-height: 1.5;
+  }
+  .container { max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 1.6rem; margin: 0 0 0.5rem; color: #f0f6fc; }
+  .subtitle { color: #8b949e; margin-bottom: 2rem; }
+  .subtitle span { margin-right: 1rem; }
+  h2 { font-size: 1.1rem; margin: 1.5rem 0 0.75rem; color: #f0f6fc;
+       border-bottom: 1px solid #30363d; padding-bottom: 0.4rem; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #21262d; }
+  th { color: #8b949e; font-weight: 500; font-size: 0.8rem; text-transform: uppercase; }
+  td { font-size: 0.9rem; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 0.75rem; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 0.75rem; }
+  .card-label { font-size: 0.75rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.03em; }
+  .card-value { font-size: 1.25rem; font-weight: 600; margin-top: 0.15rem; }
+  .card-value.small { font-size: 0.85rem; font-weight: 400; word-break: break-word; }
+  .links { margin-top: 2rem; padding-top: 1rem; border-top: 1px solid #30363d; }
+  .links a { color: #58a6ff; text-decoration: none; margin-right: 1rem; font-size: 0.9rem; }
+  .links a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>Relay \u00B7 ${escHtml(config.host)}:${config.port}</h1>
+<div class="subtitle">
+  <span>${authBadge}</span>
+  <span>lifecycle ${lifecycleBadge}</span>
+  <span>switch: ${escHtml(config.switchPolicy ?? 'eager')}</span>
+</div>
+
+<h2>Queue</h2>
+<div class="grid">
+${queueCards.map((c) => `<div class="card"><div class="card-label">${escHtml(c.label)}</div><div class="card-value">${escHtml(String(c.value))}</div></div>`).join("\n")}
+</div>
+
+<h2>Models</h2>
+<table>
+<thead><tr><th>Model</th><th>Status</th><th>Port</th><th>Ctx</th><th>Vision</th></tr></thead>
+<tbody>${modelRows}</tbody>
+</table>
+
+<h2>Lifecycle</h2>
+<div class="grid">
+${lifecycleCards.map((c) => `<div class="card"><div class="card-label">${escHtml(c.label)}</div><div class="card-value small">${c.value}</div></div>`).join("\n")}
+</div>
+
+<div class="links">
+  <a href="/health">health</a>
+  <a href="/v1/models">models</a>
+  <a href="/relay/status">status</a>
+  <a href="/relay/metrics">metrics</a>
+  <a href="/relay/jobs">jobs</a>
+  <a href="/relay/lifecycle">lifecycle</a>
+  <a href="/relay/stats">stats</a>
+</div>
+
+</div>
+</body>
+</html>`;
+}
+
+function escHtml(s: unknown): string {
+  return String(s ?? '')
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function formatCtx(n: number): string {
+  return n >= 1024 ? `${Math.round(n / 1024)}K` : String(n);
+}
+
+function formatDuration(ms: number): string {
+  if (ms >= 3_600_000) return `${Math.round(ms / 3_600_000)}h`;
+  if (ms >= 60_000) return `${Math.round(ms / 60_000)}m`;
+  return `${Math.round(ms / 1000)}s`;
 }
 
 /**
@@ -1407,7 +1660,9 @@ async function withLifecycleForStreaming(
   modelName: string | undefined,
   handler: () => Promise<Response>,
   isStream: boolean,
+  protocol: StreamingProtocol,
   externalSignal?: AbortSignal,
+  sessionId?: string,
 ): Promise<Response> {
   const enabled = lifecycle.getLifecycleStatus().enabled;
 
@@ -1470,12 +1725,12 @@ async function withLifecycleForStreaming(
       lifecycle.maybeShutdownWhenIdle();
       return response;
     }
-    return streamWithModelLoading(lifecycle, modelName, handler, externalSignal);
+    return streamWithModelLoading(lifecycle, modelName, handler, protocol, externalSignal, sessionId);
   }
 
   // Non-streaming with lifecycle: ensure model is available first
   if (enabled && !isStream) {
-    const availability = await lifecycle.ensureModelAvailable(modelName);
+    const availability = await lifecycle.ensureModelAvailable(modelName, undefined, sessionId);
     if (!availability.ok) {
       return jsonResponse({
         error: {
@@ -1540,7 +1795,9 @@ async function streamWithModelLoading(
   lifecycle: ModelLifecycle,
   modelName: string,
   handler: () => Promise<Response>,
+  protocol: StreamingProtocol,
   externalSignal?: AbortSignal,
+  sessionId?: string,
 ): Promise<Response> {
   const encoder = new TextEncoder();
   let loadingTimer: ReturnType<typeof setInterval> | null = null;
@@ -1563,18 +1820,17 @@ async function streamWithModelLoading(
 
   const stream = new ReadableStream({
     async start(controller) {
-      const emitLoading = () => {
+      const emitRelayEvent = (phase: "error" | "loaded" | "loading", message?: string) => {
         const elapsedMs = Date.now() - startTime;
-        // Emit as SSE comment lines so OpenAI-compatible clients ignore them
-        // instead of trying to parse them as chat completion chunks.
         controller.enqueue(encoder.encode(`: relay loading model=${modelName} elapsed_ms=${elapsedMs}\n\n`));
+        controller.enqueue(encoder.encode(encodeLifecycleFrame(protocol, phase, modelName, elapsedMs, message)));
       };
 
-      emitLoading();
-      loadingTimer = setInterval(emitLoading, 3000);
+      emitRelayEvent("loading");
+      loadingTimer = setInterval(() => emitRelayEvent("loading"), 3000);
 
       try {
-        const availability = await lifecycle.ensureModelAvailable(modelName, streamAbortController.signal);
+        const availability = await lifecycle.ensureModelAvailable(modelName, streamAbortController.signal, sessionId);
 
         if (loadingTimer) clearInterval(loadingTimer);
 
@@ -1584,13 +1840,13 @@ async function streamWithModelLoading(
         }
 
         if (!availability.ok) {
-          const errPayload = JSON.stringify({ event: 'error', message: availability.message ?? 'Model unavailable' });
-          controller.enqueue(encoder.encode(`data: ${errPayload}\n\n`));
+          emitRelayEvent("error", availability.message ?? "Model unavailable");
           controller.enqueue(encoder.encode('data: [DONE]\n\n'));
           controller.close();
           return;
         }
 
+        emitRelayEvent("loaded");
         lifecycle.markJobStarted();
         try {
           const response = await handler();
@@ -1627,9 +1883,8 @@ async function streamWithModelLoading(
         if (loadingTimer) clearInterval(loadingTimer);
         if (!cancelled) {
           const message = err instanceof Error ? err.message : String(err);
-          const errPayload = JSON.stringify({ error: { message, type: 'upstream_error' } });
           try {
-            controller.enqueue(encoder.encode(`data: ${errPayload}\n\n`));
+            emitRelayEvent("error", message);
             controller.enqueue(encoder.encode('data: [DONE]\n\n'));
           } catch { /* stream may already be closed */ }
           try { controller.close(); } catch { /* already closed */ }
@@ -1653,6 +1908,43 @@ async function streamWithModelLoading(
       'cache-control': 'no-cache',
       'connection': 'keep-alive',
       'x-relay-loading': '1',
+    },
+  });
+}
+
+function encodeLifecycleFrame(
+  protocol: StreamingProtocol,
+  phase: "error" | "loaded" | "loading",
+  model: string,
+  elapsedMs: number,
+  message?: string,
+): string {
+  const event = `relay.${phase}`;
+  if (protocol === "openai_chat") {
+    return encodeSSE({
+      event,
+      data: {
+        id: `relay-${phase}-${crypto.randomUUID()}`,
+        object: "chat.completion.chunk",
+        created: Math.floor(Date.now() / 1000),
+        model,
+        choices: [{ index: 0, delta: {}, finish_reason: null }],
+        relay: {
+          type: event,
+          model,
+          elapsed_ms: elapsedMs,
+          ...(message ? { message } : {}),
+        },
+      },
+    });
+  }
+  return encodeSSE({
+    event,
+    data: {
+      type: event,
+      model,
+      elapsed_ms: elapsedMs,
+      ...(message ? { message } : {}),
     },
   });
 }
