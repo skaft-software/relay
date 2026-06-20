@@ -2,8 +2,8 @@
 layout: home
 
 hero:
-  text: One gateway. Any model. Local or cloud.
-  tagline: Relay is a protocol adapter that sits between your coding agent and your models — local llama.cpp servers or cloud APIs (OpenAI, Anthropic, DeepSeek, Groq). One endpoint, one API key, no glue code.
+  text: Your GPU can run great AI models.
+  tagline: Your coding agent just can't talk to them. Relay is the missing piece — it detects your hardware, sizes your models, generates perfect configs, and translates every API call so your agent just works.
 ---
 
 <div class="relay-section">
@@ -11,11 +11,60 @@ hero:
 <ProblemVisual />
 
 <div class="relay-pipeline-section">
-  <p class="relay-section-label">Translation Pipeline</p>
+  <p class="relay-section-label">How It Works</p>
   <CompatibilityVisual />
 </div>
 
-<p class="relay-section-label">What Relay Normalizes</p>
+<p class="relay-section-label">What Relay Solves</p>
+
+<div class="relay-problem">
+  <div class="relay-problem-copy">
+    <h2>Your agent and your model don't speak the same language.</h2>
+    <p>
+      Coding agents expect exact OpenAI or Anthropic API contracts. Your local model
+      speaks something close, but different enough to break things. One missing field,
+      one out-of-order SSE event, one wrong error shape — your agent silently degrades.
+    </p>
+    <p>
+      <strong>Relay translates everything in both directions.</strong> Chat completions,
+      responses, Anthropic messages, tool calls, streaming — normalized to the exact
+      shapes your agent expects. No per-model patches. No agent-side workarounds.
+    </p>
+  </div>
+</div>
+
+<div class="relay-problem">
+  <div class="relay-problem-copy">
+    <h2>Will this model work on my hardware?</h2>
+    <p>
+      You shouldn't need to understand MoE expert offloading, KV cache quantization,
+      or VRAM headroom. You just want to know if a model runs well on your GPU and
+      at what context size.
+    </p>
+    <p>
+      <strong>Relay reads your actual GGUF files, measures your GPU, and computes
+      the optimal flags for YOUR hardware.</strong> It tells you which models fit,
+      at what context size, before you start anything. No guesswork.
+    </p>
+  </div>
+</div>
+
+<div class="relay-problem">
+  <div class="relay-problem-copy">
+    <h2>Getting local models working takes hours.</h2>
+    <p>
+      Find the GGUF. Download it. Figure out flags. Set up llama.cpp. Write a start
+      script. Configure ports. Choose KV cache quantization. Test. Fix. Repeat.
+    </p>
+    <p>
+      <strong>Relay's setup wizard does it all in one command.</strong> It finds your
+      GGUF files, sizes each one, generates start scripts with every flag dialed in,
+      and writes your config. Re-run <code>--auto</code> anytime you add new models.
+    </p>
+  </div>
+</div>
+
+<p class="relay-section-label">Capabilities</p>
 
 <h2 class="relay-section-title">Everything your agent expects, from any backend</h2>
 
@@ -79,8 +128,8 @@ hero:
 </div>
 
 <div class="relay-callout">
-  <div class="relay-callout-label">Why Relay instead of wiring things up yourself?</div>
-  <p><strong>LLM backends are great at inference. Relay handles everything around it.</strong> API contract compliance, streaming event ordering, tool call shape normalization, error codes, model metadata, auto lifecycle, session isolation, rate limiting, and observability. One endpoint for any model — local or cloud — that your agent can actually talk to.</p>
+  <div class="relay-callout-label">Two ways to run</div>
+  <p><strong>Gateway mode</strong> manages local llama.cpp models — auto-detects your GPU, sizes every GGUF, generates start scripts, and handles the full lifecycle. <strong>Cloud mode</strong> proxies OpenAI, Anthropic, DeepSeek, or Groq through a single endpoint. Same API surface either way. Your agent doesn't know or care where the model lives.</p>
 </div>
 
 <p class="relay-section-label">Quickstart</p>
@@ -88,17 +137,13 @@ hero:
 <TerminalBlock>
 
 ```bash
-# Install and run the setup wizard (auto-detects your hardware)
+# One command. That's it.
 curl -fsSL https://raw.githubusercontent.com/achuthanmukundan00/relay/main/scripts/install.sh | bash
 
 # After setup, start Relay
-npm start          # bare metal
-# or
-docker compose up -d   # Docker (recommended for Linux GPU)
+docker compose up -d
 
-# Verify it's working
-curl http://127.0.0.1:1234/v1/models
-open http://127.0.0.1:1234          # status dashboard
+# Point your agent at  http://127.0.0.1:1234/v1
 ```
 
 </TerminalBlock>

@@ -47,16 +47,16 @@ let frame = 0
 let resizeObserver: ResizeObserver | null = null
 
 const phrases = [
-  'OpenAI-compatible',
-  'Anthropic-shaped',
-  'delta != event',
-  'tool_choice drift',
-  'missing usage',
-  'error envelope?',
-  'model aliases',
-  'SSE retry',
-  'schema mismatch',
-  'canonical contract',
+  'your GPU can run this',
+  'one command setup',
+  'detects hardware',
+  'sizes every model',
+  'writes start scripts',
+  'agent-ready API',
+  'no config wrangling',
+  'streaming normalized',
+  'tool calls translated',
+  'just code',
 ]
 
 function paint(time = 0): void {

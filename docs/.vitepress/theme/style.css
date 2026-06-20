@@ -126,15 +126,17 @@
 .VPHero .text {
   color: var(--vp-c-brand-1);
   letter-spacing: -0.01em;
-  font-size: 48px;
+  font-size: 44px;
   line-height: 1.15;
+  max-width: 720px;
 }
 
 .VPHero .tagline {
   color: var(--vp-c-text-2);
-  line-height: 1.55;
-  max-width: 640px;
+  line-height: 1.6;
+  max-width: 620px;
   margin: 0 auto;
+  font-size: 17px;
 }
 
 /* ---- Home content sections ---- */
@@ -410,11 +412,220 @@
   max-width: 800px;
 }
 
-/* ---- Scroll-driven reveal animations (progressive enhancement) ---- */
+/* ---- Problem sections ---- */
+.relay-problem {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 40px;
+  align-items: center;
+  margin: 64px 0;
+  padding: 0;
+}
+
+.relay-problem--reverse {
+  direction: rtl;
+}
+
+.relay-problem--reverse .relay-problem-copy {
+  direction: ltr;
+}
+
+.relay-problem--reverse .relay-problem-visual {
+  direction: ltr;
+}
+
+.relay-problem-copy h2 {
+  font-size: 22px;
+  font-weight: 650;
+  color: var(--vp-c-text-1);
+  margin: 0 0 14px;
+  line-height: 1.3;
+  letter-spacing: -0.01em;
+  border: none;
+  padding: 0;
+}
+
+.relay-problem-copy p {
+  font-size: 15px;
+  line-height: 1.65;
+  color: var(--vp-c-text-2);
+  margin: 0 0 12px;
+}
+
+.relay-problem-copy p:last-child {
+  margin-bottom: 0;
+}
+
+.relay-problem-copy strong {
+  color: var(--vp-c-text-1);
+}
+
+.relay-problem-copy code {
+  font-size: 13px;
+}
+
+.relay-problem-visual {
+  min-width: 0;
+}
+
+.relay-problem-visual .compat-visual {
+  margin: 0;
+}
+
+/* ---- Hardware detection demo ---- */
+.relay-hw-demo {
+  background: #08080a;
+  border: 1px solid var(--relay-border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.relay-hw-demo pre {
+  margin: 0 !important;
+  padding: 20px 24px !important;
+  background: transparent !important;
+  border-radius: 0 !important;
+}
+
+.relay-hw-demo code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace !important;
+  font-size: 13px !important;
+  line-height: 1.75 !important;
+  color: var(--vp-c-text-2) !important;
+}
+
+.relay-hw-demo .relay-hw-label {
+  color: var(--vp-c-brand-2);
+  font-weight: 600;
+}
+
+.relay-hw-dim {
+  color: var(--vp-c-text-3);
+}
+
+.relay-hw-ok {
+  color: #6a9955;
+}
+
+.relay-hw-warn {
+  color: #d16969;
+}
+
+/* ---- Lifecycle demo ---- */
+.relay-lifecycle-demo {
+  background: #08080a;
+  border: 1px solid var(--relay-border);
+  border-radius: 8px;
+  padding: 20px 24px;
+}
+
+.relay-lifecycle-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.03);
+}
+
+.relay-lifecycle-row:last-of-type {
+  border-bottom: none;
+}
+
+.relay-lifecycle-model {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 13px;
+  color: var(--vp-c-text-1);
+  min-width: 160px;
+}
+
+.relay-lifecycle-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #333;
+  flex-shrink: 0;
+}
+
+.relay-lifecycle-dot--active {
+  background: #6a9955;
+  box-shadow: 0 0 6px rgba(106, 153, 85, 0.45);
+}
+
+.relay-lifecycle-state {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  color: var(--vp-c-text-3);
+}
+
+.relay-lifecycle-note {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(255,255,255,0.04);
+  font-size: 11px;
+  color: var(--vp-c-text-3);
+  text-align: center;
+}
+
+/* ---- Mode cards ---- */
+.relay-modes {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-bottom: 8px;
+}
+
+.relay-mode-card {
+  background: var(--relay-surface);
+  border: 1px solid var(--relay-border);
+  border-radius: 8px;
+  padding: 24px;
+}
+
+.relay-mode-card h3 {
+  font-size: 18px;
+  font-weight: 650;
+  color: var(--vp-c-text-1);
+  margin: 0 0 12px;
+  border: none;
+  padding: 0;
+}
+
+.relay-mode-card p {
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--vp-c-text-2);
+  margin: 0 0 14px;
+}
+
+.relay-mode-card ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.relay-mode-card li {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--vp-c-text-2);
+  padding: 3px 0;
+  padding-left: 18px;
+  position: relative;
+}
+
+.relay-mode-card li::before {
+  content: "▸";
+  position: absolute;
+  left: 0;
+  color: var(--vp-c-brand-2);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 10px;
+}
+
+/* ---- Scroll animations expanded ---- */
 @supports (animation-timeline: view()) {
-  .relay-pain-card,
+  .relay-problem,
+  .relay-mode-card,
   .relay-norm-card,
-  .relay-callout,
   .relay-note,
   .relay-terminal {
     animation: reveal-up linear both;
@@ -422,29 +633,15 @@
     animation-range: entry 8% cover 18%;
   }
 
-  .relay-pain-card:nth-child(1) { animation-range: entry 4% cover 14%; }
-  .relay-pain-card:nth-child(2) { animation-range: entry 10% cover 20%; }
-  .relay-pain-card:nth-child(3) { animation-range: entry 16% cover 26%; }
-  .relay-pain-card:nth-child(4) { animation-range: entry 22% cover 32%; }
+  .relay-mode-card:nth-child(1) { animation-range: entry 4% cover 14%; }
+  .relay-mode-card:nth-child(2) { animation-range: entry 10% cover 20%; }
 }
 
-@keyframes reveal-up {
-  from {
-    opacity: 0;
-    transform: translateY(16px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-/* Disable scroll animations when reduced motion is preferred */
 @media (prefers-reduced-motion: reduce) {
   @supports (animation-timeline: view()) {
-    .relay-pain-card,
+    .relay-problem,
+    .relay-mode-card,
     .relay-norm-card,
-    .relay-callout,
     .relay-note,
     .relay-terminal {
       animation: none;
@@ -480,6 +677,24 @@
 
   .relay-section {
     padding: 0 16px;
+  }
+
+  .relay-problem {
+    grid-template-columns: 1fr;
+    gap: 24px;
+    margin: 48px 0;
+  }
+
+  .relay-problem--reverse {
+    direction: ltr;
+  }
+
+  .relay-problem-visual {
+    order: -1;
+  }
+
+  .relay-modes {
+    grid-template-columns: 1fr;
   }
 
   .relay-pain-grid {
