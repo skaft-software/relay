@@ -73,14 +73,16 @@ hero:
 <TerminalBlock>
 
 ```bash
-# 1. Start your local model server
-llama-server --model ./model.gguf --host 127.0.0.1 --port 8080
+# 1. Setup a model for your GPU (auto-detects VRAM, downloads, sizes)
+python3 scripts/setup-tui.py
 
-# 2. Clone and start Relay
-git clone https://github.com/achuthanmukundan00/relay.git
-cd relay && npm install && cp .env.example .env && npm run dev
+# 2. Start the model with optimal settings
+bash ~/start-llama-<model>.sh
 
-# 3. Verify
+# 3. Start Relay
+npm install && cp .env.example .env && npm run dev
+
+# 4. Verify
 curl http://127.0.0.1:1234/v1/models
 ```
 

@@ -1,3 +1,39 @@
+export type CloudModelEntry = {
+  /** Base URL of the cloud API (e.g. https://api.deepseek.com/v1) */
+  base_url: string;
+  /** Environment variable name that holds the API key */
+  auth_env: string;
+  /** Context window size (exposed via /v1/models) */
+  ctx_size?: number;
+  /** Model profile override */
+  model_profile?: RelayModelProfileId;
+};
+
+export type ModelEntry = {
+  /** Shell command or script to start this model */
+  cmd: string;
+  /** Optional health URL (defaults to probing upstreamBaseUrl).
+   *  @deprecated Per-model health checks always use http://127.0.0.1:${port}/health.
+   *  This field is parsed but not consulted by the lifecycle. */
+  health_url?: string;
+  /** Startup timeout in seconds (defaults to modelStartTimeoutMs / 1000) */
+  timeout_sec?: number;
+  /** Display name reported to clients (defaults to key) */
+  name?: string;
+  /** Running context size for this model (--ctx-size). Overrides global UPSTREAM_CTX_SIZE for model list and capabilities. */
+  ctx_size?: number;
+  /** Whether this model supports multimodal (vision/audio) input. When unset, falls back to upstreamVisionOk. */
+  multimodal?: boolean;
+  /** Thinking levels this model supports. ["on"] for always-thinking models like North/Cohere. Overrides global RELAY_THINKING_LEVELS. */
+  thinking_levels?: string[];
+  /** Fixed port for this model's upstream server. Auto-allocated if unset. */
+  port?: number;
+  /** Pre-warm this model with cached conversation prefixes on switch. */
+  prewarm?: boolean;
+  /** Grace period in ms to keep old model alive after switch. */
+  switchGraceMs?: number;
+};
+
 export type AppConfig = {
   port: number;
   host: string;
@@ -53,6 +89,33 @@ export type AppConfig = {
   maxStoreBytes?: number;
   rateLimitRelayPostMax?: number;
   rateLimitRelayPostWindowMs?: number;
+  /** When true, serialize all LLM requests so exactly one runs at a time.
+   *  First caller gets zero-latency passthrough; simultaneous callers queue FCFS. */
+  serializeRequests?: boolean;
+  /** Mapping of model names (as clients request them) to start configs.
+   *  When a client requests a model in this map, the lifecycle will
+   *  automatically switch to it if the current model differs. */
+  modelEntries?: Record<string, ModelEntry>;
+  /** Switch policy: graceful keeps old model warm, eager kills first. */
+  switchPolicy: 'graceful' | 'eager';
+  /** Starting port number for dynamic model port allocation. */
+  modelPortBase: number;
+  /** Enable prompt-cache pre-warming when switching models. */
+  switchPrewarm: boolean;
+  /** Maximum number of concurrent model processes to keep warm. */
+  switchMaxWarmModels: number;
+  /** Prefix cache: max number of cached conversation prefixes. */
+  prefixCacheMaxEntries: number;
+  /** Prefix cache: max combined size of cached prefixes in tokens. */
+  prefixCacheMaxTokens: number;
+  /** Relay mode: gateway (default, manages local models) or cloud (proxies to external APIs). */
+  relayMode: 'gateway' | 'cloud';
+  /** Gateway mode: URL to forward unknown models to (e.g. http://relay-cloud:1235/v1). */
+  cloudFallbackUrl?: string;
+  /** Cloud mode: mapping of model names to cloud API configs. */
+  cloudModels?: Record<string, CloudModelEntry>;
+  /** Per-request auth header injected by cloud mode for upstream requests. */
+  upstreamAuthHeader?: string;
 };
 
 export type UnknownFieldPolicy = 'pass_through' | 'strip' | 'reject';
@@ -137,7 +200,25 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     maxStoreBytes: readOptionalNumber(env.MAX_STORE_BYTES, 'MAX_STORE_BYTES'),
     rateLimitRelayPostMax: readInteger(env.RATE_LIMIT_RELAY_POST_MAX, 50, 'RATE_LIMIT_RELAY_POST_MAX'),
     rateLimitRelayPostWindowMs: readInteger(env.RATE_LIMIT_RELAY_POST_WINDOW_SECONDS, 60, 'RATE_LIMIT_RELAY_POST_WINDOW_SECONDS') * 1000,
+    serializeRequests: readBoolean(env.RELAY_SERIALIZE_REQUESTS, true),
+    modelEntries: readModelEntries(env.RELAY_MODEL_MAP),
+    switchPolicy: readSwitchPolicy(env.RELAY_SWITCH_POLICY),
+    modelPortBase: readInteger(env.RELAY_MODEL_PORT_BASE, 8081, 'RELAY_MODEL_PORT_BASE'),
+    switchPrewarm: readBoolean(env.RELAY_SWITCH_PREWARM, true),
+    switchMaxWarmModels: readInteger(env.RELAY_SWITCH_MAX_WARM_MODELS, 2, 'RELAY_SWITCH_MAX_WARM_MODELS'),
+    prefixCacheMaxEntries: readInteger(env.RELAY_PREFIX_CACHE_MAX_ENTRIES, 50, 'RELAY_PREFIX_CACHE_MAX_ENTRIES'),
+    prefixCacheMaxTokens: readInteger(env.RELAY_PREFIX_CACHE_MAX_TOKENS, 1_000_000, 'RELAY_PREFIX_CACHE_MAX_TOKENS'),
+    relayMode: readRelayMode(env.RELAY_MODE),
+    cloudFallbackUrl: readOptional(env.RELAY_CLOUD_FALLBACK_URL),
+    cloudModels: readCloudModels(env.RELAY_CLOUD_MODELS),
   };
+}
+
+
+function readSwitchPolicy(value: string | undefined): 'graceful' | 'eager' {
+  const raw = readOptional(value) ?? 'eager'  // eager is safe for single-GPU; graceful needs 2x VRAM;
+  if (raw === 'graceful' || raw === 'eager') return raw;
+  throw new Error('RELAY_SWITCH_POLICY must be graceful or eager');
 }
 
 function readIdleShutdownMs(env: NodeJS.ProcessEnv): number {
@@ -266,4 +347,68 @@ function readOptionalNumber(value: string | undefined, name: string): number | u
 
 function trimTrailingSlash(value: string): string {
   return value.replace(/\/+$/, '');
+}
+
+function readRelayMode(value: string | undefined): 'gateway' | 'cloud' {
+  const raw = readOptional(value) ?? 'gateway';
+  if (raw === 'gateway' || raw === 'cloud') return raw;
+  throw new Error('RELAY_MODE must be gateway or cloud');
+}
+
+function readCloudModels(value: string | undefined): Record<string, CloudModelEntry> | undefined {
+  const raw = readOptional(value);
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const entries: Record<string, CloudModelEntry> = {};
+      for (const [key, entry] of Object.entries(parsed)) {
+        if (entry && typeof entry === 'object' && typeof (entry as any).base_url === 'string' && typeof (entry as any).auth_env === 'string') {
+          entries[key] = {
+            base_url: trimTrailingSlash((entry as any).base_url),
+            auth_env: (entry as any).auth_env,
+            ctx_size: typeof (entry as any).ctx_size === 'number' ? (entry as any).ctx_size : undefined,
+            model_profile: (entry as any).model_profile,
+          };
+        }
+      }
+      if (Object.keys(entries).length > 0) return entries;
+    }
+  } catch {
+    // invalid JSON, fall through
+  }
+  return undefined;
+}
+
+function readModelEntries(value: string | undefined): Record<string, ModelEntry> | undefined {
+  const raw = readOptional(value);
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const entries: Record<string, ModelEntry> = {};
+      for (const [key, entry] of Object.entries(parsed)) {
+        if (entry && typeof entry === 'object' && typeof (entry as any).cmd === 'string') {
+          entries[key] = entry as ModelEntry;
+        }
+      }
+      if (Object.keys(entries).length > 0) return entries;
+    }
+  } catch {
+    // invalid JSON, fall through
+  }
+  return undefined;
+}
+
+/**
+ * Check whether a given model supports multimodal input.
+ *
+ * Resolution order:
+ * 1. Per-model `multimodal` flag in modelEntries (explicit opt-in/opt-out)
+ * 2. Global `upstreamVisionOk` config flag (backward compat)
+ */
+export function isModelMultimodal(config: AppConfig, model?: string): boolean {
+  if (model && config.modelEntries?.[model]?.multimodal === true) return true;
+  if (model && config.modelEntries?.[model]?.multimodal === false) return false;
+  return config.upstreamVisionOk ?? false;
 }

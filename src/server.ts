@@ -43,6 +43,7 @@ import { createLogger } from "./logger.ts";
 import { LlmJobQueue } from "./jobs.ts";
 import type { JobQueueCounts } from "./jobs.ts";
 import { ModelLifecycle } from "./lifecycle.ts";
+import { RequestMutex } from "./mutex.ts";
 import {
   captureRequest,
   classifyErrorSource,
@@ -80,8 +81,10 @@ export function createApp(config: AppConfig): App {
       else logger.info(`lifecycle: ${msg}`, { level, ...(meta ?? {}) });
     },
   });
+  const mutex = config.serializeRequests ? new RequestMutex() : undefined;
   const jobs = new LlmJobQueue(async (job, signal) => {
-    const availability = await lifecycle.ensureModelAvailable(signal);
+    const jobModel = typeof job.request?.model === 'string' ? job.request.model : undefined;
+    const availability = await lifecycle.ensureModelAvailable(jobModel, signal);
     if (!availability.ok) {
       lifecycle.markJobDequeued();
       return {
@@ -94,6 +97,8 @@ export function createApp(config: AppConfig): App {
 
     lifecycle.markJobDequeued();
     lifecycle.markJobStarted();
+    // Serialize with direct endpoint callers when mutex is enabled.
+    if (mutex) await mutex.acquire(signal);
     try {
       if (job.kind === "anthropic.messages") {
         const headers = new Headers({ "content-type": "application/json" });
@@ -116,7 +121,17 @@ export function createApp(config: AppConfig): App {
         }
         return { response: payload };
       }
-      const response = await createChatCompletion(config, store, job.request, signal);
+      const response = await createChatCompletion(config, store, job.request, signal, lifecycle);
+      // v2: cache conversation prefix for future pre-warming
+      if (config.switchPrewarm && isObject(job.request)) {
+        const msgs = (job.request as any).messages;
+        if (Array.isArray(msgs)) {
+          lifecycle.cachePrefix(msgs.map((m: any) => ({
+            role: typeof m.role === 'string' ? m.role : 'user',
+            content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? ''),
+          })));
+        }
+      }
       const payload: any = await response.clone().json().catch(async () => ({ text: await response.text() }));
       if (!response.ok) {
         return {
@@ -129,6 +144,7 @@ export function createApp(config: AppConfig): App {
       }
       return { response: payload };
     } finally {
+      if (mutex) mutex.release();
       lifecycle.markJobFinished();
       lifecycle.maybeShutdownWhenIdle();
     }
@@ -160,6 +176,80 @@ export function createApp(config: AppConfig): App {
 
   let shuttingDown = false;
   const bindHost = `${config.host}:${config.port}`;
+
+  /**
+   * Wrap a handler with mutex serialization when enabled.
+   * Non-streaming responses release the mutex immediately after the response
+   * is produced. Streaming responses wrap the body so the mutex is released
+   * only after the SSE stream completes (or the client disconnects).
+   */
+  async function withMutex(
+    handler: () => Promise<Response>,
+    signal?: AbortSignal,
+  ): Promise<Response> {
+    if (!mutex) return handler();
+
+    await mutex.acquire(signal);
+
+    let response: Response;
+    try {
+      response = await handler();
+    } catch (e) {
+      mutex.release();
+      throw e;
+    }
+
+    const isStream = (response.headers.get('content-type') ?? '').includes('text/event-stream');
+    // Skip wrapping when response already manages its own lifecycle
+    // (e.g. streamWithModelLoading, which carries x-relay-loading).
+    // x-relay-loading responses are SSE heartbeats emitted while a model
+    // cold-starts.  Releasing the mutex immediately avoids holding it for
+    // the entire startup duration (potentially minutes).  Concurrent
+    // requests are protected against ping-pong model switches by the
+    // lifecycle's switchInFlight guard and the early rejection check in
+    // withLifecycleForStreaming.
+    if (!isStream || !response.body || response.headers.has('x-relay-loading')) {
+      mutex.release();
+      return response;
+    }
+
+    // Wrap the stream body so the mutex isn't released until the SSE stream
+    // finishes (or the client disconnects).
+    const reader = response.body.getReader();
+    let mutexReleased = false;
+    const releaseMutex = () => {
+      if (mutexReleased) return;
+      mutexReleased = true;
+      mutex.release();
+    };
+    const wrappedStream = new ReadableStream({
+      async start(controller) {
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            controller.enqueue(value);
+          }
+          controller.close();
+        } catch (e) {
+          controller.error(e);
+        } finally {
+          reader.releaseLock();
+          releaseMutex();
+        }
+      },
+      cancel() {
+        reader.cancel().catch(() => {});
+        releaseMutex();
+      },
+    });
+
+    return new Response(wrappedStream, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+  }
 
   async function handler(request: Request, externalSignal?: AbortSignal): Promise<Response> {
     if (config.host !== "0.0.0.0" && config.host !== "::") {
@@ -325,6 +415,7 @@ export function createApp(config: AppConfig): App {
         response = jsonResponse({
           queue: jobs.counts(),
           lifecycle: lifecycleStatus,
+          mutex: mutex ? { active: mutex.active, waiting: mutex.waiting } : undefined,
         });
         return finalizeResponse(
           response,
@@ -552,13 +643,24 @@ export function createApp(config: AppConfig): App {
       }
       if (path === "/v1/messages") {
         if (request.method === "POST") {
-          // Read body clone for stream detection before handleAnthropicMessages consumes it.
+          // Read body clone for stream detection and model extraction before handleAnthropicMessages consumes it.
           const bodyPreview = await request.clone().text().catch(() => '');
-          const isStream = bodyPreview.includes('"stream":true') || bodyPreview.includes('"stream": true');
-          response = await withLifecycleForStreaming(
-            lifecycle,
-            () => handleAnthropicMessages(config, request, externalSignal),
-            isStream,
+          let isStream = false;
+          let anthropicModel: string | undefined;
+          try {
+            const parsed = JSON.parse(bodyPreview);
+            isStream = parsed?.stream === true;
+            anthropicModel = typeof parsed?.model === 'string' ? parsed.model : undefined;
+          } catch { /* ignore */ }
+          response = await withMutex(
+            () => withLifecycleForStreaming(
+              lifecycle,
+              anthropicModel,
+              () => handleAnthropicMessages(config, request, externalSignal),
+              isStream,
+              externalSignal,
+            ),
+            externalSignal,
           );
         }
         else
@@ -642,10 +744,15 @@ export function createApp(config: AppConfig): App {
           const body = await readJson(request, logger, path);
           requestModel = readRequestModel(body);
           const isStream = isObject(body) && body.stream === true;
-          response = await withLifecycleForStreaming(
-            lifecycle,
-            () => createChatCompletion(config, store, body, externalSignal),
-            isStream,
+          response = await withMutex(
+            () => withLifecycleForStreaming(
+              lifecycle,
+              requestModel,
+              () => createChatCompletion(config, store, body, externalSignal, lifecycle),
+              isStream,
+              externalSignal,
+            ),
+            externalSignal,
           );
           return finalizeResponse(
             response,
@@ -673,7 +780,10 @@ export function createApp(config: AppConfig): App {
       if (path === "/v1/completions" && request.method === "POST") {
         const body = await readJson(request, logger, path);
         requestModel = readRequestModel(body);
-        response = await createCompletionShim(config, store, body, externalSignal);
+        response = await withMutex(
+          () => createCompletionShim(config, store, body, externalSignal),
+          externalSignal,
+        );
         return finalizeResponse(
           response,
           requestId,
@@ -687,7 +797,10 @@ export function createApp(config: AppConfig): App {
       if (path === "/v1/responses" && request.method === "POST") {
         const body = await readJson(request, logger, path);
         requestModel = readRequestModel(body);
-        response = await createResponse(config, responseStore, body, externalSignal);
+        response = await withMutex(
+          () => createResponse(config, responseStore, body, externalSignal),
+          externalSignal,
+        );
         return finalizeResponse(
           response,
           requestId,
@@ -701,7 +814,10 @@ export function createApp(config: AppConfig): App {
       if (path === "/v1/embeddings" && request.method === "POST") {
         const body = await readJson(request, logger, path);
         requestModel = readRequestModel(body);
-        response = await createEmbedding(config, body, externalSignal);
+        response = await withMutex(
+          () => createEmbedding(config, body, externalSignal),
+          externalSignal,
+        );
         return finalizeResponse(
           response,
           requestId,
@@ -718,10 +834,13 @@ export function createApp(config: AppConfig): App {
       ) {
         const body = await readJson(request, logger, path);
         requestModel = readRequestModel(body);
-        response = await createRerank(config, {
-          ...(isObject(body) ? body : {}),
-          upstream_path: path,
-        }, externalSignal);
+        response = await withMutex(
+          () => createRerank(config, {
+            ...(isObject(body) ? body : {}),
+            upstream_path: path,
+          }, externalSignal),
+          externalSignal,
+        );
         return finalizeResponse(
           response,
           requestId,
@@ -1285,14 +1404,78 @@ function parseHeaderInt(value: string | null): number | undefined {
  */
 async function withLifecycleForStreaming(
   lifecycle: ModelLifecycle,
+  modelName: string | undefined,
   handler: () => Promise<Response>,
   isStream: boolean,
+  externalSignal?: AbortSignal,
 ): Promise<Response> {
   const enabled = lifecycle.getLifecycleStatus().enabled;
 
-  if (enabled) {
-    // Ensure model is available before processing.
-    const availability = await lifecycle.ensureModelAvailable();
+  // Streaming with lifecycle: send loading SSE events during model cold-start.
+  // If the model is already hot, skip loading events and stream directly.
+  if (enabled && isStream && modelName) {
+    const status = lifecycle.getLifecycleStatus();
+    // If a different model is currently loading via a graceful/eager switch,
+    // reject early to avoid ping-pong switches and potential OOM on single-GPU.
+    if (status.loadingModel && status.loadingModel !== modelName && status.state === 'starting') {
+      return jsonResponse({
+        error: {
+          message: `Model "${status.loadingModel}" is currently loading. Retry "${modelName}" later.`,
+          code: 'model_switching',
+        },
+      }, 503);
+    }
+    if (status.modelAvailable && status.state === 'running' && status.currentModel === modelName) {
+      lifecycle.markJobStarted();
+      const response = await handler();
+      // Wrap the response body so markJobFinished/maybeShutdownWhenIdle
+      // fire when the SSE stream actually ends, not when the Response
+      // object is returned (which happens immediately for streaming).
+      if (response.body) {
+        const reader = response.body.getReader();
+        let streamDone = false;
+        const finish = () => {
+          if (streamDone) return;
+          streamDone = true;
+          lifecycle.markJobFinished();
+          lifecycle.maybeShutdownWhenIdle();
+        };
+        const wrapped = new ReadableStream({
+          async start(controller) {
+            try {
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                controller.enqueue(value);
+              }
+              controller.close();
+            } finally {
+              reader.releaseLock();
+              finish();
+            }
+          },
+          cancel() {
+            reader.cancel();
+            finish();
+          },
+        });
+        return new Response(wrapped, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers,
+        });
+      }
+      // Non-streaming fallback: no body to wrap, fire immediately.
+      lifecycle.markJobFinished();
+      lifecycle.maybeShutdownWhenIdle();
+      return response;
+    }
+    return streamWithModelLoading(lifecycle, modelName, handler, externalSignal);
+  }
+
+  // Non-streaming with lifecycle: ensure model is available first
+  if (enabled && !isStream) {
+    const availability = await lifecycle.ensureModelAvailable(modelName);
     if (!availability.ok) {
       return jsonResponse({
         error: {
@@ -1301,71 +1484,17 @@ async function withLifecycleForStreaming(
         },
       }, 503);
     }
-  }
-
-  if (!isStream) {
-    // Non-streaming: simple start/finish around the handler.
-    if (enabled) lifecycle.markJobStarted();
+    lifecycle.markJobStarted();
     try {
       return await handler();
     } finally {
-      if (enabled) {
-        lifecycle.markJobFinished();
-        lifecycle.maybeShutdownWhenIdle();
-      }
-    }
-  }
-
-  // Streaming: wrap the body to track completion.
-  if (enabled) lifecycle.markJobStarted();
-  let response: Response;
-  try {
-    response = await handler();
-  } catch (error) {
-    if (enabled) {
       lifecycle.markJobFinished();
       lifecycle.maybeShutdownWhenIdle();
     }
-    throw error;
   }
 
-  // Wrap the body to intercept stream completion.
-  const originalBody = response.body;
-  if (!originalBody) {
-    if (enabled) {
-      lifecycle.markJobFinished();
-      lifecycle.maybeShutdownWhenIdle();
-    }
-    return response;
-  }
-
-  const reader = originalBody.getReader();
-  const wrappedStream = new ReadableStream({
-    async start(controller) {
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          controller.enqueue(value);
-        }
-        controller.close();
-      } catch (error) {
-        controller.error(error);
-      } finally {
-        reader.releaseLock();
-        if (enabled) {
-          lifecycle.markJobFinished();
-          lifecycle.maybeShutdownWhenIdle();
-        }
-      }
-    },
-  });
-
-  return new Response(wrappedStream, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: response.headers,
-  });
+  // Lifecycle disabled or no model name: simple passthrough
+  return handler();
 }
 
 async function writeWebResponse(res: ServerResponse, response: Response) {
@@ -1378,17 +1507,152 @@ async function writeWebResponse(res: ServerResponse, response: Response) {
     return;
   }
   const reader = response.body.getReader();
+  let disconnected = false;
+  const onClose = () => {
+    disconnected = true;
+    reader.cancel().catch(() => {});
+  };
+  res.once('close', onClose);
   try {
     while (true) {
       const { done, value } = await reader.read();
-      if (done) break;
+      if (done || disconnected) break;
       const ok = res.write(value);
       if (!ok) {
         await new Promise<void>((resolve) => res.once('drain', resolve));
       }
     }
   } finally {
+    res.removeListener('close', onClose);
     reader.releaseLock();
-    res.end();
+    if (!res.writableEnded) {
+      res.end();
+    }
   }
+}
+
+/**
+ * For streaming requests: immediately return an SSE response that emits
+ * loading events while the lifecycle ensures the model is available.
+ * Once ready, the real upstream stream is piped through transparently.
+ */
+async function streamWithModelLoading(
+  lifecycle: ModelLifecycle,
+  modelName: string,
+  handler: () => Promise<Response>,
+  externalSignal?: AbortSignal,
+): Promise<Response> {
+  const encoder = new TextEncoder();
+  let loadingTimer: ReturnType<typeof setInterval> | null = null;
+  const startTime = Date.now();
+
+  const streamAbortController = new AbortController();
+  let cancelled = false;
+
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      streamAbortController.abort();
+      cancelled = true;
+    } else {
+      externalSignal.addEventListener('abort', () => {
+        streamAbortController.abort();
+        cancelled = true;
+      }, { once: true });
+    }
+  }
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      const emitLoading = () => {
+        const elapsedMs = Date.now() - startTime;
+        // Emit as SSE comment lines so OpenAI-compatible clients ignore them
+        // instead of trying to parse them as chat completion chunks.
+        controller.enqueue(encoder.encode(`: relay loading model=${modelName} elapsed_ms=${elapsedMs}\n\n`));
+      };
+
+      emitLoading();
+      loadingTimer = setInterval(emitLoading, 3000);
+
+      try {
+        const availability = await lifecycle.ensureModelAvailable(modelName, streamAbortController.signal);
+
+        if (loadingTimer) clearInterval(loadingTimer);
+
+        if (streamAbortController.signal.aborted) {
+          controller.close();
+          return;
+        }
+
+        if (!availability.ok) {
+          const errPayload = JSON.stringify({ event: 'error', message: availability.message ?? 'Model unavailable' });
+          controller.enqueue(encoder.encode(`data: ${errPayload}\n\n`));
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          controller.close();
+          return;
+        }
+
+        lifecycle.markJobStarted();
+        try {
+          const response = await handler();
+          if (streamAbortController.signal.aborted) {
+            response.body?.cancel();
+            controller.close();
+            return;
+          }
+          const reader = response.body?.getReader();
+          if (!reader) {
+            controller.close();
+            return;
+          }
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              if (streamAbortController.signal.aborted) {
+                reader.cancel();
+                controller.close();
+                return;
+              }
+              controller.enqueue(value);
+            }
+            controller.close();
+          } finally {
+            reader.releaseLock();
+          }
+        } finally {
+          lifecycle.markJobFinished();
+          lifecycle.maybeShutdownWhenIdle();
+        }
+      } catch (err) {
+        if (loadingTimer) clearInterval(loadingTimer);
+        if (!cancelled) {
+          const message = err instanceof Error ? err.message : String(err);
+          const errPayload = JSON.stringify({ error: { message, type: 'upstream_error' } });
+          try {
+            controller.enqueue(encoder.encode(`data: ${errPayload}\n\n`));
+            controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          } catch { /* stream may already be closed */ }
+          try { controller.close(); } catch { /* already closed */ }
+        } else {
+          try { controller.close(); } catch { /* already closed */ }
+        }
+      }
+    },
+
+    cancel() {
+      cancelled = true;
+      if (loadingTimer) clearInterval(loadingTimer);
+      streamAbortController.abort();
+    },
+  });
+
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache',
+      'connection': 'keep-alive',
+      'x-relay-loading': '1',
+    },
+  });
 }

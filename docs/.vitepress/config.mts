@@ -20,7 +20,9 @@ export default defineConfig({
         items: [
           { text: 'Overview', link: '/' },
           { text: 'Quickstart', link: '/quickstart' },
+          { text: 'Model Setup', link: '/model-setup' },
           { text: 'Configuration', link: '/configuration' },
+          { text: 'Lazy LLM Lifecycle', link: '/lazy-llm-lifecycle' },
           { text: 'API Compatibility', link: '/api-compatibility' },
           { text: 'Troubleshooting', link: '/troubleshooting' },
           { text: 'Systemd Deployment', link: '/systemd' },
