@@ -7,7 +7,7 @@
         <code>SDK requests, tools, streams</code>
       </div>
 
-      <div class="compat-arrow" aria-hidden="true">-></div>
+      <div class="compat-arrow" aria-hidden="true">→</div>
 
       <div class="compat-node compat-node-relay">
         <span class="compat-label">Relay</span>
@@ -15,12 +15,12 @@
         <code>messages, SSE, tools, errors</code>
       </div>
 
-      <div class="compat-arrow" aria-hidden="true">-></div>
+      <div class="compat-arrow" aria-hidden="true">→</div>
 
       <div class="compat-node compat-node-upstream">
-        <span class="compat-label">Local upstream</span>
-        <strong>llama.cpp / vLLM</strong>
-        <code>native server shape</code>
+        <span class="compat-label">Backend</span>
+        <strong>llama.cpp or Cloud API</strong>
+        <code>local GPU or hosted inference</code>
       </div>
     </div>
 
@@ -40,7 +40,7 @@ withDefaults(
     caption?: string
   }>(),
   {
-    caption: 'Relay sits between agent SDKs and local inference servers, translating protocol details in both directions.',
+    caption: 'Gateway mode manages local llama.cpp models. Cloud mode proxies OpenAI, Anthropic, DeepSeek, or Groq. Same API surface either way.',
   },
 )
 </script>

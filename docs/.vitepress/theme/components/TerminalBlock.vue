@@ -16,7 +16,7 @@
         <span v-else>&#10713;</span>
       </button>
     </div>
-    <pre><code><slot></slot></code></pre>
+    <pre><code><slot></slot><span class="relay-cursor" aria-hidden="true"> </span></code></pre>
   </div>
 </template>
 
@@ -29,7 +29,11 @@ let timeout: ReturnType<typeof setTimeout> | null = null
 function copy(): void {
   const codeEl = document.querySelector('.relay-terminal pre code')
   if (!codeEl) return
-  const text = codeEl.textContent || ''
+  const allText = codeEl.childNodes
+  let text = ''
+  for (const node of allText) {
+    if (node.nodeType === Node.TEXT_NODE) text += node.textContent || ''
+  }
   navigator.clipboard.writeText(text).then(() => {
     setCopied()
   }).catch(() => {
@@ -51,3 +55,27 @@ function setCopied(): void {
   timeout = setTimeout(() => { copied.value = false }, 2000)
 }
 </script>
+
+<style scoped>
+.relay-cursor {
+  display: inline-block;
+  width: 8px;
+  height: 14px;
+  background: rgba(86, 141, 208, 0.7);
+  margin-left: 1px;
+  vertical-align: text-bottom;
+  animation: relay-cursor-blink 1s step-end infinite;
+}
+
+@keyframes relay-cursor-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .relay-cursor {
+    animation: none;
+    opacity: 0;
+  }
+}
+</style>

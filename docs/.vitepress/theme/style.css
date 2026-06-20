@@ -380,30 +380,6 @@
   background: rgba(106, 153, 85, 0.08) !important;
 }
 
-/* Terminal cursor blink */
-.relay-terminal pre::after {
-  content: "";
-  display: inline-block;
-  width: 8px;
-  height: 14px;
-  background: rgba(86, 141, 208, 0.7);
-  margin-left: 2px;
-  vertical-align: text-bottom;
-  animation: terminal-cursor-blink 1s step-end infinite;
-}
-
-@keyframes terminal-cursor-blink {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0; }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .relay-terminal pre::after {
-    animation: none;
-    opacity: 0;
-  }
-}
-
 .relay-terminal pre {
   margin: 0 !important;
   border-radius: 0 !important;

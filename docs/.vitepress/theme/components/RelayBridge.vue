@@ -10,12 +10,12 @@
 
     <!-- CSS overlay labels -->
     <div class="relay-bridge__labels" aria-hidden="true">
-      <span class="relay-bridge__label relay-bridge__label--tl">/v1/chat/completions</span>
-      <span class="relay-bridge__label relay-bridge__label--tr">/v1/messages</span>
-      <span class="relay-bridge__label relay-bridge__label--ml">SSE</span>
+      <span class="relay-bridge__label relay-bridge__label--tl">OpenAI SDK</span>
+      <span class="relay-bridge__label relay-bridge__label--tr">Anthropic SDK</span>
+      <span class="relay-bridge__label relay-bridge__label--ml">SSE normalize</span>
       <span class="relay-bridge__label relay-bridge__label--mr">tool_calls</span>
-      <span class="relay-bridge__label relay-bridge__label--bl">model aliases</span>
-      <span class="relay-bridge__label relay-bridge__label--br">health</span>
+      <span class="relay-bridge__label relay-bridge__label--bl">llama.cpp</span>
+      <span class="relay-bridge__label relay-bridge__label--br">Cloud API</span>
     </div>
 
     <!-- Relay state indicator -->
@@ -31,19 +31,19 @@
         <rect x="0.5" y="0.5" width="419" height="247" rx="7.5" stroke="rgba(86,141,208,0.10)" stroke-width="1" />
         <!-- Clients -->
         <rect x="44" y="10" width="332" height="34" rx="4" fill="rgba(255,255,255,0.025)" stroke="rgba(255,255,255,0.05)" stroke-width="0.5" />
-        <text x="210" y="22" text-anchor="middle" fill="#71717a" font-family="ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace" font-size="10">OpenAI SDK</text>
-        <text x="210" y="36" text-anchor="middle" fill="#71717a" font-family="ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace" font-size="10">Anthropic SDK · Coding Agents</text>
+        <text x="210" y="22" text-anchor="middle" fill="#71717a" font-family="ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace" font-size="10">OpenAI SDK &nbsp;·&nbsp; Anthropic SDK</text>
+        <text x="210" y="36" text-anchor="middle" fill="#71717a" font-family="ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace" font-size="10">Coding Agents &nbsp;·&nbsp; Cursor &nbsp;·&nbsp; Claude Code</text>
         <!-- Relay -->
         <rect x="64" y="72" width="292" height="52" rx="5" fill="rgba(86,141,208,0.16)" stroke="#568dd0" stroke-width="1" />
         <text x="210" y="96" text-anchor="middle" fill="#75a7df" font-family="ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace" font-size="13" font-weight="700">Relay</text>
         <text x="210" y="114" text-anchor="middle" fill="#568dd0" font-family="ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace" font-size="9">normalize · stream · tools · errors</text>
         <!-- Upstream -->
         <rect x="44" y="152" width="332" height="34" rx="4" fill="rgba(255,255,255,0.025)" stroke="rgba(255,255,255,0.05)" stroke-width="0.5" />
-        <text x="210" y="165" text-anchor="middle" fill="#71717a" font-family="ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace" font-size="10">llama.cpp</text>
-        <text x="210" y="179" text-anchor="middle" fill="#71717a" font-family="ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace" font-size="10">vLLM · local inference server</text>
+        <text x="210" y="165" text-anchor="middle" fill="#71717a" font-family="ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace" font-size="10">llama.cpp &nbsp;·&nbsp; vLLM &nbsp;·&nbsp; Ollama</text>
+        <text x="210" y="179" text-anchor="middle" fill="#71717a" font-family="ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace" font-size="10">OpenAI &nbsp;·&nbsp; Anthropic &nbsp;·&nbsp; DeepSeek &nbsp;·&nbsp; Groq</text>
         <!-- Model -->
         <rect x="84" y="212" width="252" height="26" rx="3" fill="rgba(255,255,255,0.015)" stroke="rgba(255,255,255,0.035)" stroke-width="0.5" />
-        <text x="210" y="229" text-anchor="middle" fill="#52525b" font-family="ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace" font-size="9.5">GGUF / local model</text>
+        <text x="210" y="229" text-anchor="middle" fill="#52525b" font-family="ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace" font-size="9.5">GGUF / local model  ·  cloud API endpoint</text>
         <!-- Arrows -->
         <line x1="210" y1="48" x2="210" y2="69" stroke="rgba(86,141,208,0.28)" stroke-width="1" />
         <line x1="210" y1="128" x2="210" y2="149" stroke="rgba(86,141,208,0.28)" stroke-width="1" />

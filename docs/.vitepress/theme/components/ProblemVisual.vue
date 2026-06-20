@@ -10,9 +10,9 @@
           <strong>is where agents break.</strong>
         </h2>
         <p class="problem-lede">
-          Local model servers speak familiar protocols until the details matter:
+          Local model servers and cloud APIs speak familiar protocols until the details matter:
           stream events, tool calls, fields, errors, and capability metadata.
-          Relay makes the boundary actually compatible.
+          Relay makes the boundary actually compatible — same API surface whether your model runs on your GPU or someone else's.
         </p>
       </div>
     </div>
@@ -27,10 +27,10 @@
     </div>
 
     <div class="relay-pain-grid">
-      <div class="relay-pain-card"><p>OpenAI-compatible endpoints differ subtly across local servers - header conventions, field presence, and error shapes don't match what SDKs expect.</p></div>
-      <div class="relay-pain-card"><p>Anthropic clients expect different message shapes, streaming event orders, and tool-call structures than what upstream servers return.</p></div>
-      <div class="relay-pain-card"><p>Tool calls, model IDs, SSE chunk framing, and capability metadata often cause agent loops to break or silently degrade.</p></div>
-      <div class="relay-pain-card relay-pain-card-accent"><p>Relay normalizes the boundary instead of forcing every client, SDK, and agent to special-case each local inference server.</p></div>
+      <div class="relay-pain-card"><p>OpenAI-compatible endpoints differ subtly across backends — header conventions, field presence, and error shapes don't match what SDKs expect.</p></div>
+      <div class="relay-pain-card"><p>Anthropic clients expect specific message shapes, streaming event orders, and tool-call structures different from what upstream servers return.</p></div>
+      <div class="relay-pain-card"><p>Tool calls, model IDs, SSE chunk framing, and capability metadata often cause agent loops to break or silently degrade across providers.</p></div>
+      <div class="relay-pain-card relay-pain-card-accent"><p>Relay normalizes the boundary — local GPU or cloud API, same contract. No special-casing per backend, no agent-side workarounds.</p></div>
     </div>
   </section>
 </template>
@@ -82,7 +82,7 @@ function paint(time = 0): void {
   ctx.lineWidth = 1
 
   const prepared = prepareMeasuredTextWithSegments(
-    'almost compatible != agent compatible',
+    'one gateway · any model · local or cloud',
     '12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
     { whiteSpace: 'pre-wrap' },
   )

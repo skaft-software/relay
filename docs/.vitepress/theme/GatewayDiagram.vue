@@ -72,7 +72,7 @@
         font-family="ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace"
         font-size="10"
         letter-spacing="0.5"
-      >OpenAI SDK</text>
+      >OpenAI SDK &nbsp;·&nbsp; Anthropic SDK</text>
       <text
         x="210" y="36"
         text-anchor="middle"
@@ -80,7 +80,7 @@
         font-family="ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace"
         font-size="10"
         letter-spacing="0.5"
-      >Anthropic SDK &nbsp;·&nbsp; Coding Agents</text>
+      >Coding Agents &nbsp;·&nbsp; Cursor &nbsp;·&nbsp; Claude Code</text>
 
       <!-- Arrow 1 -->
       <line
@@ -153,7 +153,7 @@
         font-family="ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace"
         font-size="10"
         letter-spacing="0.5"
-      >llama.cpp</text>
+      >llama.cpp &nbsp;·&nbsp; vLLM &nbsp;·&nbsp; Ollama</text>
       <text
         x="210" y="179"
         text-anchor="middle"
@@ -161,7 +161,7 @@
         font-family="ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace"
         font-size="10"
         letter-spacing="0.5"
-      >vLLM &nbsp;·&nbsp; local inference server</text>
+      >OpenAI &nbsp;·&nbsp; Anthropic &nbsp;·&nbsp; DeepSeek &nbsp;·&nbsp; Groq</text>
 
       <!-- Arrow 3 -->
       <line
@@ -185,7 +185,7 @@
         font-family="ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace"
         font-size="9.5"
         letter-spacing="0.5"
-      >GGUF &nbsp;/&nbsp; local model</text>
+      >GGUF &nbsp;/&nbsp; local model &nbsp;·&nbsp; cloud API endpoint</text>
     </svg>
   </div>
 </template>
