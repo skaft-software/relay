@@ -29,7 +29,7 @@ test('capabilities expose the active model profile and relay headers include it'
       name: 'Qwen',
       reasoningMode: 'off',
       toolMode: 'auto',
-      thinking: { supported: false, levels: ['on', 'off'] },
+      thinking: { supported: false, levels: [] },
       expectedContext: {
         recommended: '16k debug profile, then 32k+ only when first-token latency is acceptable',
         ceiling: '90k+ is possible but can cause multi-minute prefill on consumer hardware',
@@ -106,13 +106,18 @@ test('configured sampling defaults are reflected in the exposed profile recommen
   });
 });
 
-test('thinking support is reflected in capabilities when enabled via config', async () => {
+test('thinking support is reflected in capabilities when model has thinking_levels', async () => {
   await withUpstream(async (upstream) => {
     upstream.handler = (_req, res) => sendJson(res, 200, chatCompletion('llama', 'ok'));
     const app = createApp({
       ...testConfig(upstream.url),
-      thinkingSupported: true,
-      thinkingLevels: ['on', 'off'],
+      modelEntries: {
+        'thinking-model': {
+          cmd: 'echo test',
+          ctx_size: 8192,
+          thinking_levels: ['on'],
+        },
+      },
     });
 
     const capabilities = await app.fetch('/relay/capabilities');
@@ -120,7 +125,7 @@ test('thinking support is reflected in capabilities when enabled via config', as
     const body = await capabilities.json();
     assert.deepEqual(body.profile.thinking, {
       supported: true,
-      levels: ['on', 'off'],
+      levels: ['on'],
     });
   });
 });

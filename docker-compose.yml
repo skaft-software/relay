@@ -3,6 +3,7 @@
 # and manage model servers exactly like a bare-metal install.
 services:
   relay:
+    build: .
     image: relay-gateway:local
     container_name: relay
     restart: unless-stopped

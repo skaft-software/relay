@@ -144,14 +144,15 @@ export function getModelProfile(config: AppConfig): RelayModelProfile {
 
 export function activeProfile(config: AppConfig, modelName?: string) {
   const profile = getModelProfile(config);
-  // Per-model thinking levels override global config
+  // Per-model thinking_levels is the ONLY source of truth for thinking support.
+  // There is no global "all models support thinking" flag — thinking is a model
+  // card property, not a hardware property. The catalog records which models
+  // actually support it (verified against HuggingFace model cards).
   const modelThinking = modelName ? config.modelEntries?.[modelName]?.thinking_levels : undefined;
   const thinking: { supported: boolean; levels: string[] } =
     modelThinking?.length
       ? { supported: true, levels: modelThinking }
-      : config.thinkingSupported && config.thinkingLevels?.length
-        ? { supported: true, levels: config.thinkingLevels }
-        : profile.thinking ?? { supported: false, levels: ['on', 'off'] };
+      : { supported: false, levels: [] };
   return {
     id: profile.id,
     name: profile.displayName,

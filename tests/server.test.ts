@@ -237,7 +237,7 @@ test('GET /v1/models returns synthetic list when upstream fails and DEFAULT_MODE
       owned_by: 'local',
       capabilities: ['completion'],
       supports_thinking: false,
-      thinking_levels: ['on', 'off'],
+      thinking_levels: [],
     });
   });
 });

@@ -237,6 +237,30 @@ def load_catalog():
 
 CATALOG = load_catalog()
 
+# Load the JSON model catalog for thinking/vision metadata
+_THINKING_CATALOG: dict = {}
+_json_catalog_path = REPO_ROOT / "docs" / "model-catalog.json"
+if _json_catalog_path.exists():
+    try:
+        for m in json.loads(_json_catalog_path.read_text()):
+            if isinstance(m, dict) and "id" in m:
+                _THINKING_CATALOG[m["id"]] = m
+    except Exception:
+        pass
+
+def _lookup_thinking(gguf_stem_key: str):
+    """Fuzzy-match a GGUF stem key against the JSON catalog to find thinking support.
+    Returns (thinking_levels, multimodal) or (None, None)."""
+    # Direct match
+    for cid, entry in _THINKING_CATALOG.items():
+        if cid in gguf_stem_key or gguf_stem_key in cid:
+            thinking = entry.get("thinking")
+            if thinking == "on":
+                return ["on"], entry.get("vision", False)
+            elif thinking == "toggle":
+                return ["on", "off"], entry.get("vision", False)
+    return None, None
+
 # ── Real model sizes from HuggingFace ────────────────────────────────────────
 import urllib.request
 
@@ -658,6 +682,10 @@ def auto_local(hw):
             entry["expert_flag"] = expert
         if companion_for(gguf, "mmproj"):
             entry["multimodal"] = True
+        # Look up thinking support from model catalog
+        thinking_levels, _ = _lookup_thinking(key)
+        if thinking_levels:
+            entry["thinking_levels"] = thinking_levels
         entries[key] = entry
         extras = ["smart-offload"] if expert else []
         if companion_for(gguf, "mmproj"):
@@ -679,7 +707,6 @@ def auto_local(hw):
         "RELAY_MODE=gateway",
         "RELAY_MODEL_LIFECYCLE_ENABLED=true",
         "RELAY_SERIALIZE_REQUESTS=true",   # FCFS: one request at a time, no thrash
-        "RELAY_THINKING_SUPPORTED=true",
         f"DEFAULT_MODEL={default}",
         f"RELAY_MODEL_MAP={json.dumps(entries, separators=(',', ':'))}",
     ]
@@ -888,6 +915,9 @@ def flow_local_full(hw):
         if companion_for(gguf, "mmproj"):
             entry["multimodal"] = True
             extras.append(c("👁 vision"))
+        thinking_levels, _ = _lookup_thinking(key)
+        if thinking_levels:
+            entry["thinking_levels"] = thinking_levels
         if companion_for(gguf, "draft"):
             extras.append(d("⚡ turbo"))
         # Always show GPU/CPU backend so user knows it was detected
@@ -906,7 +936,6 @@ def flow_local_full(hw):
         "RELAY_MODE=gateway",
         "RELAY_MODEL_LIFECYCLE_ENABLED=true",
         "RELAY_SERIALIZE_REQUESTS=true",   # FCFS: one request at a time, no thrash
-        "RELAY_THINKING_SUPPORTED=true",
         f"DEFAULT_MODEL={next(iter(entries))}",
         f"RELAY_MODEL_MAP={json.dumps(entries, separators=(',', ':'))}",
     ]
