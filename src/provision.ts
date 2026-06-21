@@ -13,6 +13,7 @@
 import { execFileSync } from 'node:child_process';
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -415,28 +416,85 @@ export function fitModel(model: ModelFile, hw: Hardware, profile: Profile = 'ful
   return { model, fit, ngl, ctxSize, cpuMoe };
 }
 
+
+// ── size-model.py integration ─────────────────────────────────────────
+
+const SIZE_MODEL_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'size-model.py');
+
+type SizeModelResult = {
+  maxCtx: number;
+  launchFlags: string[];
+  expertFlag: string;
+  nCpuMoe: number;
+  headroomPct: number;
+  kvGb: number;
+};
+
+export function sizeModelWithPython(ggufPath: string, pythonPath?: string): SizeModelResult | null {
+  try {
+    const out = execFileSync(pythonPath ?? 'python3', [SIZE_MODEL_SCRIPT, ggufPath, '--json'], {
+      encoding: 'utf8',
+      timeout: 180_000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      cwd: dirname(SIZE_MODEL_SCRIPT),
+    });
+    const data = JSON.parse(out.trim());
+    if (!data || typeof data !== 'object') return null;
+    if (data.error) return null;
+    return {
+      maxCtx: typeof data.max_ctx === 'number' ? data.max_ctx : 0,
+      launchFlags: Array.isArray(data.launch_flags) ? data.launch_flags : [],
+      expertFlag: typeof data.expert_flag === 'string' ? data.expert_flag : '',
+      nCpuMoe: typeof data.n_cpu_moe === 'number' ? data.n_cpu_moe : 0,
+      headroomPct: typeof data.headroom_pct === 'number' ? data.headroom_pct : 0,
+      kvGb: typeof data.kv_gb === 'number' ? data.kv_gb : 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
 // ── Generation ───────────────────────────────────────────────────────────
 
 function shq(v: string): string {
   return "'" + v.replace(/'/g, "'\\''") + "'";
 }
 
-export function renderStartScript(model: ModelFile, entry: MapEntry, llama: LlamaServer): string {
+export function renderStartScript(model: ModelFile, entry: MapEntry, llama: LlamaServer, launchFlags?: string[]): string {
   const server = llama.path ?? 'llama-server';
   const buildDir = llama.buildDir ?? dirname(dirname(server));
-  const args: string[][] = [
-    ['--model', '"$MODEL"'],
-    ['--host', '127.0.0.1'],
-    ['--port', '"$LLAMA_PORT"'],
-    ['--ctx-size', String(entry.ctx_size)],
-    ['-ngl', '999'],
-    ['--parallel', '1'],
-    ['--flash-attn', 'on'],
-    ['--cache-type-k', 'q4_0'],
-    ['--cache-type-v', 'q4_0'],
-    ['--jinja'],
-  ];
-  if (entry.expert_flag) args.push(entry.expert_flag.split(' '));
+  let args: string[][];
+  if (launchFlags && launchFlags.length > 0) {
+    const pairs: string[][] = [];
+    let i = 0;
+    while (i < launchFlags.length) {
+      const f = launchFlags[i]!;
+      if (f.startsWith('--') && i + 1 < launchFlags.length && !launchFlags[i + 1]!.startsWith('--')) {
+        pairs.push([f, launchFlags[i + 1]!]);
+        i += 2;
+      } else {
+        pairs.push([f]);
+        i += 1;
+      }
+    }
+    args = pairs;
+    args.unshift(['--port', '"$LLAMA_PORT"']);
+    args.unshift(['--host', '127.0.0.1']);
+    args.unshift(['--model', '"$MODEL"']);
+  } else {
+    args = [
+      ['--model', '"$MODEL"'],
+      ['--host', '127.0.0.1'],
+      ['--port', '"$LLAMA_PORT"'],
+      ['--ctx-size', String(entry.ctx_size)],
+      ['-ngl', '999'],
+      ['--parallel', '1'],
+      ['--flash-attn', 'on'],
+      ['--cache-type-k', 'q4_0'],
+      ['--cache-type-v', 'q4_0'],
+      ['--jinja'],
+    ];
+  }
   if (entry.multimodal && model.mmproj) args.push(['--mmproj', shq(model.mmproj)]);
   if (model.draft) args.push(['--model-draft', shq(model.draft)]);
   const body = args.map((a) => '  ' + a.join(' ') + ' \\').join('\n');
@@ -462,10 +520,12 @@ export type MapEntry = {
   thinking_levels?: string[];
 };
 
-export function modelMapEntry(fit: ModelFit, containerScriptPath: string, port: number): MapEntry {
-  const e: MapEntry = { cmd: containerScriptPath, ctx_size: fit.ctxSize, port };
+export function modelMapEntry(fit: ModelFit, containerScriptPath: string, port: number, tuned?: SizeModelResult): MapEntry {
+  const ctx_size = tuned?.maxCtx || fit.ctxSize;
+  const e: MapEntry = { cmd: containerScriptPath, ctx_size, port };
   if (fit.model.vision) e.multimodal = true;
-  if (fit.cpuMoe) e.expert_flag = fit.cpuMoe;
+  if (tuned?.expertFlag) e.expert_flag = tuned.expertFlag;
+  else if (fit.cpuMoe) e.expert_flag = fit.cpuMoe;
   return e;
 }
 
@@ -508,7 +568,7 @@ export function generateMap(
   existing: Record<string, MapEntry>,
   containerScriptDir = '/relay/start-scripts',
   portBase = 8081,
-): Record<string, MapEntry> {
+): { map: Record<string, MapEntry>; tuned: Record<string, SizeModelResult> } {
   const taken = usedPorts(existing);
   let next = portBase;
   const nextPort = (id: string): number => {
@@ -518,12 +578,21 @@ export function generateMap(
     return next;
   };
   const out: Record<string, MapEntry> = {};
+  const tuned: Record<string, SizeModelResult> = {};
   for (const fit of plan.models) {
     if (fit.model.incomplete) continue;
     const port = nextPort(fit.model.id);
-    out[fit.model.id] = modelMapEntry(fit, containerScriptDir + '/start-' + fit.model.id + '.sh', port);
+    let sizeResult: SizeModelResult | undefined;
+    if (!existing[fit.model.id]) {
+      console.error('  tuning: ' + fit.model.id + ' ...');
+      sizeResult = sizeModelWithPython(fit.model.path) ?? undefined;
+      if (sizeResult) {
+        tuned[fit.model.id] = sizeResult;
+      }
+    }
+    out[fit.model.id] = modelMapEntry(fit, containerScriptDir + '/start-' + fit.model.id + '.sh', port, sizeResult);
   }
-  return out;
+  return { map: out, tuned };
 }
 
 export function readExistingMap(envPath: string): Record<string, MapEntry> {
@@ -581,7 +650,7 @@ export function applyProvision(repoDir: string, opts: { writeScripts?: boolean }
   const composePath = join(repoDir, 'docker-compose.yml');
   const plan = buildPlan();
   const existing = readExistingMap(envPath);
-  const generated = generateMap(plan, existing);
+  const { map: generated, tuned } = generateMap(plan, existing);
   const { merged, preserved, added, kept } = reconcileMap(generated, existing);
 
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
@@ -599,7 +668,7 @@ export function applyProvision(repoDir: string, opts: { writeScripts?: boolean }
       const model = fileById.get(id);
       if (!model) continue;
       const scriptPath = join(plan.layout.scriptsDir, 'start-' + id + '.sh');
-      writeFileSync(scriptPath, renderStartScript(model, entry, plan.llama));
+      writeFileSync(scriptPath, renderStartScript(model, entry, plan.llama, tuned[id]?.launchFlags));
       chmodSync(scriptPath, 0o755);
       scriptsWritten += 1;
     }
@@ -867,7 +936,7 @@ export function runProvisionCli(args: string[], repoDir: string): void {
 
   const envPath = join(repoDir, '.env');
   const existing = readExistingMap(envPath);
-  const generated = generateMap(plan, existing);
+  const { map: generated } = generateMap(plan, existing);
   const { merged, preserved, added, kept } = reconcileMap(generated, existing);
   console.log('Reconcile (vs current RELAY_MODEL_MAP)');
   console.log('─────────────────────────────────────');
