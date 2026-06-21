@@ -1,6 +1,7 @@
 import type { AppConfig } from '../config.ts';
 import { GatewayError, jsonResponse } from '../errors.ts';
 import { upstreamJson } from '../upstream/llama.ts';
+import { activeProfile } from '../profile.ts';
 
 export async function handleModels(config: AppConfig, model?: string, externalSignal?: AbortSignal): Promise<Response> {
   // When modelEntries is configured, serve the list directly from relay config.
@@ -8,17 +9,19 @@ export async function handleModels(config: AppConfig, model?: string, externalSi
     const allModels = Object.keys(config.modelEntries).map((id) => {
       const entry = config.modelEntries![id];
       const ctxSize = entry.ctx_size ?? config.upstreamCtxSize;
+      const profile = activeProfile(config, id);
       const caps: string[] = ['completion'];
       if (entry.multimodal === true) caps.push('multimodal');
       const meta: Record<string, unknown> = {};
       if (ctxSize) meta.n_ctx = ctxSize;
-      if (entry.thinking_levels?.length) meta.thinking_levels = entry.thinking_levels;
       return {
         id: entry.name ?? id,
         object: 'model',
         created: 0,
         owned_by: 'local',
         capabilities: caps,
+        supports_thinking: profile.thinking.supported,
+        thinking_levels: profile.thinking.levels,
         meta: Object.keys(meta).length ? meta : undefined,
       };
     });
@@ -63,8 +66,9 @@ function enrichWithCtxSize(
   raw: unknown,
   config: AppConfig,
 ): unknown {
-  if (!config.upstreamCtxSize) return raw;
+  if (!config.upstreamCtxSize && !config.thinkingSupported) return raw;
   const n = config.upstreamCtxSize;
+  const profile = activeProfile(config);
 
   // /v1/models returns { object: 'list', data: [ {...} ] }
   if (isObject(raw) && Array.isArray((raw as any).data)) {
@@ -73,12 +77,19 @@ function enrichWithCtxSize(
     list.data = list.data.map((item: unknown) => {
       if (!isObject(item)) return item;
       const entry = item as Record<string, unknown>;
-      // Inject ctx size into meta (which the upstream already provides)
-      const meta = isObject(entry.meta)
-        ? { ...entry.meta } as Record<string, unknown>
-        : {};
-      meta.n_ctx = n; // running context size
-      entry.meta = meta;
+      // Inject thinking fields at top level
+      if (config.thinkingSupported) {
+        entry.supports_thinking = profile.thinking.supported;
+        entry.thinking_levels = profile.thinking.levels;
+      }
+      // Inject ctx size into meta
+      if (n) {
+        const meta = isObject(entry.meta)
+          ? { ...entry.meta } as Record<string, unknown>
+          : {};
+        meta.n_ctx = n;
+        entry.meta = meta;
+      }
       return entry;
     });
     return list;
@@ -88,11 +99,15 @@ function enrichWithCtxSize(
 }
 
 function syntheticModel(config: AppConfig) {
+  const profile = activeProfile(config);
   const base: Record<string, unknown> = {
     id: config.defaultModel ?? 'local',
     object: 'model',
     created: 0,
     owned_by: 'local',
+    capabilities: ['completion'],
+    supports_thinking: profile.thinking.supported,
+    thinking_levels: profile.thinking.levels,
   };
   if (config.upstreamCtxSize) base.meta = { n_ctx: config.upstreamCtxSize };
   return base;

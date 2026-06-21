@@ -678,7 +678,8 @@ def auto_local(hw):
     config = [
         "RELAY_MODE=gateway",
         "RELAY_MODEL_LIFECYCLE_ENABLED=true",
-        "RELAY_SERIALIZE_REQUESTS=true",
+        "RELAY_SERIALIZE_REQUESTS=true",   # FCFS: one request at a time, no thrash
+        "RELAY_THINKING_SUPPORTED=true",
         f"DEFAULT_MODEL={default}",
         f"RELAY_MODEL_MAP={json.dumps(entries, separators=(',', ':'))}",
     ]
@@ -905,6 +906,7 @@ def flow_local_full(hw):
         "RELAY_MODE=gateway",
         "RELAY_MODEL_LIFECYCLE_ENABLED=true",
         "RELAY_SERIALIZE_REQUESTS=true",   # FCFS: one request at a time, no thrash
+        "RELAY_THINKING_SUPPORTED=true",
         f"DEFAULT_MODEL={next(iter(entries))}",
         f"RELAY_MODEL_MAP={json.dumps(entries, separators=(',', ':'))}",
     ]
@@ -963,6 +965,7 @@ def render_compose(models_dir, llama_root):
 # and manage model servers exactly like a bare-metal install.
 services:
   relay:
+    build: .
     image: relay-gateway:local
     container_name: relay
     restart: unless-stopped

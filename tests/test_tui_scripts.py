@@ -139,7 +139,7 @@ def test_render_compose_structure(monkeypatch, tui):
     assert "network_mode: host" in compose
     assert "pid: host" in compose
     assert "env_file:" in compose
-    assert "./relay.env" in compose
+    assert "- .env" in compose
     assert "volumes:" in compose
     assert f"{models_dir}:{models_dir}:ro" in compose
     assert f"{llama_root}:{llama_root}:ro" in compose

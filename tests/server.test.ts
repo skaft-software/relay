@@ -235,6 +235,9 @@ test('GET /v1/models returns synthetic list when upstream fails and DEFAULT_MODE
       object: 'model',
       created: 0,
       owned_by: 'local',
+      capabilities: ['completion'],
+      supports_thinking: false,
+      thinking_levels: ['on', 'off'],
     });
   });
 });
