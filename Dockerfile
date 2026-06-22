@@ -14,8 +14,7 @@ COPY src ./src
 
 RUN groupadd -g 991 render 2>/dev/null || true; groupadd -r relay && useradd -r -g relay relay && usermod -a -G 44,991 relay || true
 
-ENV HOST=127.0.0.1 \
-    PORT=1234 \
+ENV PORT=1234 \
     UPSTREAM_BASE_URL=http://127.0.0.1:8080/v1 \
     MAX_REQUEST_BODY_BYTES=1048576
 
