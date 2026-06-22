@@ -1,8 +1,25 @@
 {
-  "name": "relay",
+  "name": "@skaft/relay",
   "version": "0.1.4",
-  "description": "Lightweight OpenAI/Anthropic-compatible gateway for local llama.cpp models.",
+  "description": "Lightweight OpenAI/Anthropic-compatible gateway for local llama.cpp models — with a no-jargon setup TUI that sizes models to your hardware, builds llama.cpp for your GPU, and manages Docker for you.",
   "type": "module",
+  "bin": {
+    "relay": "bin/relay.js"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "scripts/",
+    "docs/model-catalog.json",
+    "Dockerfile",
+    "docker-compose.yml",
+    ".dockerignore",
+    "package-lock.json",
+    ".env.example",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
   "scripts": {
     "dev": "node --env-file=.env --watch --experimental-strip-types src/main.ts",
     "start": "node --env-file=.env --experimental-strip-types src/main.ts",
@@ -23,6 +40,36 @@
   "engines": {
     "node": ">=22"
   },
+  "keywords": [
+    "llama.cpp",
+    "llm",
+    "gateway",
+    "openai",
+    "anthropic",
+    "local-ai",
+    "moe",
+    "gguf",
+    "vulkan",
+    "cuda",
+    "inference"
+  ],
+  "author": "Achuthan Mukundan",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/achuthanmukundan00/relay.git"
+  },
+  "homepage": "https://github.com/achuthanmukundan00/relay#readme",
+  "bugs": {
+    "url": "https://github.com/achuthanmukundan00/relay/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "get-east-asian-width": "^1.6.0",
+    "marked": "^18.0.5"
+  },
   "devDependencies": {
     "@chenglou/pretext": "^0.0.6",
     "@types/node": "^25.6.0",
@@ -30,6 +77,5 @@
     "three": "^0.184.0",
     "typescript": "^6.0.3",
     "vitepress": "^1.6.3"
-  },
-  "dependencies": {}
+  }
 }
