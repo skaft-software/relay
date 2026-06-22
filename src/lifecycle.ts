@@ -135,7 +135,9 @@ export class ModelLifecycle {
     // Kill any llama-server processes from previous Relay instances
     // that survived as init orphans (detached spawn). These would
     // otherwise consume VRAM and collide with our port allocations.
-    if (config.lazyModelEnabled) {
+    // Skip when a spawnProcess hook is provided (test harness) — the
+    // hook owns process lifecycle and fuser -k would be destructive.
+    if (config.lazyModelEnabled && !hooks.spawnProcess) {
       try {
         const portBase = config.modelPortBase ?? 8081;
         const portArgs: string[] = [];
