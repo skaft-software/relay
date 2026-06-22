@@ -1,22 +1,16 @@
 /**
- * Terminal capabilities + degradable theme for the Relay setup TUI.
+ * Terminal caps detection + color/glyph degradation for the Relay setup TUI.
  *
- * One detection at module load; everything downstream asks `caps`. The goal is
- * an identical rich look on capable terminals, and a clean, legible fallback on
- * dumb ones:
- *   - colors degrade by depth   (truecolor → 256 → 16 → none)
- *   - glyphs degrade by unicode (rich unicode → ASCII)
- *   - piped / TERM=dumb output emits no escape codes at all
+ * Detects at module load. All rendering asks `caps`:
+ *   - color: truecolor → 256 → 16 → none (NO_COLOR, TERM=dumb, --no-color)
+ *   - glyphs: unicode → ASCII (--ascii, RELAY_ASCII, non-UTF8 locale)
+ *   - plain: no escape codes (pipe, TERM=dumb, --plain)
  *
- * Overrides: `--ascii` / RELAY_ASCII force ASCII glyphs; `--no-color` / NO_COLOR
- * force monochrome; `--plain` forces bare text. FORCE_COLOR/NO_COLOR/TERM=dumb
- * are honored for free via Node's getColorDepth().
+ * Overrides: FORCE_COLOR honored via Node getColorDepth().
  *
- * The color helpers (a, g, c, b, d …) deliberately close with attribute-specific
- * resets (`\x1b[39m` fg-default, `\x1b[22m` intensity-normal) instead of a full
- * `\x1b[0m`. A full reset clears the background too, which shreds the shaded
- * cards into ragged stripes. Attribute-specific resets keep a card's background
- * continuous across every colored span.
+ * Color helpers (a, g, c, b, d) close with attr-specific resets (\x1b[39m fg,
+ * \x1b[22m intensity) — not \x1b[0m — so shaded card backgrounds stay continuous
+ * across colored spans instead of shredding.
  */
 
 type ColorLevel = 'none' | '16' | '256' | 'truecolor';
@@ -144,8 +138,8 @@ export const RULE_CH = caps.unicode ? '─' : '-';
 const GLYPH_FOLD: Array<[string, string]> = [
   ['🖥  ', ''], ['📡  ', ''], ['☁  ', ''], ['🔒  ', ''], ['🌐  ', ''],
   ['🖥 ', ''], ['📡 ', ''], ['☁ ', ''], ['🔒 ', ''], ['🌐 ', ''],
-  ['🎉 ', ''], ['🎉', ''], ['✨', ''], ['👋', ''],
-  ['❯', '>'], ['→', '->'], ['←', '<-'], ['↑', '^'], ['↓', 'v'],
+  ['🎉 ', ''], ['⚡', ''], ['✨', ''], ['👋', ''],
+  ['✦', '+'], ['❯', '>'], ['→', '->'], ['←', '<-'], ['↑', '^'], ['↓', 'v'],
   ['⚠', '!'], ['ｉ', 'i'], ['ℹ', 'i'],
   ['★', '*'], ['●', 'o'], ['○', '.'], ['·', '-'], ['└', '`'],
   ['─', '-'], ['—', '-'], ['–', '-'], ['…', '...'],
