@@ -39,6 +39,11 @@ if (args.includes('--help') || args.includes('-h')) {
     relay keys delete <l>  delete a key by label
     relay doctor           run health & preflight checks
     relay provision        bootstrap/provision a host for relay
+    relay llama            detect/build llama.cpp for your GPU (vulkan/cuda)
+    relay docker           build & manage the gateway as a Docker container
+    relay models           list / download / delete local models
+    relay tunnel           expose the gateway publicly via Cloudflare
+    relay probe            launch a model & measure its real fit (✓ tested)
     relay --version        print version
     relay --help           show this help
 
@@ -96,6 +101,9 @@ if (args[0] === 'setup') {
 } else if (args[0] === 'provision') {
   script = resolve(SRC, 'main.ts');
   scriptArgs = ['provision', ...args.slice(1)];
+} else if (['llama', 'docker', 'models', 'tunnel', 'probe', 'catalog'].includes(args[0])) {
+  script = resolve(SRC, 'main.ts');
+  scriptArgs = [args[0], ...args.slice(1)];
 } else if (args[0] === 'start' || args.length === 0) {
   script = resolve(SRC, 'main.ts');
   scriptArgs = [];
