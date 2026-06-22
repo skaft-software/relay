@@ -3,9 +3,6 @@ import type { Theme } from 'vitepress'
 import DefaultTheme from 'vitepress/theme'
 import RelayLogo from './RelayLogo.vue'
 import RelayBridge from './components/RelayBridge.vue'
-import CompatibilityVisual from './components/CompatibilityVisual.vue'
-import ProblemVisual from './components/ProblemVisual.vue'
-import TerminalBlock from './components/TerminalBlock.vue'
 import './style.css'
 
 export default {
@@ -22,8 +19,6 @@ export default {
     })
   },
   enhanceApp({ app }: { app: App }) {
-    app.component('CompatibilityVisual', CompatibilityVisual)
-    app.component('ProblemVisual', ProblemVisual)
-    app.component('TerminalBlock', TerminalBlock)
+    // global components registered here as needed
   },
 } satisfies Theme

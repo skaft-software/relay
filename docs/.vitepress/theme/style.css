@@ -1,6 +1,16 @@
 /* Relay docs custom styles — infrastructure-oriented theme. */
 
 :root {
+  --relay-bg: #fafafa;
+  --relay-surface: #f4f4f5;
+  --relay-surface-soft: #eaeaec;
+  --relay-border: #d4d4d8;
+  --relay-text: #18181b;
+  --relay-text-muted: #52525b;
+  --relay-steel-rgb: 56 111 178;
+}
+
+.dark {
   --relay-bg: #0a0a0c;
   --relay-surface: #111115;
   --relay-surface-soft: #17171c;
@@ -8,7 +18,36 @@
   --relay-text: #d4d4d8;
   --relay-text-muted: #71717a;
   --relay-steel-rgb: 86 141 208;
+}
 
+/* Delegate to VitePress stock tokens in light mode, custom in dark */
+:root {
+  --vp-c-bg: var(--relay-bg);
+  --vp-c-bg-alt: #f0f0f2;
+  --vp-c-bg-soft: var(--relay-surface);
+  --vp-c-bg-elv: var(--relay-surface-soft);
+  --vp-c-divider: var(--relay-border);
+  --vp-c-gutter: var(--relay-border);
+  --vp-c-text-1: var(--relay-text);
+  --vp-c-text-2: var(--relay-text-muted);
+  --vp-c-text-3: #71717a;
+  --vp-c-brand-1: #386fb2;
+  --vp-c-brand-2: #2d5f9e;
+  --vp-c-brand-3: #1e4a82;
+  --vp-c-brand-soft: rgba(56, 111, 178, 0.14);
+  --vp-button-brand-bg: #386fb2;
+  --vp-button-brand-border: #386fb2;
+  --vp-button-brand-text: #fff;
+  --vp-button-brand-hover-bg: #2d5f9e;
+  --vp-button-brand-hover-border: #2d5f9e;
+  --vp-button-alt-bg: #f4f4f5;
+  --vp-button-alt-border: #d4d4d8;
+  --vp-button-alt-text: #18181b;
+  --vp-button-alt-hover-bg: rgba(56, 111, 178, 0.06);
+  --vp-button-alt-hover-border: rgba(56, 111, 178, 0.24);
+}
+
+.dark {
   --vp-c-bg: var(--relay-bg);
   --vp-c-bg-alt: #08080a;
   --vp-c-bg-soft: var(--relay-surface);
@@ -32,29 +71,6 @@
   --vp-button-alt-text: #d4d4d8;
   --vp-button-alt-hover-bg: rgba(86, 141, 208, 0.08);
   --vp-button-alt-hover-border: rgba(86, 141, 208, 0.34);
-}
-
-.dark {
-  --relay-bg: #0a0a0c;
-  --relay-surface: #111115;
-  --relay-surface-soft: #17171c;
-  --relay-border: #1e1e24;
-  --relay-text: #d4d4d8;
-  --relay-text-muted: #71717a;
-
-  --vp-c-bg: var(--relay-bg);
-  --vp-c-bg-alt: #08080a;
-  --vp-c-bg-soft: var(--relay-surface);
-  --vp-c-bg-elv: var(--relay-surface-soft);
-  --vp-c-divider: var(--relay-border);
-  --vp-c-gutter: var(--relay-border);
-  --vp-c-text-1: var(--relay-text);
-  --vp-c-text-2: var(--relay-text-muted);
-  --vp-c-text-3: #52525b;
-  --vp-c-brand-1: #75a7df;
-  --vp-c-brand-2: #568dd0;
-  --vp-c-brand-3: #467ec2;
-  --vp-c-brand-soft: rgba(86, 141, 208, 0.16);
 }
 
 /* ---- Navbar logo ---- */
@@ -306,7 +322,7 @@
 .relay-terminal {
   --vp-c-text-3: #8b95a5;
 
-  background: #08080a;
+  background: var(--vp-c-bg-alt);
   border: 1px solid var(--relay-border);
   border-radius: 8px;
   overflow: hidden;

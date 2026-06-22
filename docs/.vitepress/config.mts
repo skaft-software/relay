@@ -5,7 +5,7 @@ export default defineConfig({
   description: 'Protocol adapter for local and cloud LLMs — OpenAI and Anthropic compatible',
   base: '/relay/',
   cleanUrls: true,
-  appearance: 'dark',
+  appearance: true,
   themeConfig: {
     siteTitle: '',
     nav: [
