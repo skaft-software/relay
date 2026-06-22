@@ -28,6 +28,9 @@ export type ModelEntry = {
   thinking_levels?: string[];
   /** Fixed port for this model's upstream server. Auto-allocated if unset. */
   port?: number;
+  /** MoE expert-offload flag (e.g. "--cpu-moe" or "--n-cpu-moe 17"). Informational:
+   *  the flag is baked into the generated start script, which the lifecycle execs. */
+  expert_flag?: string;
 };
 
 export type AppConfig = {
