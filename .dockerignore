@@ -1,0 +1,17 @@
+# Keep the build context small + reproducible. The Dockerfile only needs
+# package.json, package-lock.json and src/.
+node_modules
+.git
+tests
+.venv-test
+.pytest_cache
+.hamr
+**/__pycache__
+*.pyc
+*.log
+start-scripts
+.env
+.env.*
+!.env.example
+docs/.vitepress
+releases
