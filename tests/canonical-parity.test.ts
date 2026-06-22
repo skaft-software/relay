@@ -103,8 +103,10 @@ test('canonical response model maps to OpenAI chat, Responses, and Anthropic sha
   const anthropic = canonicalToAnthropicMessage(canonical);
 
   assert.equal(chat.choices[0].message.tool_calls[0].function.name, 'lookup');
+  assert.equal(response.output[0].type, 'message');
   assert.equal(response.output[0].content[0].type, 'output_text');
-  assert.equal(response.output[0].content[1].type, 'function_call');
+  assert.equal(response.output[1].type, 'function_call');
+  assert.equal(response.output[1].name, 'lookup');
   assert.equal(anthropic.content[1].type, 'tool_use');
 });
 

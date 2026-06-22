@@ -327,12 +327,12 @@ test('Spec 12 Responses tool fixtures cover the supported function-tool subset',
     const text = await response.text();
     assert.equal(response.status, 200, text);
     const body = JSON.parse(text);
-    assert.deepEqual(body.output[0].content[0], {
-      type: 'function_call',
-      call_id: 'call_lookup',
-      name: 'lookup',
-      arguments: '{"query":"Relay"}',
-    });
+    const item = body.output[0];
+    assert.equal(item.type, 'function_call');
+    assert.equal(item.call_id, 'call_lookup');
+    assert.equal(item.name, 'lookup');
+    assert.equal(item.arguments, '{"query":"Relay"}');
+    assert.equal(item.status, 'completed');
   });
 });
 
@@ -391,6 +391,11 @@ async function withUpstream(run: (upstream: { url: string; handler: Handler }) =
     },
   };
   const server = createServer(async (req, res) => {
+    // Serve health + models probes that the lifecycle makes during ensureModelAvailable.
+    if (req.method === 'GET' && (req.url === '/health' || req.url === '/v1/models')) {
+      sendJson(res, 200, req.url === '/v1/models' ? { data: [] } : { status: 'ok' });
+      return;
+    }
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(Buffer.from(chunk));
     const text = Buffer.concat(chunks).toString('utf8');

@@ -111,6 +111,7 @@ test('thinking support is reflected in capabilities when model has thinking_leve
     upstream.handler = (_req, res) => sendJson(res, 200, chatCompletion('llama', 'ok'));
     const app = createApp({
       ...testConfig(upstream.url),
+      defaultModel: 'thinking-model',
       modelEntries: {
         'thinking-model': {
           cmd: 'echo test',

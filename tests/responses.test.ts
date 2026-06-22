@@ -35,7 +35,7 @@ test('POST /v1/responses maps string input to chat completion and stores respons
     assert.equal(response.object, 'response');
     assert.equal(response.status, 'completed');
     assert.equal(response.output[0].status, 'completed');
-    assert.deepEqual(response.output[0].content[0], { type: 'output_text', text: 'hi' });
+    assert.deepEqual(response.output[0].content[0], { type: 'output_text', text: 'hi', annotations: [] });
     assert.deepEqual(response.usage, { input_tokens: 2, output_tokens: 1, total_tokens: 3 });
 
     const get = await app.fetch(`/v1/responses/${response.id}`);
@@ -125,8 +125,9 @@ test('POST /v1/responses accepts Responses SDK function tool shape', async () =>
     const text = await res.text();
     assert.equal(res.status, 200, text);
     const body = JSON.parse(text);
-    assert.equal(body.output[0].content[0].type, 'function_call');
-    assert.equal(body.output[0].content[0].name, 'lookup');
+    assert.equal(body.output[0].type, 'function_call');
+    assert.equal(body.output[0].name, 'lookup');
+    assert.equal(body.output[0].call_id, 'call_1');
   });
 });
 
