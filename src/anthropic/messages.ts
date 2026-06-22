@@ -1,4 +1,5 @@
 import { hasValidApiKey } from '../auth.ts';
+import type { ModelLifecycle } from '../lifecycle.ts';
 import type { AppConfig } from '../config.ts';
 import { anthropicError, GatewayError, invalidJsonError, jsonResponse, missingRequiredFieldError, unsupportedCapabilityError, upstreamError } from '../errors.ts';
 import { applyFieldPolicy, withFieldWarning } from '../field-policy.ts';
@@ -13,7 +14,7 @@ import { detectProviderFormat, logInboundDiagnostics, logStreamingResponseDiagno
 
 type JsonObject = Record<string, any>;
 
-export async function handleAnthropicMessages(config: AppConfig, request: Request, externalSignal?: AbortSignal): Promise<Response> {
+export async function handleAnthropicMessages(config: AppConfig, request: Request, externalSignal?: AbortSignal, lifecycle?: ModelLifecycle): Promise<Response> {
   const logger = createLogger(config.logLevel);
   try {
     authorizeAnthropic(config, request);
@@ -21,12 +22,23 @@ export async function handleAnthropicMessages(config: AppConfig, request: Reques
     const { body, strippedFields } = applyFieldPolicy('anthropic_messages', rawBody, config);
     const chatRequest = anthropicRequestToChat(body, config);
     logUpstreamPayloadDiagnostics(logger, { route: '/v1/messages', upstream_route: '/v1/chat/completions', payload: chatRequest });
-    if (body.stream === true) return withFieldWarning(await streamAnthropicMessage(config, chatRequest, externalSignal), strippedFields, config);
+
+    // Ensure lifecycle model is available before proxying upstream.
+    // Only when lifecycle is enabled AND has model entries to manage.
+    const modelName = isObject(body) && typeof (body as any).model === 'string' ? (body as any).model : undefined;
+    let upstreamBaseUrlOverride: string | undefined;
+    if (lifecycle && modelName && config.lazyModelEnabled && config.modelEntries) {
+      const availability = await lifecycle.ensureModelAvailable(modelName, externalSignal);
+      if (!availability.ok) throw upstreamError('unavailable', availability.message ?? 'Model unavailable');
+      upstreamBaseUrlOverride = lifecycle.getUpstreamUrl(modelName);
+    }
+
+    if (body.stream === true) return withFieldWarning(await streamAnthropicMessage(config, chatRequest, externalSignal, upstreamBaseUrlOverride), strippedFields, config);
     const upstreamRes = await upstreamFetch(config, '/v1/chat/completions', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(chatRequest),
-    }, externalSignal);
+    }, externalSignal, upstreamBaseUrlOverride);
     if (!upstreamRes.response.ok) throw await upstreamHttpError(upstreamRes.response, config);
     const upstreamText = await readLimitedText(upstreamRes.response, config.maxUpstreamResponseBytes);
     let chat: unknown;
@@ -222,13 +234,13 @@ function chatCompletionToAnthropicMessage(chat: unknown, requestedModel: unknown
   return canonicalToAnthropicMessage(canonical);
 }
 
-async function streamAnthropicMessage(config: AppConfig, chatRequest: JsonObject, externalSignal?: AbortSignal): Promise<Response> {
+async function streamAnthropicMessage(config: AppConfig, chatRequest: JsonObject, externalSignal?: AbortSignal, upstreamBaseUrlOverride?: string): Promise<Response> {
   const logger = createLogger(config.logLevel);
   const upstream = await upstreamFetch(config, '/v1/chat/completions', {
     method: 'POST',
     headers: { accept: 'text/event-stream', 'content-type': 'application/json' },
     body: JSON.stringify(chatRequest),
-  }, externalSignal);
+  }, externalSignal, upstreamBaseUrlOverride);
   if (!upstream.response.ok || !upstream.response.body) {
     throw upstream.response.body ? await upstreamHttpError(upstream.response, config) : upstreamError('bad_response', 'Upstream returned an empty stream');
   }

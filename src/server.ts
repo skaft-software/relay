@@ -113,7 +113,7 @@ export function createApp(config: AppConfig): App {
           headers,
           body: JSON.stringify(job.request),
         });
-        const response = await handleAnthropicMessages(config, upstreamReq, signal);
+        const response = await handleAnthropicMessages(config, upstreamReq, signal, lifecycle);
         const payload: any = await response.clone().json().catch(async () => ({ text: await response.text() }));
         if (!response.ok) {
           return {
@@ -666,7 +666,7 @@ export function createApp(config: AppConfig): App {
           }
           if (isCloud) {
             response = await withMutex(
-              () => handleAnthropicMessages(config, request, externalSignal),
+              () => handleAnthropicMessages(config, request, externalSignal, lifecycle),
               externalSignal,
             );
           } else {
@@ -675,7 +675,7 @@ export function createApp(config: AppConfig): App {
               () => withLifecycleForStreaming(
                 lifecycle,
                 anthropicModel,
-                () => handleAnthropicMessages(config, request, externalSignal),
+                () => handleAnthropicMessages(config, request, externalSignal, lifecycle),
                 isStream,
                 "anthropic",
                 externalSignal,
