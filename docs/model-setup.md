@@ -1,72 +1,118 @@
 # Setup Wizard
 
-Relay includes an interactive setup wizard and a headless CLI mode for agents and scripts.
+Relay includes an interactive terminal UI (TUI) for guided setup, plus a headless provision command for scripts and agents.
 
-## Interactive (TUI)
+## Interactive Setup
 
 ```bash
-python3 scripts/setup-tui.py
+relay setup
+# or
+node --experimental-strip-types src/main.ts setup
 ```
 
 Arrow keys to navigate, Enter to pick. The wizard:
 
-1. Auto-detects your GPU, VRAM, and RAM
-2. Shows supported modes: local models, cloud API proxy, or BYO (existing server)
-3. For local: finds your GGUF files, sizes them, generates start scripts with optimal flags
-4. For cloud: configures OpenAI, Anthropic, DeepSeek, or Groq as upstreams
-5. Writes `.env` and `docker-compose.yml`
+1. **Detects your hardware** — GPU vendor, VRAM, driver, system RAM
+2. **Presents three modes**: local model (quickstart), cloud API proxy, or BYO (point at existing server)
+3. **For local mode**: shows the model catalog filtered by lane (Coding, General, Reasoning, Vision, MoE, Dense), with fit estimates per model. Pick a model, pick a quant — Relay sizes it for your hardware.
+4. **For cloud**: select a provider (OpenAI, Anthropic, DeepSeek, Groq, Gemini) and enter your API key
+5. **For BYO**: provide your existing server URL and model name
+6. **Configures networking**: localhost-only (safe, use Cloudflare Tunnel for WAN) or bind all interfaces (LAN + Docker)
+7. **Writes** `.env` and generates model start scripts
 
-## Headless (CLI)
+### Model Picker
 
-```bash
-# Auto-detect everything, no questions — re-run anytime to regenerate configs
-python3 scripts/setup-tui.py --auto
+The model picker shows every model in the catalog with:
 
-# Cloud mode
-python3 scripts/setup-tui.py --auto --mode cloud
+- **Fit label** — ✓ fits / ⚠ tight / ✗ no fit, based on your VRAM and the model's quant
+- **IQ badge** (★) — importance-matrix quants (better quality at same file size)
+- **Download marker** — ● on disk / ○ needs download
+- **MoE vs Dense** grouping — MoE models offload experts to system RAM via `--cpu-moe`
+- **Lane filters** — Coding, General, Reasoning, Vision, Long Context, MoE, Dense
 
-# Custom model directory
-python3 scripts/setup-tui.py --auto --models-dir /opt/models
+The fit estimate accounts for your GPU backend (CUDA ~0.6GB overhead, Vulkan ~1GB), host profile (headless server vs desktop), and whether the model is MoE or dense.
 
-# Print model catalog and exit
-python3 scripts/setup-tui.py --list
+### API Key Management
 
-# Show all options
-python3 scripts/setup-tui.py --help
+The Config screen (→ Config in the main menu) shows:
+
+- **View API key** — displays the full key and a copy-paste `models.json` block for hamr
+- **Rotate API key** — generates a new random key, invalidates the old one immediately
+
+For hamr agents, add this to `~/.hamr/agent/models.json`:
+
+```json
+{
+  "providers": {
+    "relay": {
+      "baseUrl": "http://127.0.0.1:1234/v1",
+      "api": "openai-completions",
+      "apiKey": "<your-key>"
+    }
+  }
+}
 ```
 
-The `--auto` flag does the full local setup silently: detect hardware → find llama.cpp → size every GGUF → generate start scripts → write `.env` and `docker-compose.yml`. Start scripts go to `~/.relay/start-scripts/` (or the repo's `start-scripts/` if run from inside a relay checkout).
+Or use hamr's `/login → Use a custom/self-hosted endpoint` flow.
+
+## Headless Provision
+
+```bash
+# Regenerate start scripts for all downloaded GGUFs
+relay provision
+
+# Apply changes (writes scripts, stages .env)
+relay provision --apply
+
+# Show plan without applying
+relay provision --dry-run
+```
+
+The provision command:
+
+1. Scans your model directory for GGUF files
+2. Runs the pure-TypeScript sizing engine on each one
+3. Generates start scripts with optimal flags (GPU layers, KV cache type, MoE offloading, `--jinja`)
+4. Updates `RELAY_MODEL_MAP` in `.env`
 
 ## The Sizing Engine
 
-`size-model.py` reads a GGUF file and computes the maximum safe context size for your specific hardware. The wizard calls this automatically. You can also run it standalone:
+The sizing engine (`src/sizing/size-model.ts`) reads a GGUF file and computes the maximum safe context size for your specific hardware. The setup wizard and provision command call this automatically. It produces:
 
-```bash
-python3 scripts/size-model.py /path/to/model.gguf --json
-```
+- `maxCtx` — maximum safe context window size
+- `launchFlags` — optimal llama-server flags (GPU layers, KV cache type, `--jinja`)
+- `expertFlag` — MoE expert offloading flag (`--cpu-moe` or `--n-cpu-moe N`)
+- `headroomPct` — VRAM safety margin percentage
+- `kvGb` — KV cache memory estimate
 
-Output includes:
-
-- `max_ctx` — maximum safe context window size
-- `launch_flags` — optimal llama-server flags (GPU layers, KV cache type, MoE offloading, `--jinja`)
-- `expert_flag` — MoE expert offloading flag (e.g. `--n-cpu-moe 25`)
-- `headroom_gb` — VRAM safety margin
-- `kv_gb` — KV cache memory estimate
-- `cache_type_k` / `cache_type_v` — recommended KV cache quantization
+For catalog-only estimates (no GGUF on disk yet), per-architecture KV bytes-per-token values provide a fast approximation. Once the GGUF is downloaded, provision re-sizes with real header data (kv_ptok, nonex_frac).
 
 ## Regenerating Configs
 
 After adding new GGUF files to your models directory:
 
 ```bash
-# Backup existing config
-cp .env .env.bak
+# Regenerate start scripts and model map
+relay provision --apply
 
-# Regenerate everything
-python3 scripts/setup-tui.py --auto
-
-# Restart
+# Restart if running in Docker
 docker compose restart
+
+# Or re-run the full setup wizard
+relay setup
 ```
 
-Your model files are never touched. Only `.env`, `docker-compose.yml`, and `start-scripts/` are regenerated.
+Your model files are never touched. Only `.env` and `start-scripts/` are regenerated.
+
+## Other TUI Screens
+
+| Screen | What it does |
+|--------|-------------|
+| Models | Catalog browser — download, delete, or probe (test-launch) models |
+| GPU runtime | Check or build llama.cpp for your GPU backend (Vulkan, CUDA, Metal) |
+| Docker | Build image, start/stop container, view logs |
+| Tunnel | Cloudflare Tunnel — quick (anonymous URL) or named (your domain) |
+| Config | Edit `.env` — bind address, model map, API key, lifecycle settings |
+| Sampling | Set temperature, top_p, penalties |
+| Logs | Tail the relay log file |
+| Doctor | Preflight checks — GPU, llama-server, model files, port binding, API compat |

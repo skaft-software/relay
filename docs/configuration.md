@@ -1,21 +1,24 @@
 # Configuration
 
 Relay is configured via environment variables, typically in a `.env` file.
-The setup wizard writes this for you. Run `python3 scripts/setup-tui.py --auto`
-to regenerate it anytime.
+The setup wizard writes this for you. Run `relay setup` to generate it
+interactively, or `relay provision --apply` to regenerate from downloaded GGUFs.
 
 ## Core
 
 | Variable | Default | Description |
 |---|---|---|
-| `HOST` | `127.0.0.1` | Bind address |
+| `HOST` | `127.0.0.1` | Bind address. Set to `0.0.0.0` for LAN/Docker/tunnel access. |
 | `PORT` | `1234` | Bind port |
 | `UPSTREAM_BASE_URL` | `http://127.0.0.1:8080/v1` | Default upstream when lifecycle is disabled |
 | `DEFAULT_MODEL` | (empty) | Fallback model when client omits model name |
 | `REQUEST_TIMEOUT_SECONDS` | `600` | Upstream request timeout in seconds |
 | `MAX_REQUEST_BODY_BYTES` | `1048576` | Request body size limit |
 | `MAX_UPSTREAM_RESPONSE_BYTES` | `16777216` | Upstream response body limit |
-| `API_KEY` | (empty) | If set, require Bearer or x-api-key on all requests |
+| `API_KEY` | (empty) | If set, require Bearer or x-api-key on all requests. Rotate via TUI Config screen. |
+| `RELAY_MODEL_DIR` | `~/models` | Directory containing GGUF files |
+| `RELAY_LLAMA_SERVER_PATH` | auto-detected | Path to llama-server binary |
+| `RELAY_HOST_PROFILE` | auto-detected | `headless` (server, less VRAM reserved) or `desktop` (workstation, more headroom) |
 
 ## Operating Mode
 
@@ -84,6 +87,7 @@ Each entry:
 - `multimodal` (optional) — `true` if model supports vision
 - `port` (optional) — fixed port (auto-allocated if unset)
 - `thinking_levels` (optional) — `["on"]` or `["on","off"]` for thinking-capable models
+- `expert_flag` (optional) — MoE expert offload flag (`--cpu-moe` or `--n-cpu-moe N`), informational (baked into the start script)
 - `health_url` (optional) — override health check URL
 
 Example:

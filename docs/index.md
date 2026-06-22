@@ -3,155 +3,65 @@ layout: home
 
 hero:
   text: Your GPU can run great AI models.
-  tagline: Your coding agent just can't talk to them. Relay is the missing piece — it detects your hardware, sizes your models, generates perfect configs, and translates every API call so your agent just works.
+  tagline: Relay detects your hardware, sizes your models, generates configs, and translates every API call so your agent just works.
 ---
 
-<div class="relay-section">
+## What Relay Solves
 
-<ProblemVisual />
+### Your agent and your model don't speak the same language.
 
-<div class="relay-pipeline-section">
-  <p class="relay-section-label">How It Works</p>
-  <CompatibilityVisual />
-</div>
+Coding agents expect exact OpenAI or Anthropic API contracts. Your local model speaks something close, but different enough to break things. One missing field, one out-of-order SSE event, one wrong error shape — your agent silently degrades.
 
-<p class="relay-section-label">What Relay Solves</p>
+**Relay translates everything in both directions.** Chat completions, responses, Anthropic messages, tool calls, streaming — normalized to the exact shapes your agent expects. No per-model patches. No agent-side workarounds.
 
-<div class="relay-problem">
-  <div class="relay-problem-copy">
-    <h2>Your agent and your model don't speak the same language.</h2>
-    <p>
-      Coding agents expect exact OpenAI or Anthropic API contracts. Your local model
-      speaks something close, but different enough to break things. One missing field,
-      one out-of-order SSE event, one wrong error shape — your agent silently degrades.
-    </p>
-    <p>
-      <strong>Relay translates everything in both directions.</strong> Chat completions,
-      responses, Anthropic messages, tool calls, streaming — normalized to the exact
-      shapes your agent expects. No per-model patches. No agent-side workarounds.
-    </p>
-  </div>
-</div>
+### Will this model work on my hardware?
 
-<div class="relay-problem">
-  <div class="relay-problem-copy">
-    <h2>Will this model work on my hardware?</h2>
-    <p>
-      You shouldn't need to understand MoE expert offloading, KV cache quantization,
-      or VRAM headroom. You just want to know if a model runs well on your GPU and
-      at what context size.
-    </p>
-    <p>
-      <strong>Relay reads your actual GGUF files, measures your GPU, and computes
-      the optimal flags for YOUR hardware.</strong> It tells you which models fit,
-      at what context size, before you start anything. No guesswork.
-    </p>
-  </div>
-</div>
+You shouldn't need to understand MoE expert offloading, KV cache quantization, or VRAM headroom. You just want to know if a model runs well on your GPU and at what context size.
 
-<div class="relay-problem">
-  <div class="relay-problem-copy">
-    <h2>Getting local models working takes hours.</h2>
-    <p>
-      Find the GGUF. Download it. Figure out flags. Set up llama.cpp. Write a start
-      script. Configure ports. Choose KV cache quantization. Test. Fix. Repeat.
-    </p>
-    <p>
-      <strong>Relay's setup wizard does it all in one command.</strong> It finds your
-      GGUF files, sizes each one, generates start scripts with every flag dialed in,
-      and writes your config. Re-run <code>--auto</code> anytime you add new models.
-    </p>
-  </div>
-</div>
+**Relay reads your actual GGUF files, measures your GPU, and computes optimal flags for YOUR hardware.** It tells you which models fit, at what context size, before you start anything. No guesswork.
 
-<p class="relay-section-label">Capabilities</p>
+### Getting local models working takes hours.
 
-<h2 class="relay-section-title">Everything your agent expects, from any backend</h2>
+Find the GGUF. Download it. Figure out flags. Set up llama.cpp. Write a start script. Configure ports. Choose KV cache quantization. Test. Fix. Repeat.
 
-<div class="relay-norm-grid">
+**Relay's setup wizard does it all.** It finds your GGUF files, sizes each one, generates start scripts with every flag dialed in, and writes your config. Re-run anytime you add new models.
 
-<div class="relay-norm-card">
-  <span class="relay-norm-card-icon">▸</span>
-  <span class="relay-norm-card-label">OpenAI + Anthropic APIs</span>
-</div>
+## Capabilities
 
-<div class="relay-norm-card">
-  <span class="relay-norm-card-icon">▸</span>
-  <span class="relay-norm-card-label">Streaming SSE normalization</span>
-</div>
+- OpenAI `/v1/chat/completions` + Anthropic `/v1/messages` APIs
+- Streaming SSE normalization
+- Tool call compatibility (both protocols)
+- Error shape normalization (both protocols)
+- Auto model start / stop / switch (lazy lifecycle)
+- Session-aware context isolation
+- Cloud API proxy mode (OpenAI, Anthropic, DeepSeek, Groq, Gemini)
+- Hardware-aware auto-setup (GPU detection, VRAM sizing, MoE expert offload)
+- HTML status dashboard at `/`
+- Health, metrics, observability endpoints
+- Docker + one-liner install
 
-<div class="relay-norm-card">
-  <span class="relay-norm-card-icon">▸</span>
-  <span class="relay-norm-card-label">Tool call compatibility</span>
-</div>
+## Two Ways to Run
 
-<div class="relay-norm-card">
-  <span class="relay-norm-card-icon">▸</span>
-  <span class="relay-norm-card-label">Error shape normalization</span>
-</div>
+**Gateway mode** manages local llama.cpp models — auto-detects your GPU, sizes every GGUF, generates start scripts, and handles the full lifecycle.
 
-<div class="relay-norm-card">
-  <span class="relay-norm-card-icon">▸</span>
-  <span class="relay-norm-card-label">Auto model start / stop / switch</span>
-</div>
+**Cloud mode** proxies OpenAI, Anthropic, DeepSeek, Groq, or Gemini through a single endpoint. Same API surface either way. Your agent doesn't know or care where the model lives.
 
-<div class="relay-norm-card">
-  <span class="relay-norm-card-icon">▸</span>
-  <span class="relay-norm-card-label">Session-aware context isolation</span>
-</div>
-
-<div class="relay-norm-card">
-  <span class="relay-norm-card-icon">▸</span>
-  <span class="relay-norm-card-label">Cloud API proxy mode</span>
-</div>
-
-<div class="relay-norm-card">
-  <span class="relay-norm-card-icon">▸</span>
-  <span class="relay-norm-card-label">Hardware-aware auto-setup</span>
-</div>
-
-<div class="relay-norm-card">
-  <span class="relay-norm-card-icon">▸</span>
-  <span class="relay-norm-card-label">HTML status dashboard</span>
-</div>
-
-<div class="relay-norm-card">
-  <span class="relay-norm-card-icon">▸</span>
-  <span class="relay-norm-card-label">Health, metrics, observability</span>
-</div>
-
-<div class="relay-norm-card">
-  <span class="relay-norm-card-icon">▸</span>
-  <span class="relay-norm-card-label">Docker + one-liner install</span>
-</div>
-
-</div>
-
-<div class="relay-callout">
-  <div class="relay-callout-label">Two ways to run</div>
-  <p><strong>Gateway mode</strong> manages local llama.cpp models — auto-detects your GPU, sizes every GGUF, generates start scripts, and handles the full lifecycle. <strong>Cloud mode</strong> proxies OpenAI, Anthropic, DeepSeek, or Groq through a single endpoint. Same API surface either way. Your agent doesn't know or care where the model lives.</p>
-</div>
-
-<p class="relay-section-label">Quickstart</p>
-
-<TerminalBlock>
+## Quickstart
 
 ```bash
-# One command. That's it.
-curl -fsSL https://raw.githubusercontent.com/achuthanmukundan00/relay/main/scripts/install.sh | bash
+# Clone and run the setup wizard
+git clone https://github.com/achuthanmukundan00/relay
+cd relay
+npm install
+node --experimental-strip-types src/main.ts setup
 
-# After setup, start Relay
+# Or run directly
+npx relay setup
+
+# After setup, start
 docker compose up -d
 
 # Point your agent at  http://127.0.0.1:1234/v1
 ```
 
-</TerminalBlock>
-
-<div class="relay-note">
-  <strong>Already have an agent runtime?</strong> Relay works underneath any OpenAI or Anthropic-compatible client — opencode, Cursor, Claude Code, Continue, Aider, and more. Point them at <code>http://127.0.0.1:1234/v1</code>.
-</div>
-
-</div>
-
-<hr class="relay-divider" />
+Already have an agent runtime? Relay works underneath any OpenAI or Anthropic-compatible client — opencode, Cursor, Claude Code, Continue, Aider, and more. Point them at `http://127.0.0.1:1234/v1`.
