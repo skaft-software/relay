@@ -1,5 +1,5 @@
 import type { AppConfig } from '../config.ts';
-import { invalidRequestError } from '../errors.ts';
+import { invalidRequestError, unsupportedCapabilityError } from '../errors.ts';
 import { normalizeMessages } from '../normalize/messages.ts';
 import { normalizeTools } from '../normalize/tools.ts';
 import { normalizeOpenAIResponseFormat } from '../openai/response-format.ts';
@@ -185,12 +185,9 @@ function normalizeResponseInputMessage(message: unknown): unknown {
 }
 function rejectHostedResponsesTools(tools: unknown): void {
   if (!Array.isArray(tools)) return;
-  const before = tools.length;
-  const arr = tools;
-  for (let i = arr.length - 1; i >= 0; i--) {
-    const tool = arr[i];
-    if (isObject(tool) && typeof tool.type === "string" && tool.type !== "function") {
-      arr.splice(i, 1);
+  for (const tool of tools) {
+    if (isObject(tool) && typeof tool.type === 'string' && tool.type !== 'function') {
+      throw unsupportedCapabilityError(`${tool.type} tools are not supported by this local llama.cpp backend`);
     }
   }
 }
