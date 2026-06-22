@@ -5,8 +5,10 @@ import { runSetup } from './setup.ts';
 import { runPreflight, printPreflight } from './preflight.ts';
 
 if (process.argv[2] === 'setup' || process.argv[2] === 'menu' || process.argv[2] === 'tui') {
+  // The TUI is event-driven — runSetup() starts it and returns immediately.
+  // Keep the process alive until the TUI calls process.exit() itself on quit.
   await runSetup();
-  process.exit(0);
+  await new Promise(() => {});
 }
 
 if (process.argv[2] === 'provision') {

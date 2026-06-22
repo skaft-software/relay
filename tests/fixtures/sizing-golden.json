@@ -1,0 +1,269 @@
+[
+ {
+  "path": "apodex-1.0-4b-sft-q8_0.gguf",
+  "meta": {
+   "arch": "qwen35",
+   "nl": 33,
+   "nkv": 4,
+   "kl": 256,
+   "emb": 2560,
+   "nexp": 0,
+   "nact": 0,
+   "train_ctx": 262144,
+   "swa_window": null,
+   "swa_pattern": null,
+   "fsize": 4610580256
+  },
+  "analyze": {
+   "nonex": 4610580256,
+   "exp": 0,
+   "kv_ptok": 38016.0,
+   "n_kv": 33,
+   "n_cache": 33,
+   "fsize": 4610580256
+  },
+  "cases": [
+   {
+    "vram_gb": 15,
+    "best_ctx": 255329,
+    "n_cpu_moe": 0,
+    "cpu_moe": false,
+    "headroom_pct": 5.0,
+    "kv_gb": 9.04,
+    "exp_gpu": 0.0,
+    "exp_cpu": 0.0
+   },
+   {
+    "vram_gb": 24,
+    "best_ctx": 262144,
+    "n_cpu_moe": 0,
+    "cpu_moe": false,
+    "headroom_pct": 40.719,
+    "kv_gb": 9.2812,
+    "exp_gpu": 0.0,
+    "exp_cpu": 0.0
+   },
+   {
+    "vram_gb": 8,
+    "best_ctx": 67504,
+    "n_cpu_moe": 0,
+    "cpu_moe": false,
+    "headroom_pct": 5.0,
+    "kv_gb": 2.39,
+    "exp_gpu": 0.0,
+    "exp_cpu": 0.0
+   }
+  ]
+ },
+ {
+  "path": "GLM-4.7-Flash-REAP-23B-A3B-UD-Q4_K_XL.gguf",
+  "meta": {
+   "arch": "deepseek2",
+   "nl": 47,
+   "nkv": 1,
+   "kl": 576,
+   "emb": 2048,
+   "nexp": 48,
+   "nact": 4,
+   "train_ctx": 202752,
+   "swa_window": null,
+   "swa_pattern": null,
+   "fsize": 14244202208
+  },
+  "analyze": {
+   "nonex": 1065512195,
+   "exp": 13178690013,
+   "kv_ptok": 15228.0,
+   "n_kv": 47,
+   "n_cache": 47,
+   "fsize": 14244202208
+  },
+  "cases": [
+   {
+    "vram_gb": 15,
+    "best_ctx": 202752,
+    "n_cpu_moe": 11,
+    "cpu_moe": false,
+    "headroom_pct": 6.614,
+    "kv_gb": 2.8755,
+    "exp_gpu": 9.4011,
+    "exp_cpu": 2.8725
+   },
+   {
+    "vram_gb": 24,
+    "best_ctx": 202752,
+    "n_cpu_moe": 0,
+    "cpu_moe": false,
+    "headroom_pct": 30.396,
+    "kv_gb": 2.8755,
+    "exp_gpu": 12.2736,
+    "exp_cpu": 0.0
+   },
+   {
+    "vram_gb": 8,
+    "best_ctx": 202752,
+    "n_cpu_moe": 36,
+    "cpu_moe": false,
+    "headroom_pct": 6.496,
+    "kv_gb": 2.8755,
+    "exp_gpu": 2.8725,
+    "exp_cpu": 9.4011
+   }
+  ]
+ },
+ {
+  "path": "gemma-4-E4B-it-Q4_K_M.gguf",
+  "meta": {
+   "arch": "gemma4",
+   "nl": 42,
+   "nkv": 2,
+   "kl": 512,
+   "emb": 2560,
+   "nexp": 0,
+   "nact": 0,
+   "train_ctx": 131072,
+   "swa_window": 512,
+   "swa_pattern": [
+    true,
+    true,
+    true,
+    true,
+    true,
+    false,
+    true,
+    true,
+    true,
+    true,
+    true,
+    false,
+    true,
+    true,
+    true,
+    true,
+    true,
+    false,
+    true,
+    true,
+    true,
+    true,
+    true,
+    false,
+    true,
+    true,
+    true,
+    true,
+    true,
+    false,
+    true,
+    true,
+    true,
+    true,
+    true,
+    false,
+    true,
+    true,
+    true,
+    true,
+    true,
+    false
+   ],
+   "fsize": 4977169568
+  },
+  "analyze": {
+   "nonex": 4977169568,
+   "exp": 0,
+   "kv_ptok": 28224.0,
+   "n_kv": 42,
+   "n_cache": 42,
+   "fsize": 4977169568
+  },
+  "cases": [
+   {
+    "vram_gb": 15,
+    "best_ctx": 131072,
+    "n_cpu_moe": 0,
+    "cpu_moe": false,
+    "headroom_pct": 41.715,
+    "kv_gb": 3.4453,
+    "exp_gpu": 0.0,
+    "exp_cpu": 0.0
+   },
+   {
+    "vram_gb": 24,
+    "best_ctx": 131072,
+    "n_cpu_moe": 0,
+    "cpu_moe": false,
+    "headroom_pct": 64.266,
+    "kv_gb": 3.4453,
+    "exp_gpu": 0.0,
+    "exp_cpu": 0.0
+   },
+   {
+    "vram_gb": 8,
+    "best_ctx": 77286,
+    "n_cpu_moe": 0,
+    "cpu_moe": false,
+    "headroom_pct": 5.0,
+    "kv_gb": 2.0315,
+    "exp_gpu": 0.0,
+    "exp_cpu": 0.0
+   }
+  ]
+ },
+ {
+  "path": "Qwen3.6-27B-UD-Q2_K_XL.gguf",
+  "meta": {
+   "arch": "qwen35",
+   "nl": 64,
+   "nkv": 4,
+   "kl": 256,
+   "emb": 5120,
+   "nexp": 0,
+   "nact": 0,
+   "train_ctx": 262144,
+   "swa_window": null,
+   "swa_pattern": null,
+   "fsize": 11849779424
+  },
+  "analyze": {
+   "nonex": 11849779424,
+   "exp": 0,
+   "kv_ptok": 73728.0,
+   "n_kv": 64,
+   "n_cache": 64,
+   "fsize": 11849779424
+  },
+  "cases": [
+   {
+    "vram_gb": 15,
+    "best_ctx": 28557,
+    "n_cpu_moe": 0,
+    "cpu_moe": false,
+    "headroom_pct": 5.0,
+    "kv_gb": 1.9609,
+    "exp_gpu": 0.0,
+    "exp_cpu": 0.0
+   },
+   {
+    "vram_gb": 24,
+    "best_ctx": 153075,
+    "n_cpu_moe": 0,
+    "cpu_moe": false,
+    "headroom_pct": 5.0,
+    "kv_gb": 10.5108,
+    "exp_gpu": 0.0,
+    "exp_cpu": 0.0
+   },
+   {
+    "vram_gb": 8,
+    "best_ctx": 0,
+    "n_cpu_moe": 0,
+    "cpu_moe": false,
+    "headroom_pct": 0,
+    "kv_gb": 0,
+    "exp_gpu": 0,
+    "exp_cpu": 0
+   }
+  ]
+ }
+]

@@ -1,0 +1,28 @@
+# Defense-in-depth alongside package.json "files" (which is the primary
+# allowlist). This denies junk that could slip through inside whitelisted
+# dirs (src/, scripts/, etc.).
+
+# Editor/backup cruft — never ship
+**/*.bak
+**/*.bak-*
+**/*.swp
+**/*.orig
+**/*~
+
+# Local secrets/state — never ship
+.env
+.env.*
+!.env.example
+start-scripts/
+*.log
+
+# Test + tooling artifacts
+tests/
+node_modules/
+.hamr/
+.venv-test/
+__pycache__/
+*.pyc
+.pytest_cache/
+test-results/
+docs/.vitepress/

@@ -1,681 +1,996 @@
-import { createInterface } from 'node:readline/promises';
-import { stdin as input, stdout as output } from 'node:process';
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { resolve, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { execFileSync } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+/**
+ * Relay Setup TUI — friendly, no-jargon setup wizard.
+ *
+ * Built on sexy-tui-rs for flicker-free differential rendering.
+ * Design: horizontal lines + shaded cards (no vertical borders/rounded boxes).
+ * Personality: "no jargon required" — matches the old Python setup TUI spirit.
+ */
+import { createHash } from 'node:crypto';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
 
-type CatalogEntry = {
-  id: string;
-  label: string;
-  family: string;
-  lane: string;
-  ctx: number;
-  vision: boolean;
-  thinking: 'off' | 'on' | 'toggle';
-  quant: string;
-  size_gb?: number;
-  download_url?: string;
-  filename?: string;
-};
+import { TUI, ProcessTerminal, Container, Text, Box, Spacer, Input, type Component, type Focusable, CURSOR_MARKER, matchesKey } from './tui/index.ts';
+import { truncateToWidth, visibleWidth, applyBackgroundToLine } from './tui/utils.ts';
 
-type EnvMap = Map<string, string>;
-type GpuProbe = {
-  gpu_type: string;
-  driver: string;
-  vram_total_gb: number;
-  vram_free_gb: number;
-};
+import * as L from './setup-logic.ts';
+import { resolve } from 'node:path';
+import type { CatalogEntry, EnvMap, GpuProbe, FitClass } from './setup-logic.ts';
 
-type FitClass = 'full-gpu' | 'partial-offload' | 'too-large' | 'unknown';
+// ── Theme ───────────────────────────────────────────────────────────────
+// Colors, glyphs, and the logo all degrade with terminal capabilities; see
+// setup-theme.ts. Color helpers close with attribute-specific resets so shaded
+// card backgrounds stay continuous across colored spans.
 
-const DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const ENV_PATH = resolve(DIR, '.env');
-const EXAMPLE_PATH = resolve(DIR, '.env.example');
-const CATALOG_PATH = resolve(DIR, 'docs', 'model-catalog.json');
-const START_SCRIPTS_DIR = resolve(DIR, 'start-scripts');
-const PROBE_GPU_PATH = resolve(DIR, 'scripts', 'probe-gpu.sh');
+import {
+  ACCENT_BG, GREEN, YELLOW, RED, DIM, RESET, INVERSE,
+  a, g, y, r, c, b, d, w, gB, yB, cB, LOGO, RULE_CH, fold,
+} from './setup-theme.ts';
 
-const MODEL_VRAM_ESTIMATES: Record<string, number> = {
-  'devstral-2-24b': 14,
-  'gemma-4-26b': 14,
-  'gemma-4-26b-q2': 10,
-  'gemma-4-26b-q4': 16,
-  'gemma-4-31b': 18,
-  'glm-4.7-flash': 9,
-  'glm-4.7-flash-iq3': 7,
-  'glm-4.7-flash-q2': 8,
-  'glm-4.7-flash-q4km': 13,
-  'glm-4.7-flash-q4xl': 14,
-  'hypernova-60b-q2': 29,
-  'north-mini-code': 6,
-  'qwen3.6-27b': 11,
-  'qwen3-thinking-30b': 12,
-  'qwen3.6-35b-a3b': 8,
-  'qwen3.6-35b-a3b-mtp': 9,
-  'qwen3.6-35b-a3b-q2': 12,
-  'qwen3.6-35b-a3b-q3': 16,
-  'qwen3.6-35b-a3b-q4': 21,
-  'qwen3-coder-30b': 13,
-  'qwen3-coder-30b-q3': 14,
-  'qwen3-coder-30b-q4': 17,
-  'qwen3-coder-next': 18,
-  'qwen3-coder-next-iq2': 22,
-  'qwen3-next-80b': 25,
-};
+// ── Custom components ───────────────────────────────────────────────────
 
-const SYSTEM_RAM_GB = detectSystemRamGb();
-
-// ── ANSI helpers ────────────────────────────────────────────────────────
-
-const C = {
-  reset: '\x1b[0m',
-  bold: '\x1b[1m',
-  dim: '\x1b[2m',
-  italic: '\x1b[3m',
-  cyan: '\x1b[36m',
-  green: '\x1b[32m',
-  yellow: '\x1b[33m',
-  red: '\x1b[31m',
-  magenta: '\x1b[35m',
-  blue: '\x1b[34m',
-};
-
-function line(text = ''): void {
-  output.write(text + '\n');
+/** Horizontal separator line. */
+class HRule implements Component {
+  private ch: string;
+  private color: string;
+  constructor(ch = RULE_CH, color = DIM) {
+    this.ch = ch;
+    this.color = color;
+  }
+  invalidate(): void {}
+  render(width: number): string[] {
+    return [fold(`${this.color}${this.ch.repeat(width)}${RESET}`)];
+  }
 }
 
-function section(title: string): void {
-  line();
-  line(`  ${C.bold}${C.cyan}◆ ${title}${C.reset}`);
-  line(`  ${C.dim}${'─'.repeat(Math.min(title.length + 4, 56))}${C.reset}`);
-}
+/** Shaded card — horizontal lines top/bottom, dim background fill. No vertical borders. */
+class Card implements Component {
+  private children: Component[] = [];
+  private padX: number;
+  private padY: number;
+  private bgFn: (text: string) => string;
 
-function check(text: string): void {
-  line(`  ${C.green}✔${C.reset} ${text}`);
-}
+  constructor(padX = 2, padY = 1, bgFn?: (text: string) => string) {
+    this.padX = padX;
+    this.padY = padY;
+    this.bgFn = bgFn ?? ((s: string) => `${ACCENT_BG}${s}${RESET}`);
+  }
 
-function warn(text: string): void {
-  line(`  ${C.yellow}⚠${C.reset} ${text}`);
-}
+  addChild(child: Component): void {
+    this.children.push(child);
+  }
 
-function info(text: string): void {
-  line(`  ${C.blue}ｉ${C.reset} ${text}`);
-}
+  invalidate(): void {
+    for (const c of this.children) c.invalidate?.();
+  }
 
-function fail(text: string): void {
-  line(`  ${C.red}✘${C.reset} ${text}`);
-}
+  render(width: number): string[] {
+    const contentWidth = Math.max(1, width - this.padX * 2);
+    const leftPad = ' '.repeat(this.padX);
+    const lines: string[] = [];
 
-// ── Main ────────────────────────────────────────────────────────────────
-
-export async function runSetup(): Promise<void> {
-  const rl = createInterface({ input, output });
-  try {
-    banner();
-
-    // Seed .env from example if missing
-    if (!existsSync(ENV_PATH) && existsSync(EXAMPLE_PATH)) {
-      copyFileSync(EXAMPLE_PATH, ENV_PATH);
-      check('.env created from .env.example');
+    // Top padding
+    for (let i = 0; i < this.padY; i++) {
+      lines.push(applyBackgroundToLine(' '.repeat(width), width, this.bgFn));
     }
 
-    const env = parseEnv(readFileSync(ENV_PATH, 'utf8'));
+    // Children
+    for (const child of this.children) {
+      for (const line of child.render(contentWidth)) {
+        lines.push(applyBackgroundToLine(leftPad + line + ' '.repeat(Math.max(0, contentWidth - visibleWidth(line))), width, this.bgFn));
+      }
+    }
 
-    const mode = await choose(rl, 'How do you want to use Relay?', [
-      { label: 'Quick start — pick a model, auto-configure', value: 'quickstart' },
-      { label: 'Connect an existing OpenAI-compatible server', value: 'byo' },
-      { label: 'Cloud fallback (Gemini, etc.)', value: 'cloud' },
-      { label: 'Exit', value: 'exit' },
+    // Bottom padding
+    for (let i = 0; i < this.padY; i++) {
+      lines.push(applyBackgroundToLine(' '.repeat(width), width, this.bgFn));
+    }
+
+    return lines;
+  }
+}
+
+/** Menu list — arrow-key navigation with inverse-video selection bar. */
+class MenuList implements Component, Focusable {
+  private items: Array<{ label: string; desc?: string; value: string }>;
+  private idx = 0;
+  private maxVisible: number;
+  focused = false;
+  onSelect?: (value: string) => void;
+  onCancel?: () => void;
+
+  constructor(items: Array<{ label: string; desc?: string; value: string }>, maxVisible = 10) {
+    this.items = items;
+    this.maxVisible = maxVisible;
+  }
+
+  invalidate(): void {}
+
+  render(width: number): string[] {
+    const lines: string[] = [];
+    const start = Math.max(0, Math.min(this.idx - Math.floor(this.maxVisible / 2), this.items.length - this.maxVisible));
+    const end = Math.min(start + this.maxVisible, this.items.length);
+
+    for (let i = start; i < end; i++) {
+      const item = this.items[i]!;
+      const selected = i === this.idx;
+      const pointer = selected ? `${a(b('❯'))}` : ' ';
+      const label = selected ? `${INVERSE} ${item.label} ${RESET}` : item.label;
+      lines.push(`  ${pointer} ${label}`);
+      if (item.desc) {
+        lines.push(`     ${d(item.desc)}`);
+      }
+    }
+
+    if (this.items.length > this.maxVisible) {
+      lines.push(d(`  (${this.idx + 1}/${this.items.length})`));
+    }
+
+    return lines.map(fold);
+  }
+
+  handleInput(data: string): void {
+    if (matchesKey(data, 'up') || matchesKey(data, 'k')) {
+      this.idx = (this.idx - 1 + this.items.length) % this.items.length;
+    } else if (matchesKey(data, 'down') || matchesKey(data, 'j')) {
+      this.idx = (this.idx + 1) % this.items.length;
+    } else if (matchesKey(data, 'enter')) {
+      this.onSelect?.(this.items[this.idx]!.value);
+    } else if (matchesKey(data, 'escape') || matchesKey(data, 'q') || matchesKey(data, 'ctrl+c')) {
+      this.onCancel?.();
+    }
+  }
+}
+
+/** Labeled input field with prompt text. */
+class LabeledInput implements Component, Focusable {
+  private input: Input;
+  private label: string;
+  focused = false;
+  onSubmit?: (value: string) => void;
+  onCancel?: () => void;
+
+  constructor(label: string, placeholder = '') {
+    this.label = label;
+    this.input = new Input();
+    if (placeholder) this.input.setValue(placeholder);
+    this.input.onSubmit = (v) => this.onSubmit?.(v);
+    this.input.onEscape = () => this.onCancel?.();
+  }
+
+  getValue(): string {
+    return this.input.getValue();
+  }
+
+  setValue(v: string): void {
+    this.input.setValue(v);
+  }
+
+  setFocused(v: boolean): void {
+    this.input.focused = v;
+  }
+  getFocused(): boolean {
+    return this.input.focused;
+  }
+
+  invalidate(): void {
+    this.input.invalidate();
+  }
+
+  handleInput(data: string): void {
+    this.input.handleInput(data);
+  }
+
+  render(width: number): string[] {
+    const inputLines = this.input.render(width);
+    if (!this.label) return inputLines;
+    return [fold(`  ${b(this.label)}`), ...inputLines];
+  }
+}
+
+/** Static text block with padding. */
+class Block implements Component {
+  private lines: string[];
+  constructor(lines: string[]) {
+    this.lines = lines;
+  }
+  invalidate(): void {}
+  render(_width: number): string[] {
+    return this.lines.map(fold);
+  }
+}
+
+// ── TUI App ─────────────────────────────────────────────────────────────
+
+type Screen =
+  | 'welcome'
+  | 'menu'
+  | 'setup-mode'
+  | 'setup-models'
+  | 'setup-network'
+  | 'setup-summary'
+  | 'models'
+  | 'config'
+  | 'params'
+  | 'logs'
+  | 'doctor'
+  | 'about';
+
+class RelayTUI {
+  private tui: TUI;
+  private terminal: ProcessTerminal;
+  private screen: Screen = 'welcome';
+  private gpu: GpuProbe | undefined;
+  private hwLabel = 'your machine';
+  private env: EnvMap;
+  private setupMode: 'quickstart' | 'byo' | 'cloud' = 'quickstart';
+  private selectedModels: CatalogEntry[] = [];
+  private modelDir = '';
+  private llamaServerPath = '';
+  private networkMode: 'local' | 'expose' = 'local';
+
+  constructor() {
+    this.terminal = new ProcessTerminal();
+    this.tui = new TUI(this.terminal);
+    this.env = L.seedEnv();
+    this.gpu = L.probeGpu();
+    this.hwLabel = this.detectHwLabel();
+    this.modelDir = this.env.get('RELAY_MODEL_DIR') ?? L.resolveHome('~/models');
+    this.llamaServerPath = this.env.get('RELAY_LLAMA_SERVER_PATH') ?? L.detectLlamaServerPath();
+
+    // Ctrl+C exits from anywhere
+    this.tui.addInputListener((data) => {
+      if (matchesKey(data, 'ctrl+c')) {
+        this.quit();
+        return { consume: true };
+      }
+      return undefined;
+    });
+  }
+
+  private detectHwLabel(): string {
+    if (this.gpu) {
+      const vram = this.gpu.vram_total_gb;
+      return `${this.gpu.gpu_type} (${vram} GB VRAM)`;
+    }
+    return 'CPU only';
+  }
+
+  private hwVerdict(): string {
+    if (!this.gpu) return yB('modest — we\'ll find a small model that runs great.');
+    const budget = this.gpu.vram_total_gb;
+    if (budget >= 22) return gB('plenty of room — you can run big, smart models.');
+    if (budget >= 12) return gB('a comfy amount — solid coding models will fly.');
+    if (budget >= 7) return cB('enough for a capable everyday model.');
+    return yB('modest, but we\'ll find a small model that runs great.');
+  }
+
+  private vramStr(): string {
+    return this.gpu ? `${this.gpu.vram_total_gb} GB GPU memory` : 'no dedicated GPU';
+  }
+
+  // ── Screen rendering ──────────────────────────────────────────────────
+
+  private renderScreen(): void {
+    this.tui.clear();
+    const build = this.screenBuilder();
+    for (const comp of build) {
+      this.tui.addChild(comp);
+    }
+    // Focus the last focusable component (usually the menu/input)
+    const focusable = build.findLast((c): c is Component & Focusable => 'focused' in c);
+    this.tui.setFocus(focusable ?? null);
+    this.tui.requestRender(true);
+  }
+
+  private screenBuilder(): Component[] {
+    switch (this.screen) {
+      case 'welcome': return this.screenWelcome();
+      case 'menu': return this.screenMenu();
+      case 'setup-mode': return this.screenSetupMode();
+      case 'setup-models': return this.screenSetupModels();
+      case 'setup-network': return this.screenSetupNetwork();
+      case 'setup-summary': return this.screenSetupSummary();
+      case 'models': return this.screenModels();
+      case 'config': return this.screenConfig();
+      case 'params': return this.screenParams();
+      case 'logs': return this.screenLogs();
+      case 'doctor': return this.screenDoctor();
+      case 'about': return this.screenAbout();
+    }
+  }
+
+  private navigate(screen: Screen): void {
+    this.screen = screen;
+    this.renderScreen();
+  }
+
+  // ── Welcome ───────────────────────────────────────────────────────────
+
+  private screenWelcome(): Component[] {
+    const comps: Component[] = [];
+    // Logo — accent only, never bold: bolding block/box-drawing glyphs makes
+    // most terminal fonts double-strike them into a ghosted smear.
+    for (const ln of LOGO) {
+      comps.push(new Block([`  ${a(ln)}`]));
+    }
+    comps.push(new Block([`  ${c('       your friendly model gateway — no jargon required')}`]));
+    comps.push(new Spacer(1));
+
+    // Hardware card. Specs use readable colors on the blue fill — accent-on-accent
+    // is invisible, and the connector reads in default fg rather than dim.
+    const card = new Card(2, 1);
+    card.addChild(new Block([
+      `  ${gB('●')} ${b(w(this.hwLabel))}   ${w(this.vramStr())}   ${w(`${L.SYSTEM_RAM_GB} GB RAM`)}`,
+      `  ${w('└')} ${this.hwVerdict()}`,
+    ]));
+    comps.push(card);
+    comps.push(new Spacer(1));
+
+    // Greeting
+    comps.push(new Block([
+      `  ${a(b('Hey there 👋'))}`,
+      ``,
+      `  ${d('I turn your consumer GPU into an agentic inference server.')}`,
+      `  ${d('Or proxy cloud APIs — OpenAI, Anthropic, DeepSeek, Groq — through one endpoint.')}`,
+      `  ${d('No jargon — I work out what fits your hardware so models run fast and never OOM.')}`,
+      ``,
+      `  ${d('Press ')}${a(b('Enter'))}${d(' to get started.')}`,
+    ]));
+
+    // Input to proceed
+    const proceed = new LabeledInput('', '');
+    proceed.onSubmit = () => this.navigate('menu');
+    proceed.onCancel = () => this.quit();
+    comps.push(proceed);
+
+    return comps;
+  }
+
+  // ── Main menu ─────────────────────────────────────────────────────────
+
+  private miniHeader(): string[] {
+    const mode = this.env.get('RELAY_MODE') ?? 'gateway';
+    const model = this.env.get('DEFAULT_MODEL') || '—';
+    const life = this.env.get('RELAY_MODEL_LIFECYCLE_ENABLED') === 'true' ? 'on' : 'off';
+    return [
+      `  ${d('relay')} ${d('·')} ${this.hwLabel} ${d('·')} ${this.vramStr()} ${d('·')} ${L.SYSTEM_RAM_GB} GB RAM`,
+      `  ${d(mode)} ${d('→')} ${c(L.endpoint(this.env))} ${d('·')} ${model} ${d('·')} lifecycle ${life}`,
+    ];
+  }
+
+  private screenMenu(): Component[] {
+    const comps: Component[] = [];
+    comps.push(new Block(this.miniHeader()));
+    comps.push(new HRule());
+    comps.push(new Spacer(1));
+
+    comps.push(new Block([`  ${a(b('What do you want to do?'))}`]));
+    comps.push(new Spacer(1));
+
+    const menu = new MenuList([
+      { label: 'Setup', desc: 'guided model & endpoint configuration — start here', value: 'setup' },
+      { label: 'Models', desc: 'browse the catalog and see what\'s active', value: 'models' },
+      { label: 'Config', desc: 'core environment settings', value: 'config' },
+      { label: 'Parameters', desc: 'sampling defaults (temperature, top_p, etc.)', value: 'params' },
+      { label: 'Logs', desc: 'recent gateway activity', value: 'logs' },
+      { label: 'Doctor', desc: 'health & preflight checks', value: 'doctor' },
+      { label: 'About', desc: `Relay v${L.relayVersion()}`, value: 'about' },
+      { label: 'Quit', desc: 'exit relay setup', value: 'quit' },
     ]);
-    if (mode === 'exit') {
-      line(`\n  ${C.dim}Bye!${C.reset}\n`);
-      return;
-    }
+    menu.onSelect = (v) => {
+      if (v === 'quit') { this.quit(); return; }
+      if (v === 'setup') { this.navigate('setup-mode'); return; }
+      this.navigate(v as Screen);
+    };
+    menu.onCancel = () => this.quit();
+    comps.push(menu);
 
-    section('Configuration');
-    if (mode === 'quickstart') {
-      await setupQuickstart(rl, env);
-    } else if (mode === 'byo') {
-      await setupBYO(rl, env);
-    } else if (mode === 'cloud') {
-      await setupCloud(rl, env);
-    }
+    comps.push(new Spacer(1));
+    comps.push(new Block([`  ${d('↑/↓ to move · Enter to pick · q to quit')}`]));
 
-    if (await askYes(rl, 'Set up a Cloudflare Tunnel endpoint after this?', 'n')) {
-      setupCloudflareTunnel(env);
-    }
-
-    writeEnv(ENV_PATH, env);
-    printSummary(mode, env);
-  } finally {
-    rl.close();
-  }
-}
-
-// ── Quickstart (preset model) ──────────────────────────────────────────
-
-async function setupQuickstart(rl: ReturnType<typeof createInterface>, env: EnvMap): Promise<void> {
-  const catalog = readCatalog();
-  const gpu = probeGpu();
-  const modelDir = resolveHome(await ask(rl, 'Model directory', env.get('RELAY_MODEL_DIR') ?? resolveHome('~/models')));
-  const llamaServerPath = resolveHome(await ask(
-    rl,
-    'Path to llama-server',
-    env.get('RELAY_LLAMA_SERVER_PATH') ?? detectLlamaServerPath(),
-  ));
-
-  if (gpu) {
-    info(`Detected ${gpu.gpu_type}/${gpu.driver} with ${gpu.vram_total_gb} GB VRAM; system RAM estimate ${SYSTEM_RAM_GB} GB`);
-  } else {
-    warn('GPU probe unavailable; showing the full model catalog');
+    return comps;
   }
 
-  const topology = await choose(rl, 'Relay model topology', [
-    { label: 'Single model — simplest, one default model', value: 'single' },
-    { label: 'Multi model — cold-start and switch by requested model', value: 'multi' },
-  ]);
-  if (topology === 'exit') return;
+  // ── Setup wizard: mode select ─────────────────────────────────────────
 
-  const lanes = [
-    { label: 'General purpose', value: 'general' },
-    { label: 'Coding', value: 'code' },
-    { label: 'Reasoning', value: 'reasoning' },
-    { label: 'Vision', value: 'vision' },
-    { label: 'Long context', value: 'long' },
-    { label: 'All models', value: '__all__' },
-  ];
+  private screenSetupMode(): Component[] {
+    const comps: Component[] = [];
+    comps.push(new Block(this.miniHeader()));
+    comps.push(new HRule());
+    comps.push(new Spacer(1));
 
-  const laneChoice = await choose(rl, 'Pick a category', lanes);
-  if (laneChoice === 'exit') return;
+    comps.push(new Block([`  ${a(b('How do you want to use Relay?'))}  ${d('(Step 1)')}`]));
+    comps.push(new Spacer(1));
 
-  let filtered = laneChoice === '__all__' ? catalog : catalog.filter((m) => m.lane === laneChoice || m.lane.startsWith(laneChoice));
-  if (filtered.length === 0) {
-    filtered = catalog;
-    info(`No models in "${laneChoice}", showing all`);
+    const menu = new MenuList([
+      { label: '🖥  Local model — run on my GPU', desc: 'pick from a catalog, auto-download, auto-tune. No cloud needed.', value: 'quickstart' },
+      { label: '📡  Use a server I already have', desc: 'point relay at Ollama or an existing llama.cpp server', value: 'byo' },
+      { label: '☁  Cloud — proxy Gemini, OpenAI, etc.', desc: 'one tidy endpoint in front of cloud APIs. No local GPU needed.', value: 'cloud' },
+      { label: '← Back to menu', desc: '', value: 'back' },
+    ]);
+    menu.onSelect = (v) => {
+      if (v === 'back') { this.navigate('menu'); return; }
+      this.setupMode = v as 'quickstart' | 'byo' | 'cloud';
+      if (this.setupMode === 'cloud' || this.setupMode === 'byo') {
+        this.navigate('setup-network');
+      } else {
+        this.navigate('setup-models');
+      }
+    };
+    menu.onCancel = () => this.navigate('menu');
+    comps.push(menu);
+
+    return comps;
   }
-  if (gpu?.vram_total_gb && laneChoice !== '__all__') {
-    const fitting = filtered.filter((m) => classifyFit(m, gpu) !== 'too-large');
-    if (fitting.length > 0) {
-      filtered = fitting;
-      info(`Filtered to ${filtered.length} model(s) that should fit full-GPU or partial-offload on this machine`);
+
+  // ── Setup wizard: model picker (quickstart) ───────────────────────────
+
+  private screenSetupModels(): Component[] {
+    const comps: Component[] = [];
+    comps.push(new Block(this.miniHeader()));
+    comps.push(new HRule());
+    comps.push(new Spacer(1));
+
+    comps.push(new Block([`  ${a(b('Pick a model for your hardware'))}  ${d('(Step 2)')}`]));
+    comps.push(new Spacer(1));
+
+    if (this.gpu) {
+      comps.push(new Block([
+        `  ${g('●')} Detected ${this.gpu.gpu_type}/${this.gpu.driver} · ${this.gpu.vram_total_gb} GB VRAM · ${L.SYSTEM_RAM_GB} GB RAM`,
+      ]));
+    } else {
+      comps.push(new Block([
+        `  ${y('⚠')} GPU probe unavailable — showing the full catalog. Models marked "fits GPU" are recommended.`,
+      ]));
     }
+    comps.push(new Spacer(1));
+
+    const catalog = L.readCatalog();
+    if (catalog.length === 0) {
+      comps.push(new Block([`  ${r('No model catalog found.')} ${d('Check that docs/model-catalog.json exists.')}`]));
+      const back = new MenuList([{ label: '← Back', value: 'back' }]);
+      back.onSelect = () => this.navigate('setup-mode');
+      back.onCancel = () => this.navigate('setup-mode');
+      comps.push(back);
+      return comps;
+    }
+
+    // Filter by lane
+    const lanes = [
+      { label: 'Coding', value: 'code' },
+      { label: 'General purpose', value: 'general' },
+      { label: 'Reasoning', value: 'reasoning' },
+      { label: 'Long context', value: 'long' },
+      { label: 'All models', value: '__all__' },
+      { label: '← Back', value: 'back' },
+    ];
+
+    const laneMenu = new MenuList(lanes.map(l => ({ label: l.label, value: l.value, desc: l.value === '__all__' ? 'show everything' : '' })));
+    laneMenu.onSelect = (lane) => {
+      if (lane === 'back') { this.navigate('setup-mode'); return; }
+      this.showModelPicker(lane === '__all__' ? catalog : catalog.filter(m => m.lane === lane || m.lane.startsWith(lane)));
+    };
+    laneMenu.onCancel = () => this.navigate('setup-mode');
+    comps.push(laneMenu);
+
+    return comps;
   }
 
-  const selections = topology === 'multi'
-    ? await chooseMultiModelSet(rl, filtered, gpu)
-    : [await chooseOneModel(rl, 'Pick a model', filtered, gpu)].filter((m): m is CatalogEntry => Boolean(m));
-  if (selections.length === 0) return;
+  private showModelPicker(models: CatalogEntry[]): void {
+    const comps: Component[] = [];
+    comps.push(new Block(this.miniHeader()));
+    comps.push(new HRule());
+    comps.push(new Spacer(1));
+    comps.push(new Block([`  ${a(b('Choose a model'))}  ${d('(Step 2)')}`]));
+    comps.push(new Spacer(1));
 
-  const modelEntries: Record<string, { cmd: string; ctx_size: number; multimodal: boolean; thinking_levels?: string[] }> = {};
-  let defaultModel = selections[0]!;
-  for (const model of selections) {
-    const defaultModelPath = resolve(modelDir, model.filename ?? `${model.id}.gguf`);
-    const shouldDownload = model.download_url
-      ? await askYes(rl, `Download ${model.label} now${model.size_gb ? ` (~${model.size_gb} GB)` : ''}?`, 'n')
-      : false;
-    const modelPath = shouldDownload
-      ? await downloadModel(model, modelDir)
-      : await ask(rl, `Path to ${model.id} GGUF`, defaultModelPath);
-    const ctxSize = recommendedContext(model, gpu);
-    const scriptPath = generateStartScript({
-      modelId: model.id,
-      modelLabel: model.label,
-      modelPath,
-      llamaServerPath,
-      ctxSize,
-      multimodal: model.vision,
-      fit: gpu ? classifyFit(model, gpu) : 'unknown',
+    if (this.gpu) {
+      const fitting = models.filter(m => L.classifyFit(m, this.gpu!) !== 'too-large');
+      if (fitting.length > 0 && fitting.length < models.length) {
+        comps.push(new Block([`  ${d(`Filtered to ${fitting.length} model(s) that fit your hardware.`)}`]));
+        comps.push(new Spacer(1));
+        models = fitting;
+      }
+    }
+
+    const items = models.map(m => {
+      const fit = this.gpu ? L.classifyFit(m, this.gpu) : 'unknown' as FitClass;
+      const { icon, color } = L.fitIcon(fit);
+      const size = m.size_gb ?? '?';
+      const caps = L.modelCapabilities(m);
+      // Helpers (attribute-specific resets) so the inverse selection bar isn't
+      // torn open by a full reset mid-label.
+      const fitText = fit === 'full-gpu' ? g(`${icon} fits`)
+        : fit === 'partial-offload' ? y(`${icon} partial`)
+        : fit === 'too-large' ? r(`${icon} too big`)
+        : d(`${icon} unknown`);
+      const meta = `${L.fmtCtx(m.ctx)} ctx · ${m.quant}`;
+      return {
+        label: `${m.label}  ~${size}GB  ${fitText}`,
+        desc: caps ? `${meta} · ${caps}` : meta,
+        value: m.id,
+      };
     });
 
-    modelEntries[model.id] = {
-      cmd: scriptPath,
-      ctx_size: ctxSize,
-      multimodal: model.vision,
-      ...(model.thinking === 'on' ? { thinking_levels: ['on'] } : {}),
-      ...(model.thinking === 'toggle' ? { thinking_levels: ['on', 'off'] } : {}),
+    const menu = new MenuList(items, 8);
+    menu.onSelect = (modelId) => {
+      const model = models.find(m => m.id === modelId);
+      if (model) {
+        this.selectedModels = [model];
+        this.applyQuickstart();
+        this.navigate('setup-network');
+      }
     };
+    menu.onCancel = () => this.navigate('setup-models');
+    comps.push(menu);
+    comps.push(new Spacer(1));
+    comps.push(new Block([`  ${d('↑/↓ to browse · Enter to pick · Esc to go back')}`]));
+
+    // Swap the TUI content
+    this.tui.clear();
+    for (const comp of comps) this.tui.addChild(comp);
+    this.tui.setFocus(menu);
+    this.tui.requestRender(true);
   }
 
-  env.set('RELAY_MODE', 'gateway');
-  env.set('RELAY_MODEL_LIFECYCLE_ENABLED', 'true');
-  env.set('RELAY_SWITCH_POLICY', 'eager');
-  env.set('DEFAULT_MODEL', defaultModel.id);
-  env.set('UPSTREAM_CTX_SIZE', String(recommendedContext(defaultModel, gpu)));
-  env.set('RELAY_REPO_DIR', DIR);
-  env.set('RELAY_MODEL_DIR', modelDir);
-  env.set('RELAY_LLAMA_SERVER_PATH', llamaServerPath);
-  env.set('RELAY_MODEL_FILE_HINT', resolve(modelDir, defaultModel.filename ?? `${defaultModel.id}.gguf`));
-  env.set('RELAY_SWITCH_MAX_WARM_MODELS', '1');
-  ensureApiKey(env);
-  env.set('RELAY_MODEL_MAP', JSON.stringify(modelEntries));
+  // ── Setup wizard: networking ──────────────────────────────────────────
 
-  check(`Default model set to ${C.bold}${defaultModel.id}${C.reset}`);
-  check(`Lifecycle enabled (idle shutdown after 10 min)`);
-  check(`${selections.length} model map entr${selections.length === 1 ? 'y' : 'ies'} configured`);
-  if (selections.some((m) => m.vision)) {
-    warn('Vision models usually need an mmproj file; add it to the generated script before first run');
-  }
-  info(`Change models later by editing ${ENV_PATH} or re-running setup`);
-}
+  private screenSetupNetwork(): Component[] {
+    const comps: Component[] = [];
+    comps.push(new Block(this.miniHeader()));
+    comps.push(new HRule());
+    comps.push(new Spacer(1));
+    comps.push(new Block([`  ${a(b('How should Relay be reachable?'))}  ${d('(Step 3)')}`]));
+    comps.push(new Spacer(1));
 
-// ── Bring your own server ──────────────────────────────────────────────
-
-async function setupBYO(rl: ReturnType<typeof createInterface>, env: EnvMap): Promise<void> {
-  const baseUrl = await ask(rl, 'Upstream URL (e.g. http://127.0.0.1:8080/v1)', env.get('UPSTREAM_BASE_URL') ?? 'http://127.0.0.1:8080/v1');
-  const model = await ask(rl, 'Default model name', env.get('DEFAULT_MODEL') ?? 'local-model');
-  const ctx = await ask(rl, 'Context size (tokens)', env.get('UPSTREAM_CTX_SIZE') ?? '32768');
-
-  env.set('RELAY_MODE', 'gateway');
-  env.set('RELAY_MODEL_LIFECYCLE_ENABLED', 'false');
-  env.set('RELAY_MODEL_MAP', '{}');
-  env.set('UPSTREAM_BASE_URL', trimSlash(baseUrl));
-  env.set('DEFAULT_MODEL', model);
-  env.set('UPSTREAM_CTX_SIZE', ctx);
-  ensureApiKey(env);
-
-  check(`Upstream: ${C.bold}${baseUrl}${C.reset}`);
-  check(`Default model: ${C.bold}${model}${C.reset}`);
-  check(`Lifecycle disabled (always-on server mode)`);
-}
-
-// ── Cloud fallback (Gemini) ────────────────────────────────────────────
-
-async function setupCloud(rl: ReturnType<typeof createInterface>, env: EnvMap): Promise<void> {
-  const model = await ask(rl, 'Model name', env.get('DEFAULT_MODEL') ?? 'gemini-2.5-flash');
-  const apiKey = await ask(rl, 'API key', env.get('GEMINI_API_KEY') ?? '');
-  if (!apiKey.trim()) {
-    fail('API key is required');
-    return;
-  }
-
-  const baseUrl = 'https://generativelanguage.googleapis.com/v1beta/openai';
-  env.set('RELAY_MODE', 'cloud');
-  env.set('GEMINI_API_KEY', apiKey.trim());
-  ensureApiKey(env);
-  env.set('RELAY_CLOUD_MODELS', JSON.stringify({
-    [model]: { base_url: baseUrl, auth_env: 'GEMINI_API_KEY', ctx_size: 1_048_576 },
-  }));
-  env.set('DEFAULT_MODEL', model);
-
-  check(`Model: ${C.bold}${model}${C.reset}`);
-  check(`Cloud mode enabled (Gemini)`);
-}
-
-function setupCloudflareTunnel(env: EnvMap): void {
-  ensureApiKey(env);
-  env.set('HOST', '0.0.0.0');
-  env.set('TRUST_PROXY', 'true');
-  if (!env.get('RELAY_ALLOWED_HOSTS')) {
-    env.set('RELAY_ALLOWED_HOSTS', '');
-  }
-  check('Cloudflare Tunnel profile enabled in docker-compose.yml');
-  check('API key required for public access');
-  info('Quick tunnel: docker compose --profile public up -d tunnel');
-  info('Permanent DNS tunnel: cloudflared tunnel login && cloudflared tunnel create relay');
-}
-
-// ── Output ─────────────────────────────────────────────────────────────
-
-function banner(): void {
-  line();
-  line(`  ${C.bold}${C.cyan}  ╭──────────────────────╮${C.reset}`);
-  line(`  ${C.bold}${C.cyan}  │  Relay Setup Wizard   │${C.reset}`);
-  line(`  ${C.bold}${C.cyan}  ╰──────────────────────╯${C.reset}`);
-  line();
-  line(`  ${C.dim}Configure your local AI gateway in a few steps.${C.reset}`);
-  line();
-}
-
-function printSummary(mode: string, env: EnvMap): void {
-  section('All set!');
-
-  const host = env.get('HOST') ?? '127.0.0.1';
-  const port = env.get('PORT') ?? '1234';
-  const defaultModel = env.get('DEFAULT_MODEL') ?? '(none)';
-  const relayMode = env.get('RELAY_MODE') ?? 'gateway';
-  const lifecycle = env.get('RELAY_MODEL_LIFECYCLE_ENABLED') === 'true' ? 'on' : 'off';
-  const apiKey = env.get('API_KEY') ?? '(unset)';
-
-  line(`  ${C.bold}Summary${C.reset}`);
-  line(`    Mode:       ${relayMode}`);
-  line(`    Endpoint:   ${C.cyan}http://${host}:${port}/v1${C.reset}`);
-  line(`    Model:      ${defaultModel}`);
-  line(`    Lifecycle:  ${lifecycle === 'on' ? `${C.green}on${C.reset}` : 'off'}`);
-  line(`    API key:    ${apiKey === '(unset)' ? apiKey : `${apiKey.slice(0, 8)}…`}`);
-
-  line();
-  line(`  ${C.bold}${C.green}▶ Next steps${C.reset}`);
-  line();
-
-  if (mode === 'quickstart') {
-    line(`    ${C.dim}1.${C.reset} Place the GGUF file at: ${C.cyan}${env.get('RELAY_MODEL_FILE_HINT') ?? resolve(env.get('RELAY_MODEL_DIR') ?? resolveHome('~/models'), `${defaultModel}.gguf`)}${C.reset}`);
-    line(`    ${C.dim}2.${C.reset} Review the script:      ${C.cyan}${resolve(START_SCRIPTS_DIR, `start-${defaultModel}.sh`)}${C.reset}`);
-    line(`    ${C.dim}3.${C.reset} Start Relay locally:    ${C.bold}npm start${C.reset}`);
-    line(`    ${C.dim}4.${C.reset} Optional Docker proxy:  ${C.bold}docker compose up -d${C.reset}`);
-  } else if (mode === 'byo') {
-    line(`    ${C.dim}1.${C.reset} Make sure your server is running at ${C.cyan}${env.get('UPSTREAM_BASE_URL')}${C.reset}`);
-    line(`    ${C.dim}2.${C.reset} Start Relay:            ${C.bold}npm start${C.reset}`);
-  } else if (mode === 'cloud') {
-    line(`    ${C.dim}1.${C.reset} Start Relay:            ${C.bold}npm start${C.reset}`);
-  }
-
-  line();
-  line(`    ${C.dim}Then point your agent to:${C.reset}`);
-  line(`    ${C.cyan}    http://${host}:${port}/v1${C.reset}`);
-  line();
-  line(`    ${C.dim}Run setup again anytime:${C.reset}`);
-  line(`    ${C.dim}    node src/main.ts setup${C.reset}`);
-  line();
-}
-
-// ── Helpers ────────────────────────────────────────────────────────────
-
-async function choose(
-  rl: ReturnType<typeof createInterface>,
-  prompt: string,
-  options: Array<{ label: string; value: string }>,
-): Promise<string> {
-  const exitOption = { label: `${C.dim}(exit)${C.reset}`, value: 'exit' };
-  const allOptions = [...options, exitOption];
-
-  line(`  ${C.bold}${prompt}${C.reset}`);
-  allOptions.forEach((opt, i) => {
-    const label = opt.label.replace(/\x1b\[[0-9;]*m/g, '').length > 60
-      ? opt.label
-      : opt.label;
-    line(`    ${C.dim}${i + 1}.${C.reset} ${label}`);
-  });
-
-  while (true) {
-    const raw = await rl.question(`  ${C.cyan}›${C.reset} `);
-    const index = Number.parseInt(raw.trim(), 10);
-    if (Number.isFinite(index) && index >= 1 && index <= allOptions.length) return allOptions[index - 1]!.value;
-    if (raw.trim().toLowerCase() === 'exit' || raw.trim() === 'q') return 'exit';
-  }
-}
-
-async function ask(rl: ReturnType<typeof createInterface>, label: string, fallback: string): Promise<string> {
-  const raw = await rl.question(`  ${label} ${C.dim}[${fallback}]${C.reset}: `);
-  return raw.trim() || fallback;
-}
-
-async function askYes(rl: ReturnType<typeof createInterface>, label: string, fallback: 'y' | 'n' = 'n'): Promise<boolean> {
-  const suffix = fallback === 'y' ? '[Y/n]' : '[y/N]';
-  const raw = await rl.question(`  ${label} ${C.dim}${suffix}${C.reset}: `);
-  const answer = (raw.trim() || fallback).toLowerCase();
-  return answer === 'y' || answer === 'yes';
-}
-
-// ── File I/O ──────────────────────────────────────────────────────────
-
-function readCatalog(): CatalogEntry[] {
-  if (!existsSync(CATALOG_PATH)) {
-    warn(`Model catalog not found at ${CATALOG_PATH}`);
-    return [];
-  }
-  return JSON.parse(readFileSync(CATALOG_PATH, 'utf8')) as CatalogEntry[];
-}
-
-function parseEnv(text: string): EnvMap {
-  const env = new Map<string, string>();
-  for (const line of text.split('\n')) {
-    if (!line || line.trimStart().startsWith('#')) continue;
-    const idx = line.indexOf('=');
-    if (idx <= 0) continue;
-    env.set(line.slice(0, idx), line.slice(idx + 1));
-  }
-  return env;
-}
-
-function writeEnv(path: string, env: EnvMap): void {
-  const original = readFileSync(path, 'utf8').split('\n');
-  const seen = new Set<string>();
-  const next = original.map((line) => {
-    if (!line || line.trimStart().startsWith('#')) return line;
-    const idx = line.indexOf('=');
-    if (idx <= 0) return line;
-    const key = line.slice(0, idx);
-    if (!env.has(key)) return line;
-    seen.add(key);
-    return `${key}=${env.get(key) ?? ''}`;
-  });
-  for (const [key, value] of env.entries()) {
-    if (!seen.has(key)) next.push(`${key}=${value}`);
-  }
-  writeFileSync(path, `${next.join('\n').replace(/\n+$/, '')}\n`);
-}
-
-function trimSlash(value: string): string {
-  return value.replace(/\/+$/, '');
-}
-
-function fmtCtx(ctx: number): string {
-  return ctx >= 1024 ? `${Math.round(ctx / 1024)}k` : String(ctx);
-}
-
-async function chooseOneModel(
-  rl: ReturnType<typeof createInterface>,
-  prompt: string,
-  models: CatalogEntry[],
-  gpu?: GpuProbe,
-): Promise<CatalogEntry | undefined> {
-  const modelId = await choose(rl, prompt, models.map((m) => ({
-    label: modelLabel(m, gpu),
-    value: m.id,
-  })));
-  if (!modelId || modelId === 'exit') return undefined;
-  return models.find((m) => m.id === modelId);
-}
-
-async function chooseMultiModelSet(
-  rl: ReturnType<typeof createInterface>,
-  models: CatalogEntry[],
-  gpu?: GpuProbe,
-): Promise<CatalogEntry[]> {
-  const mode = await choose(rl, 'How should multi-model setup choose models?', [
-    { label: 'Recommended set — general + code + reasoning when available', value: 'recommended' },
-    { label: 'Manual picks — choose models one at a time', value: 'manual' },
-  ]);
-  if (mode === 'exit') return [];
-
-  if (mode === 'recommended') {
-    const lanes = ['general', 'code', 'reasoning', 'vision'];
-    const picked = new Map<string, CatalogEntry>();
-    for (const lane of lanes) {
-      const match = models.find((m) =>
-        !picked.has(m.id) &&
-        (m.lane === lane || m.lane.startsWith(lane)) &&
-        (!gpu || classifyFit(m, gpu) !== 'too-large')
-      );
-      if (match) picked.set(match.id, match);
+    const cf = L.detectCloudflare();
+    if (cf.installed) {
+      const names = cf.tunnels.map(t => t.name).join(', ');
+      comps.push(new Block([
+        `  ${c('i')} cloudflared ${cf.version ?? ''} detected${names ? ` · tunnels: ${names}` : ''}${cf.serviceActive ? ' · service active' : ''}`.replace(/\s+·/, ' ·'),
+      ]));
+      comps.push(new Spacer(1));
     }
-    const selected = [...picked.values()];
-    if (selected.length > 0) {
-      info(`Recommended set: ${selected.map((m) => m.id).join(', ')}`);
-      return selected;
+
+    const menu = new MenuList([
+      { label: '🔒  Localhost only (recommended)', desc: 'bind 127.0.0.1 — safe, works with a tunnel on this host', value: 'local' },
+      { label: '🌐  Expose on LAN / container', desc: 'bind 0.0.0.0 + trust proxy — API key required', value: 'expose' },
+      { label: '← Back', value: 'back' },
+    ]);
+    menu.onSelect = (v) => {
+      if (v === 'back') {
+        if (this.setupMode === 'quickstart') this.navigate('setup-models');
+        else this.navigate('setup-mode');
+        return;
+      }
+      this.networkMode = v as 'local' | 'expose';
+      L.configureNetwork(this.env, this.networkMode);
+      this.navigate('setup-summary');
+    };
+    menu.onCancel = () => this.navigate('menu');
+    comps.push(menu);
+
+    return comps;
+  }
+
+  // ── Setup wizard: summary ─────────────────────────────────────────────
+
+  private screenSetupSummary(): Component[] {
+    const comps: Component[] = [];
+    comps.push(new Block(this.miniHeader()));
+    comps.push(new HRule());
+    comps.push(new Spacer(1));
+    comps.push(new Block([`  ${g(b('🎉 All set!'))}`]));
+    comps.push(new Spacer(1));
+
+    const host = this.env.get('HOST') ?? '127.0.0.1';
+    const port = this.env.get('PORT') ?? '1234';
+    const defaultModel = this.env.get('DEFAULT_MODEL') ?? '(none)';
+    const relayMode = this.env.get('RELAY_MODE') ?? 'gateway';
+    const lifecycle = this.env.get('RELAY_MODEL_LIFECYCLE_ENABLED') === 'true' ? g('on') : d('off');
+    const apiKey = this.env.get('API_KEY') ?? '(unset)';
+
+    // Summary card
+    const card = new Card(2, 1);
+    card.addChild(new Block([
+      `  ${b('Summary')}`,
+      `    Mode:       ${relayMode}`,
+      `    Endpoint:   ${c(`http://${host}:${port}/v1`)}`,
+      `    Model:      ${defaultModel}`,
+      `    Lifecycle:  ${lifecycle}`,
+      `    API key:    ${apiKey === '(unset)' ? apiKey : `${apiKey.slice(0, 8)}…`}`,
+    ]));
+    comps.push(card);
+    comps.push(new Spacer(1));
+
+    // Next steps
+    const steps: string[] = [`  ${b('Next steps:')}`];
+    if (this.setupMode === 'quickstart') {
+      const hint = this.env.get('RELAY_MODEL_FILE_HINT') ?? resolve(this.env.get('RELAY_MODEL_DIR') ?? this.modelDir, `${defaultModel}.gguf`);
+      steps.push(`    ${d('1.')} Place the GGUF at: ${c(hint)}`);
+      steps.push(`    ${d('2.')} Start Relay:     ${b('npm start')} ${d('or')} ${b('docker compose up -d')}`);
+    } else if (this.setupMode === 'byo') {
+      steps.push(`    ${d('1.')} Make sure your server is at ${c(this.env.get('UPSTREAM_BASE_URL') ?? '')}`);
+      steps.push(`    ${d('2.')} Start Relay:     ${b('npm start')}`);
+    } else if (this.setupMode === 'cloud') {
+      steps.push(`    ${d('1.')} Start Relay:     ${b('npm start')}`);
     }
-    warn('No recommended models fit; switching to manual selection');
+    steps.push(`    ${d('Then point your agent to:')} ${c(`http://${host}:${port}/v1`)}`);
+    steps.push(``);
+    steps.push(`  ${g(b('You\'re done. Go build something. ✨'))}`);
+    comps.push(new Block(steps));
+    comps.push(new Spacer(1));
+
+    const menu = new MenuList([
+      { label: '← Back to menu', value: 'menu' },
+      { label: 'Quit', value: 'quit' },
+    ]);
+    menu.onSelect = (v) => {
+      if (v === 'quit') { this.quit(); return; }
+      this.navigate('menu');
+    };
+    menu.onCancel = () => this.navigate('menu');
+    comps.push(menu);
+
+    return comps;
   }
 
-  const selected: CatalogEntry[] = [];
-  const remaining = [...models];
-  while (remaining.length > 0) {
-    const next = await chooseOneModel(
-      rl,
-      selected.length === 0 ? 'Pick first model' : 'Pick another model',
-      remaining,
-      gpu,
-    );
-    if (!next) break;
-    selected.push(next);
-    const index = remaining.findIndex((m) => m.id === next.id);
-    if (index >= 0) remaining.splice(index, 1);
-    if (!(await askYes(rl, 'Add another model?', selected.length < 3 ? 'y' : 'n'))) break;
-  }
-  return selected;
-}
+  // ── Apply quickstart config ───────────────────────────────────────────
 
-function modelLabel(model: CatalogEntry, gpu?: GpuProbe): string {
-  const estimate = model.size_gb ?? MODEL_VRAM_ESTIMATES[model.id];
-  const fit = gpu ? fitLabel(classifyFit(model, gpu)) : 'fit unknown';
-  return `${model.label}  ${C.dim}${fmtCtx(model.ctx)} ctx  ${model.quant}  ~${estimate ?? '?'} GB  ${fit}${model.vision ? '  vision' : ''}${model.thinking !== 'off' ? '  thinking' : ''}${C.reset}`;
-}
-
-function fitLabel(fit: FitClass): string {
-  if (fit === 'full-gpu') return 'full GPU';
-  if (fit === 'partial-offload') return 'partial GPU';
-  if (fit === 'too-large') return 'too large';
-  return 'fit unknown';
-}
-
-function probeGpu(): GpuProbe | undefined {
-  if (!existsSync(PROBE_GPU_PATH)) return undefined;
-  try {
-    const raw = execFileSync('bash', [PROBE_GPU_PATH], { cwd: DIR, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-    const parsed = JSON.parse(raw) as GpuProbe;
-    if (!parsed || typeof parsed.vram_total_gb !== 'number') return undefined;
-    return parsed;
-  } catch {
-    return undefined;
-  }
-}
-
-function classifyFit(model: CatalogEntry, gpu: GpuProbe): FitClass {
-  const estimate = model.size_gb ?? MODEL_VRAM_ESTIMATES[model.id];
-  if (!estimate || !gpu.vram_total_gb) return 'unknown';
-  const gpuBudget = Math.max(0, gpu.vram_total_gb - 2);
-  if (estimate <= gpuBudget) return 'full-gpu';
-  const combinedBudget = Math.max(gpuBudget, gpu.vram_total_gb + Math.max(0, SYSTEM_RAM_GB - 8));
-  return estimate <= combinedBudget ? 'partial-offload' : 'too-large';
-}
-
-function recommendedContext(model: CatalogEntry, gpu?: GpuProbe): number {
-  if (!gpu) return model.ctx;
-  const fit = classifyFit(model, gpu);
-  if (fit === 'full-gpu') return model.ctx;
-  if (fit === 'partial-offload') return Math.min(model.ctx, model.ctx >= 98_304 ? 65_536 : model.ctx);
-  return Math.min(model.ctx, 32_768);
-}
-
-async function downloadModel(model: CatalogEntry, modelDir: string): Promise<string> {
-  if (!model.download_url) throw new Error(`No download_url configured for ${model.id}`);
-  mkdirSync(modelDir, { recursive: true });
-  const filename = model.filename ?? model.download_url.split('/').pop() ?? `${model.id}.gguf`;
-  const destination = resolve(modelDir, filename);
-  if (existsSync(destination)) {
-    check(`Model already exists at ${destination}`);
-    return destination;
-  }
-  const downloader = commandPath('curl') ? 'curl' : commandPath('wget') ? 'wget' : undefined;
-  if (!downloader) throw new Error('curl or wget is required to download models');
-  info(`Downloading ${model.label} to ${destination}`);
-  if (downloader === 'curl') {
-    execFileSync('curl', ['-fL', '--continue-at', '-', '-o', destination, model.download_url], { stdio: 'inherit' });
-  } else {
-    execFileSync('wget', ['-c', '-O', destination, model.download_url], { stdio: 'inherit' });
-  }
-  return destination;
-}
-
-function commandPath(command: string): string | undefined {
-  try {
-    return execFileSync('which', [command], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-  } catch {
-    return undefined;
-  }
-}
-
-function detectSystemRamGb(): number {
-  try {
-    if (process.platform === 'linux') {
-      const meminfo = readFileSync('/proc/meminfo', 'utf8');
-      const match = /^MemTotal:\s+(\d+)\s+kB/m.exec(meminfo);
-      if (match) return Math.round(Number(match[1]) / 1024 / 1024);
+  private applyQuickstart(): void {
+    if (this.selectedModels.length === 0) return;
+    const modelPaths = new Map<string, string>();
+    for (const model of this.selectedModels) {
+      const defaultPath = resolve(this.modelDir, model.filename ?? `${model.id}.gguf`);
+      modelPaths.set(model.id, defaultPath);
     }
-    if (process.platform === 'darwin') {
-      const bytes = Number(execFileSync('sysctl', ['-n', 'hw.memsize'], { encoding: 'utf8' }).trim());
-      if (Number.isFinite(bytes)) return Math.round(bytes / 1024 / 1024 / 1024);
+    L.configureQuickstart(this.env, this.selectedModels, modelPaths, this.llamaServerPath, this.modelDir, this.gpu);
+  }
+
+  // ── Models screen ─────────────────────────────────────────────────────
+
+  private screenModels(): Component[] {
+    const comps: Component[] = [];
+    comps.push(new Block(this.miniHeader()));
+    comps.push(new HRule());
+    comps.push(new Spacer(1));
+    comps.push(new Block([`  ${a(b('Models'))}  ${d('catalog & active map')}`]));
+    comps.push(new Spacer(1));
+
+    const catalog = L.readCatalog();
+    if (catalog.length === 0) {
+      comps.push(new Block([`  ${d('No model catalog found. Run Setup to configure models.')}`]));
+      const back = new MenuList([{ label: '← Back', value: 'back' }]);
+      back.onSelect = () => this.navigate('menu');
+      back.onCancel = () => this.navigate('menu');
+      comps.push(back);
+      return comps;
     }
-  } catch {
-    // Best-effort sizing only.
+
+    const def = this.env.get('DEFAULT_MODEL');
+    let map: Record<string, unknown> = {};
+    try { map = JSON.parse(this.env.get('RELAY_MODEL_MAP') ?? '{}'); } catch { map = {}; }
+    const active = new Set(Object.keys(map));
+
+    const ordered = [...catalog].sort((a, b) => {
+      const score = (m: CatalogEntry) => (m.id === def ? 0 : active.has(m.id) ? 1 : 2);
+      return score(a) - score(b);
+    });
+
+    const lines: string[] = [`  ${g('★')} ${d('default')}   ${c('●')} ${d('active')}   ${d('○ available')}`, ``];
+    for (const m of ordered) {
+      const isDefault = m.id === def;
+      const isActive = active.has(m.id);
+      const dot = isDefault ? g('★') : isActive ? c('●') : d('○');
+      const size = m.size_gb ?? '?';
+      const caps = [m.vision ? 'vision' : null, m.thinking !== 'off' ? 'thinking' : null].filter(Boolean).join(' ');
+      const name = (isDefault || isActive) ? b(m.label) : m.label;
+      lines.push(`  ${dot} ${name}  ${d(`${L.fmtCtx(m.ctx)} ctx · ${m.quant} · ~${size}GB${caps ? ' · ' + caps : ''}`)}`);
+    }
+    comps.push(new Block(lines));
+    comps.push(new Spacer(1));
+
+    const menu = new MenuList([
+      { label: 'Configure models', desc: 'open the guided picker', value: 'setup' },
+      { label: '← Back', value: 'back' },
+    ]);
+    menu.onSelect = (v) => {
+      if (v === 'setup') { this.navigate('setup-mode'); return; }
+      this.navigate('menu');
+    };
+    menu.onCancel = () => this.navigate('menu');
+    comps.push(menu);
+
+    return comps;
   }
-  return 0;
-}
 
-function detectLlamaServerPath(): string {
-  const candidates = [
-    process.env.RELAY_LLAMA_SERVER_PATH,
-    '/usr/local/bin/llama-server',
-    resolveHome('~/llama.cpp/build/bin/llama-server'),
-    resolveHome('~/llama.cpp/build-vulkan/bin/llama-server'),
-  ].filter(Boolean) as string[];
+  // ── Config screen ─────────────────────────────────────────────────────
 
-  for (const candidate of candidates) {
-    if (existsSync(candidate)) return candidate;
+  private screenConfig(): Component[] {
+    const comps: Component[] = [];
+    comps.push(new Block(this.miniHeader()));
+    comps.push(new HRule());
+    comps.push(new Spacer(1));
+    comps.push(new Block([`  ${a(b('Config'))}  ${d('core environment settings')}`]));
+    comps.push(new Spacer(1));
+
+    const key = this.env.get('API_KEY');
+    const fields: Array<[string, string]> = [
+      ['RELAY_MODE', this.env.get('RELAY_MODE') ?? 'gateway'],
+      ['HOST', this.env.get('HOST') ?? '127.0.0.1'],
+      ['PORT', this.env.get('PORT') ?? '1234'],
+      ['DEFAULT_MODEL', this.env.get('DEFAULT_MODEL') ?? '—'],
+      ['RELAY_MODEL_LIFECYCLE_ENABLED', this.env.get('RELAY_MODEL_LIFECYCLE_ENABLED') ?? 'false'],
+      ['LOG_LEVEL', this.env.get('LOG_LEVEL') ?? 'info'],
+    ];
+
+    const lines: string[] = [
+      `  ${d('endpoint')}  ${c(L.endpoint(this.env))}`,
+      `  ${d('API_KEY')}   ${key ? `${key.slice(0, 8)}…  ${d('set')}` : y('unset — required for public access')}`,
+      ``,
+    ];
+    for (const [k, v] of fields) {
+      lines.push(`  ${d(k.padEnd(32))} ${d(v)}`);
+    }
+    comps.push(new Block(lines));
+    comps.push(new Spacer(1));
+
+    const items = fields.map(([k]) => ({ label: `Edit ${k}`, value: k, desc: '' }));
+    items.push({ label: '← Back', value: 'back', desc: '' });
+    const menu = new MenuList(items);
+    menu.onSelect = (v) => {
+      if (v === 'back') { this.navigate('menu'); return; }
+      this.editConfigValue(v);
+    };
+    menu.onCancel = () => this.navigate('menu');
+    comps.push(menu);
+
+    return comps;
   }
 
-  return 'llama-server';
-}
+  private editConfigValue(key: string): void {
+    const comps: Component[] = [];
+    comps.push(new Block(this.miniHeader()));
+    comps.push(new HRule());
+    comps.push(new Spacer(1));
+    comps.push(new Block([`  ${a(b(`Edit ${key}`))}`]));
+    comps.push(new Spacer(1));
 
-function ensureApiKey(env: EnvMap): void {
-  if (!env.get('API_KEY') || env.get('API_KEY') === 'change-me-in-production') {
-    env.set('API_KEY', randomBytes(24).toString('hex'));
+    const current = this.env.get(key) ?? '';
+    comps.push(new Block([`  ${d(`Current: ${current || '(unset)'}`)}`, ``]));
+
+    const input = new LabeledInput('New value (Enter to save, Esc to cancel):', current);
+    input.onSubmit = (val) => {
+      this.env.set(key, val.trim());
+      L.writeEnv(L.ENV_PATH, this.env);
+      this.navigate('config');
+    };
+    input.onCancel = () => this.navigate('config');
+    comps.push(input);
+
+    this.tui.clear();
+    for (const comp of comps) this.tui.addChild(comp);
+    this.tui.setFocus(input);
+    this.tui.requestRender(true);
+  }
+
+  // ── Parameters screen ─────────────────────────────────────────────────
+
+  private screenParams(): Component[] {
+    const comps: Component[] = [];
+    comps.push(new Block(this.miniHeader()));
+    comps.push(new HRule());
+    comps.push(new Spacer(1));
+    comps.push(new Block([`  ${a(b('Parameters'))}  ${d('sampling defaults — blank means model/profile default')}`]));
+    comps.push(new Spacer(1));
+
+    const paramFields: Array<[string, string]> = [
+      ['DEFAULT_TEMPERATURE', 'temperature'],
+      ['DEFAULT_TOP_P', 'top_p'],
+      ['DEFAULT_TOP_K', 'top_k'],
+      ['DEFAULT_MIN_P', 'min_p'],
+      ['DEFAULT_PRESENCE_PENALTY', 'presence_penalty'],
+      ['DEFAULT_REPETITION_PENALTY', 'repeat_penalty'],
+    ];
+
+    const lines: string[] = [];
+    for (const [k, label] of paramFields) {
+      const v = this.env.get(k);
+      const shown = v && v.trim() ? v : d('unset');
+      lines.push(`  ${label.padEnd(20)} ${shown}`);
+    }
+    comps.push(new Block(lines));
+    comps.push(new Spacer(1));
+
+    const items = paramFields.map(([k, label]) => ({ label: `Edit ${label}`, value: k, desc: '' }));
+    items.push({ label: '← Back', value: 'back', desc: '' });
+    const menu = new MenuList(items);
+    menu.onSelect = (v) => {
+      if (v === 'back') { this.navigate('menu'); return; }
+      this.editParamValue(v);
+    };
+    menu.onCancel = () => this.navigate('menu');
+    comps.push(menu);
+
+    return comps;
+  }
+
+  private editParamValue(key: string): void {
+    const comps: Component[] = [];
+    comps.push(new Block(this.miniHeader()));
+    comps.push(new HRule());
+    comps.push(new Spacer(1));
+    comps.push(new Block([`  ${a(b(`Edit ${key}`))}`]));
+    comps.push(new Spacer(1));
+
+    const current = this.env.get(key) ?? '';
+    comps.push(new Block([`  ${d(`Current: ${current || '(unset)'}`)}`, `  ${d('Blank to unset.')}`, ``]));
+
+    const input = new LabeledInput('New value:', current);
+    input.onSubmit = (val) => {
+      const trimmed = val.trim();
+      if (trimmed && Number.isNaN(Number(trimmed))) {
+        // Show error and stay
+        return;
+      }
+      this.env.set(key, trimmed);
+      L.writeEnv(L.ENV_PATH, this.env);
+      this.navigate('params');
+    };
+    input.onCancel = () => this.navigate('params');
+    comps.push(input);
+
+    this.tui.clear();
+    for (const comp of comps) this.tui.addChild(comp);
+    this.tui.setFocus(input);
+    this.tui.requestRender(true);
+  }
+
+  // ── Logs screen ───────────────────────────────────────────────────────
+
+  private screenLogs(): Component[] {
+    const comps: Component[] = [];
+    comps.push(new Block(this.miniHeader()));
+    comps.push(new HRule());
+    comps.push(new Spacer(1));
+    comps.push(new Block([`  ${a(b('Logs'))}  ${d('recent gateway activity')}`]));
+    comps.push(new Spacer(1));
+
+    const file = this.env.get('RELAY_LOG_FILE');
+    if (!file || !existsSync(file)) {
+      comps.push(new Block([
+        `  ${d(file ? `Log file not found: ${file}` : 'No log file configured (RELAY_LOG_FILE).')}`,
+        `  ${d('Set RELAY_LOG_FILE in Config, or run: bash scripts/logs.sh')}`,
+      ]));
+      const back = new MenuList([{ label: '← Back', value: 'back' }]);
+      back.onSelect = () => this.navigate('menu');
+      back.onCancel = () => this.navigate('menu');
+      comps.push(back);
+      return comps;
+    }
+
+    const lines = readFileSync(file, 'utf8').split('\n').filter(Boolean);
+    const tail = lines.slice(-30);
+    const logLines: string[] = [];
+    if (tail.length === 0) {
+      logLines.push(`  ${d('Log file is empty.')}`);
+    } else {
+      for (const l of tail) {
+        const color = /"level":"error"|\berror\b/i.test(l) ? RED
+          : /"level":"warn"|\bwarn\b/i.test(l) ? YELLOW
+          : DIM;
+        logLines.push(`  ${color}${l.slice(0, 160)}${RESET}`);
+      }
+    }
+    comps.push(new Block(logLines));
+    comps.push(new Spacer(1));
+
+    const back = new MenuList([{ label: '← Back', value: 'back' }]);
+    back.onSelect = () => this.navigate('menu');
+    back.onCancel = () => this.navigate('menu');
+    comps.push(back);
+
+    return comps;
+  }
+
+  // ── Doctor screen ─────────────────────────────────────────────────────
+
+  private screenDoctor(): Component[] {
+    const comps: Component[] = [];
+    comps.push(new Block(this.miniHeader()));
+    comps.push(new HRule());
+    comps.push(new Spacer(1));
+    comps.push(new Block([`  ${a(b('Doctor'))}  ${d('health & preflight checks')}`]));
+    comps.push(new Spacer(1));
+
+    if (!existsSync(L.DOCTOR_SCRIPT)) {
+      comps.push(new Block([`  ${r('Doctor script not found:')} ${d(L.DOCTOR_SCRIPT)}`]));
+      const back = new MenuList([{ label: '← Back', value: 'back' }]);
+      back.onSelect = () => this.navigate('menu');
+      back.onCancel = () => this.navigate('menu');
+      comps.push(back);
+      return comps;
+    }
+
+    comps.push(new Block([`  ${d('Running diagnostics…')}`]));
+    comps.push(new Spacer(1));
+
+    // Run doctor synchronously and capture output
+    const result = spawnSync('node', ['--env-file=' + L.ENV_PATH, '--experimental-strip-types', L.DOCTOR_SCRIPT, '--static'], {
+      cwd: L.PKG, stdio: 'pipe', timeout: 60_000, encoding: 'utf8',
+    });
+    const output = (result.stdout ?? '') + (result.stderr ?? '');
+    const outLines = output.split('\n').filter(Boolean).slice(-25);
+    const docLines: string[] = [];
+    for (const l of outLines) {
+      const color = /^FAIL/i.test(l) ? RED : /^PASS/i.test(l) ? GREEN : /^WARN/i.test(l) ? YELLOW : DIM;
+      docLines.push(`  ${color}${l.slice(0, 160)}${RESET}`);
+    }
+    if (result.error) {
+      docLines.push(`  ${r(`doctor failed: ${result.error.message}`)}`);
+    }
+    comps.push(new Block(docLines));
+    comps.push(new Spacer(1));
+
+    const back = new MenuList([{ label: '← Back', value: 'back' }]);
+    back.onSelect = () => this.navigate('menu');
+    back.onCancel = () => this.navigate('menu');
+    comps.push(back);
+
+    return comps;
+  }
+
+  // ── About screen ──────────────────────────────────────────────────────
+
+  private screenAbout(): Component[] {
+    const comps: Component[] = [];
+    comps.push(new Block(this.miniHeader()));
+    comps.push(new HRule());
+    comps.push(new Spacer(1));
+    comps.push(new Block([`  ${a(b('About'))}  ${d(`Relay v${L.relayVersion()}`)}`]));
+    comps.push(new Spacer(1));
+
+    const cf = L.detectCloudflare();
+    const deploy = L.detectDeployment();
+
+    const lines: string[] = [
+      `  ${d('version').padEnd(16)} ${L.relayVersion()}`,
+      `  ${d('mode').padEnd(16)} ${this.env.get('RELAY_MODE') ?? 'gateway'}`,
+      `  ${d('endpoint').padEnd(16)} ${c(L.endpoint(this.env))}`,
+      `  ${d('node').padEnd(16)} ${process.version}`,
+      `  ${d('catalog').padEnd(16)} ${existsSync(L.CATALOG_PATH) ? `${L.readCatalog().length} models` : y('not found')}`,
+      `  ${d('cloudflared').padEnd(16)} ${cf.installed ? `${cf.version ?? 'installed'}${cf.serviceActive ? ' · active' : ''}` : d('not installed')}`,
+      `  ${d('deployment').padEnd(16)} ${deploy.serviceActive ? 'relay.service (active)' : deploy.dockerPresent ? d('docker available') : d('manual / npm start')}`,
+      ``,
+      `  ${d('Local AI gateway · OpenAI & Anthropic compatible')}`,
+    ];
+    comps.push(new Block(lines));
+    comps.push(new Spacer(1));
+
+    const back = new MenuList([{ label: '← Back', value: 'back' }]);
+    back.onSelect = () => this.navigate('menu');
+    back.onCancel = () => this.navigate('menu');
+    comps.push(back);
+
+    return comps;
+  }
+
+  // ── Lifecycle ─────────────────────────────────────────────────────────
+
+  private quit(): void {
+    this.tui.stop();
+    process.exit(0);
+  }
+
+  run(): void {
+    this.tui.start();
+    this.renderScreen();
   }
 }
 
-function resolveHome(inputPath: string): string {
-  if (inputPath === '~') return process.env.HOME ?? inputPath;
-  if (inputPath.startsWith('~/')) return resolve(process.env.HOME ?? '', inputPath.slice(2));
-  return inputPath;
-}
+// ── Export ──────────────────────────────────────────────────────────────
 
-function shEscape(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
-}
-
-function generateStartScript(input: {
-  modelId: string;
-  modelLabel: string;
-  modelPath: string;
-  llamaServerPath: string;
-  ctxSize: number;
-  multimodal: boolean;
-  fit: FitClass;
-}): string {
-  mkdirSync(START_SCRIPTS_DIR, { recursive: true });
-  const scriptPath = resolve(START_SCRIPTS_DIR, `start-${input.modelId}.sh`);
-  const maybeVisionComment = input.multimodal ? '# Vision model: add --mmproj /path/to/mmproj.gguf before first real use.\n' : '';
-  const maybePartialComment = input.fit === 'partial-offload'
-    ? '# Partial-offload profile: tune -ngl after first successful load if VRAM has headroom.\n'
-    : '';
-  const gpuLayers = input.fit === 'partial-offload' ? 35 : 99;
-  const script = `#!/usr/bin/env bash
-set -euo pipefail
-
-# Relay generated start script for ${input.modelLabel}
-LLAMA_PORT="\${LLAMA_PORT:-8080}"
-MODEL=${shEscape(input.modelPath)}
-LLAMA_SERVER=${shEscape(input.llamaServerPath)}
-${maybeVisionComment}
-${maybePartialComment}
-
-if [[ ! -f "$MODEL" ]]; then
-  echo "Relay model file not found: $MODEL" >&2
-  exit 1
-fi
-
-exec "$LLAMA_SERVER" \\
-  --model "$MODEL" \\
-  --host 127.0.0.1 \\
-  --port "$LLAMA_PORT" \\
-  --ctx-size ${input.ctxSize} \\
-  --jinja \\
-  --parallel 1 \\
-  -ngl ${gpuLayers}
-`;
-  writeFileSync(scriptPath, script);
-  chmodSync(scriptPath, 0o755);
-  return scriptPath;
+export async function runSetup(): Promise<void> {
+  const app = new RelayTUI();
+  app.run();
 }

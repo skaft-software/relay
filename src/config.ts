@@ -399,3 +399,19 @@ export function isModelMultimodal(config: AppConfig, model?: string): boolean {
   if (model && config.modelEntries?.[model]?.multimodal === false) return false;
   return config.upstreamVisionOk ?? false;
 }
+
+export type ConfigWarning = { severity: 'error' | 'warn'; key: string; message: string };
+
+/** Validate a loaded config, returning startup warnings/errors (empty = all good). */
+export function validateConfig(config: AppConfig): ConfigWarning[] {
+  const warnings: ConfigWarning[] = [];
+  const bindsAll = config.host === '0.0.0.0' || config.host === '::';
+  if (bindsAll && !config.apiKey && config.relayMode !== 'cloud') {
+    warnings.push({
+      severity: 'error',
+      key: 'API_KEY',
+      message: 'binding to all interfaces without an API_KEY — set API_KEY or bind to 127.0.0.1',
+    });
+  }
+  return warnings;
+}
