@@ -19,6 +19,42 @@ if (process.argv[2] === 'provision') {
   process.exit(0);
 }
 
+if (process.argv[2] === 'llama') {
+  const { runLlamaCli } = await import('./llama.ts');
+  runLlamaCli(process.argv.slice(3));
+  process.exit(0);
+}
+
+if (process.argv[2] === 'docker') {
+  const { runDockerCli } = await import('./docker.ts');
+  runDockerCli(process.argv.slice(3));
+  process.exit(0);
+}
+
+if (process.argv[2] === 'models') {
+  const { runModelsCli } = await import('./models.ts');
+  runModelsCli(process.argv.slice(3));
+  process.exit(0);
+}
+
+if (process.argv[2] === 'tunnel') {
+  const { runTunnelCli } = await import('./cloudflare.ts');
+  runTunnelCli(process.argv.slice(3));
+  process.exit(0);
+}
+
+if (process.argv[2] === 'probe') {
+  const { runProbeCli } = await import('./probe.ts');
+  await runProbeCli(process.argv.slice(3));
+  process.exit(0);
+}
+
+if (process.argv[2] === 'catalog') {
+  const { runCatalogCli } = await import('./catalog.ts');
+  await runCatalogCli(process.argv.slice(3));
+  process.exit(0);
+}
+
 const config = loadConfig();
 const logFile = resolveLogFile();
 const logger = createLogger(config.logLevel, logFile);
@@ -70,11 +106,11 @@ if ((config.host === '0.0.0.0' || config.host === '::') && !config.apiKey && con
 const app = createApp(config);
 
 if (config.relayMode === 'cloud') {
-  logger.info('relay cloud mode — proxying to external APIs', {
+  logger.info('cloud mode — proxying to external APIs', {
     models: config.cloudModels ? Object.keys(config.cloudModels).join(', ') : 'none',
   });
 } else {
-  logger.info('relay gateway mode — managing local models');
+  logger.info('gateway mode — lazy model lifecycle, local GPU inference');
 }
 
 if (logFile) {
