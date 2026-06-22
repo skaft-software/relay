@@ -118,19 +118,6 @@ export const c = (s: string) => (CYAN ? `${CYAN}${s}${FG_OFF}` : s);
 export const b = (s: string) => (BOLD ? `${BOLD}${s}${ATTR_OFF}` : s);
 export const d = (s: string) => (DIM ? `${DIM}${s}${ATTR_OFF}` : s);
 
-// Bright (aixterm 90–97) foregrounds — high contrast for text on the shaded
-// card's blue fill, where standard-intensity colors muddy together. They work
-// at every color level; monochrome/plain drop them like any other color.
-const bright = (code: string) => (caps.plain || lvl === 'none' ? '' : code);
-export const WHITEB = bright('\x1b[97m');
-export const GREENB = bright('\x1b[92m');
-export const YELLOWB = bright('\x1b[93m');
-export const CYANB = bright('\x1b[96m');
-export const w = (s: string) => (WHITEB ? `${WHITEB}${s}${FG_OFF}` : s);
-export const gB = (s: string) => (GREENB ? `${GREENB}${s}${FG_OFF}` : s);
-export const yB = (s: string) => (YELLOWB ? `${YELLOWB}${s}${FG_OFF}` : s);
-export const cB = (s: string) => (CYANB ? `${CYANB}${s}${FG_OFF}` : s);
-
 // ── Glyphs (degraded by unicode support) ──────────────────────────────────
 
 /** The wordmark. Crisp block figlet on unicode terminals; plain on ASCII ones. */

@@ -10,7 +10,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 
 import { TUI, ProcessTerminal, Container, Text, Box, Spacer, Input, type Component, type Focusable, CURSOR_MARKER, matchesKey } from './tui/index.ts';
-import { truncateToWidth, visibleWidth, applyBackgroundToLine } from './tui/utils.ts';
+import { truncateToWidth, visibleWidth } from './tui/utils.ts';
 
 import * as L from './setup-logic.ts';
 import { resolve } from 'node:path';
@@ -23,7 +23,7 @@ import type { CatalogEntry, EnvMap, GpuProbe, FitClass } from './setup-logic.ts'
 
 import {
   ACCENT_BG, GREEN, YELLOW, RED, DIM, RESET, INVERSE,
-  a, g, y, r, c, b, d, w, gB, yB, cB, LOGO, RULE_CH, fold,
+  a, g, y, r, c, b, d, LOGO, RULE_CH, fold,
 } from './setup-theme.ts';
 
 // ── Custom components ───────────────────────────────────────────────────
@@ -39,53 +39,6 @@ class HRule implements Component {
   invalidate(): void {}
   render(width: number): string[] {
     return [fold(`${this.color}${this.ch.repeat(width)}${RESET}`)];
-  }
-}
-
-/** Shaded card — horizontal lines top/bottom, dim background fill. No vertical borders. */
-class Card implements Component {
-  private children: Component[] = [];
-  private padX: number;
-  private padY: number;
-  private bgFn: (text: string) => string;
-
-  constructor(padX = 2, padY = 1, bgFn?: (text: string) => string) {
-    this.padX = padX;
-    this.padY = padY;
-    this.bgFn = bgFn ?? ((s: string) => `${ACCENT_BG}${s}${RESET}`);
-  }
-
-  addChild(child: Component): void {
-    this.children.push(child);
-  }
-
-  invalidate(): void {
-    for (const c of this.children) c.invalidate?.();
-  }
-
-  render(width: number): string[] {
-    const contentWidth = Math.max(1, width - this.padX * 2);
-    const leftPad = ' '.repeat(this.padX);
-    const lines: string[] = [];
-
-    // Top padding
-    for (let i = 0; i < this.padY; i++) {
-      lines.push(applyBackgroundToLine(' '.repeat(width), width, this.bgFn));
-    }
-
-    // Children
-    for (const child of this.children) {
-      for (const line of child.render(contentWidth)) {
-        lines.push(applyBackgroundToLine(leftPad + line + ' '.repeat(Math.max(0, contentWidth - visibleWidth(line))), width, this.bgFn));
-      }
-    }
-
-    // Bottom padding
-    for (let i = 0; i < this.padY; i++) {
-      lines.push(applyBackgroundToLine(' '.repeat(width), width, this.bgFn));
-    }
-
-    return lines;
   }
 }
 
@@ -256,12 +209,12 @@ class RelayTUI {
   }
 
   private hwVerdict(): string {
-    if (!this.gpu) return yB('modest — we\'ll find a small model that runs great.');
+    if (!this.gpu) return 'modest — we\'ll find a small model that runs great.';
     const budget = this.gpu.vram_total_gb;
-    if (budget >= 22) return gB('plenty of room — you can run big, smart models.');
-    if (budget >= 12) return gB('a comfy amount — solid coding models will fly.');
-    if (budget >= 7) return cB('enough for a capable everyday model.');
-    return yB('modest, but we\'ll find a small model that runs great.');
+    if (budget >= 22) return 'plenty of room — you can run big, smart models.';
+    if (budget >= 12) return 'a comfy amount — solid coding models will fly.';
+    if (budget >= 7) return 'enough for a capable everyday model.';
+    return 'modest, but we\'ll find a small model that runs great.';
   }
 
   private vramStr(): string {
@@ -316,14 +269,11 @@ class RelayTUI {
     comps.push(new Block([`  ${c('       your friendly model gateway — no jargon required')}`]));
     comps.push(new Spacer(1));
 
-    // Hardware card. Specs use readable colors on the blue fill — accent-on-accent
-    // is invisible, and the connector reads in default fg rather than dim.
-    const card = new Card(2, 1);
-    card.addChild(new Block([
-      `  ${gB('●')} ${b(w(this.hwLabel))}   ${w(this.vramStr())}   ${w(`${L.SYSTEM_RAM_GB} GB RAM`)}`,
-      `  ${w('└')} ${this.hwVerdict()}`,
+    // Hardware — plain text, no colored backgrounds. Works on headless terminals.
+    comps.push(new Block([
+      `  ${b(this.hwLabel)}   ${this.vramStr()}   ${L.SYSTEM_RAM_GB} GB RAM`,
+      `  ${d(this.hwVerdict())}`,
     ]));
-    comps.push(card);
     comps.push(new Spacer(1));
 
     // Greeting
@@ -590,17 +540,15 @@ class RelayTUI {
     const lifecycle = this.env.get('RELAY_MODEL_LIFECYCLE_ENABLED') === 'true' ? g('on') : d('off');
     const apiKey = this.env.get('API_KEY') ?? '(unset)';
 
-    // Summary card
-    const card = new Card(2, 1);
-    card.addChild(new Block([
+    // Summary — plain text, no colored backgrounds.
+    comps.push(new Block([
       `  ${b('Summary')}`,
       `    Mode:       ${relayMode}`,
-      `    Endpoint:   ${c(`http://${host}:${port}/v1`)}`,
+      `    Endpoint:   http://${host}:${port}/v1`,
       `    Model:      ${defaultModel}`,
       `    Lifecycle:  ${lifecycle}`,
-      `    API key:    ${apiKey === '(unset)' ? apiKey : `${apiKey.slice(0, 8)}…`}`,
+      `    API key:    ${apiKey === '(unset)' ? apiKey : `${apiKey.slice(0, 8)}...`}`,
     ]));
-    comps.push(card);
     comps.push(new Spacer(1));
 
     // Next steps

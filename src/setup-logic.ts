@@ -8,6 +8,7 @@ import { resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { packageDir, envFilePath, startScriptsDir, ensureDataDir } from './paths.ts';
+import { sizeModel, buildLaunchFlags, GB } from './sizing/size-model.ts';
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -370,7 +371,7 @@ export function downloadModel(model: CatalogEntry, modelDir: string): string {
   return destination;
 }
 
-// ── size-model.py integration (the real solver) ────────────────────────
+// ── Hardware-aware sizing (pure TS, no Python dependency) ──────────────
 
 export type SizeModelResult = {
   maxCtx: number;
@@ -381,28 +382,19 @@ export type SizeModelResult = {
   kvGb: number;
 };
 
-const SIZE_MODEL_SCRIPT = resolve(PKG, 'scripts', 'size-model.py');
-
-/** Call the real hardware-aware solver to compute optimal launch flags
-  * for a GGUF file. Returns null if the script fails or python is missing. */
-export function sizeModelWithPython(ggufPath: string, pythonPath?: string): SizeModelResult | null {
+/** Call the TS sizing engine against a downloaded GGUF. Returns null on failure. */
+export function sizeModelTS(ggufPath: string, vramGb: number, dramGb: number): SizeModelResult | null {
   try {
-    const out = execFileSync(pythonPath ?? 'python3', [SIZE_MODEL_SCRIPT, ggufPath, '--json'], {
-      encoding: 'utf8',
-      timeout: 180_000,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      cwd: PKG,
-    });
-    const data = JSON.parse(out.trim());
-    if (!data || typeof data !== 'object') return null;
-    if (data.error) return null;
+    const { result } = sizeModel(ggufPath, Math.trunc(vramGb * GB), Math.trunc(dramGb * GB));
+    if (!result.ok) return null;
+    const { launchFlags, expertFlag } = buildLaunchFlags(result);
     return {
-      maxCtx: typeof data.max_ctx === 'number' ? data.max_ctx : 0,
-      launchFlags: Array.isArray(data.launch_flags) ? data.launch_flags : [],
-      expertFlag: typeof data.expert_flag === 'string' ? data.expert_flag : '',
-      nCpuMoe: typeof data.n_cpu_moe === 'number' ? data.n_cpu_moe : 0,
-      headroomPct: typeof data.headroom_pct === 'number' ? data.headroom_pct : 0,
-      kvGb: typeof data.kv_gb === 'number' ? data.kv_gb : 0,
+      maxCtx: result.bestCtx,
+      launchFlags,
+      expertFlag,
+      nCpuMoe: result.nCpuMoe,
+      headroomPct: Math.round(result.headroomPct * 100) / 100,
+      kvGb: Math.round(result.kvGb * 10000) / 10000,
     };
   } catch {
     return null;
@@ -427,9 +419,11 @@ export function configureQuickstart(
     let launchFlags: string[] | undefined;
     let expertFlag: string | undefined;
 
-    // If the GGUF is already on disk, use the real solver for optimal flags
+    // If the GGUF is on disk, use the real TS sizing engine for optimal flags
     if (existsSync(modelPath)) {
-      const tuned = sizeModelWithPython(modelPath);
+      const vramGb = gpu?.vram_total_gb ?? 0;
+      const dramGb = SYSTEM_RAM_GB - (gpu ? 2 : 0); // keep OS headroom
+      const tuned = sizeModelTS(modelPath, vramGb, dramGb);
       if (tuned) {
         ctxSize = tuned.maxCtx;
         launchFlags = tuned.launchFlags;

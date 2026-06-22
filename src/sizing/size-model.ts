@@ -297,3 +297,34 @@ export function sizeModel(path: string, vramBytes: number, dramBytes: number): {
   const result = compute(vramBytes, dramBytes, meta, analysis);
   return { meta, analysis, result };
 }
+
+/** Build launch flags from a sizing result, mirroring size-model.py"s output format.
+  * Returns flat [flag, value, flag, value, ...] for use by generateStartScript. */
+export function buildLaunchFlags(
+  result: SizeResult,
+  opts?: { gpuLayers?: number; parallel?: number; flashAttn?: string; cacheType?: string },
+): { launchFlags: string[]; expertFlag: string } {
+  const gpuLayers = opts?.gpuLayers ?? 999;
+  const parallel = opts?.parallel ?? 1;
+  const flashAttn = opts?.flashAttn ?? "on";
+  const cacheType = opts?.cacheType ?? "q4_0";
+
+  const flags: string[] = [
+    "--ctx-size", String(result.bestCtx),
+    "-ngl", String(gpuLayers),
+    "--parallel", String(parallel),
+    "--flash-attn", flashAttn,
+    "--cache-type-k", cacheType,
+    "--cache-type-v", cacheType,
+    "--jinja",
+  ];
+
+  let expertFlag = "";
+  if (result.cpuMoe) {
+    expertFlag = "--cpu-moe";
+  } else if (result.nCpuMoe > 0) {
+    expertFlag = `--n-cpu-moe ${result.nCpuMoe}`;
+  }
+
+  return { launchFlags: flags, expertFlag };
+}
