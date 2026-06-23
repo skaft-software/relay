@@ -23,4 +23,6 @@ EXPOSE 1234
 
 USER relay
 
-CMD ["node", "--experimental-strip-types", "src/main.ts"]
+# Node 22+ native .env loading. Falls back to process env if /app/.env is missing
+# (e.g. when --env-file is used via docker run instead of a volume mount).
+CMD ["node", "--experimental-strip-types", "--env-file=/app/.env", "src/main.ts"]
