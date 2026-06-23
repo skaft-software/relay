@@ -103,7 +103,11 @@ export async function handleModels(config: AppConfig, model?: string, externalSi
   // When modelEntries is configured (gateway mode), merge static map with on-disk discovery.
   if (config.modelEntries) {
     const discovered = discoverModels(config);
-    const allModels = discovered.map((d) => {
+    // Only advertise models that have a static entry (went through setup and have
+    // a launch command). On-disk GGUFs matched from the catalog but not yet
+    // provisioned are excluded — they have no start script and will fail at runtime.
+    const provisioned = discovered.filter((d) => d.entry != null);
+    const allModels = provisioned.map((d) => {
       const entry = d.entry;
       const cat = d.catalogEntry;
       const id = d.id;
