@@ -1,27 +1,136 @@
-import type { AppConfig } from '../config.ts';
+import { existsSync } from 'node:fs';
+import { resolve } from 'node:path';
+
+import type { AppConfig, ModelEntry } from '../config.ts';
 import { GatewayError, jsonResponse } from '../errors.ts';
 import { upstreamJson } from '../upstream/llama.ts';
 import { activeProfile } from '../profile.ts';
+import { readCatalog, type CatalogEntry } from '../setup-logic.ts';
+import { scanGgufs } from '../models.ts';
+
+/**
+ * Discover all models available to relay:
+ * 1. Static modelEntries (from RELAY_MODEL_MAP) — full lifecycle support
+ * 2. On-disk GGUFs matched against the catalog — auto-discovered, served without
+ *    pre-provisioning. Relay auto-generates a start config when first requested.
+ */
+export function discoverModels(config: AppConfig): Array<{
+  id: string;
+  entry?: ModelEntry;
+  catalogEntry?: CatalogEntry;
+  onDisk: boolean;
+  ggufPath?: string;
+}> {
+  const modelDir = process.env.RELAY_MODEL_DIR ||
+    resolve(process.env.HOME ?? '/home', 'models');
+  const catalog = readCatalog();
+
+  // Build an index: catalog id → entry, and quick lookup by filename
+  const catalogById = new Map<string, CatalogEntry>();
+  const catalogByFilename = new Map<string, CatalogEntry>();
+  for (const c of catalog) {
+    catalogById.set(c.id, c);
+    if (c.filename) catalogByFilename.set(c.filename.toLowerCase(), c);
+  }
+
+  const onDisk = scanGgufs(modelDir);
+  const result: Map<string, {
+    id: string;
+    entry?: ModelEntry;
+    catalogEntry?: CatalogEntry;
+    onDisk: boolean;
+    ggufPath?: string;
+  }> = new Map();
+
+  // First pass: static entries (always shown, even if file is missing)
+  if (config.modelEntries) {
+    for (const [id, entry] of Object.entries(config.modelEntries)) {
+      const catEntry = catalogById.get(id) ??
+        (entry.cmd ? catalogByFilename.get(basenameOf(entry.cmd).toLowerCase()) : undefined);
+      // Check if the model file exists on disk
+      let ggufPath: string | undefined;
+      for (const g of onDisk) {
+        if (g.name.toLowerCase() === (catEntry?.filename ?? '').toLowerCase() ||
+            g.name.toLowerCase().replace(/[^a-z0-9]/g, '').includes(id.toLowerCase().replace(/[^a-z0-9]/g, ''))) {
+          ggufPath = g.path;
+          break;
+        }
+      }
+      result.set(id, { id: entry.name ?? id, entry, catalogEntry: catEntry, onDisk: Boolean(ggufPath), ggufPath });
+    }
+  }
+
+  // Second pass: on-disk models not yet in the static map
+  for (const g of onDisk) {
+    // Try to match this GGUF to a catalog entry
+    let catEntry = catalogByFilename.get(g.name.toLowerCase());
+    if (!catEntry) {
+      // Try stem matching
+      const stem = g.name.toLowerCase().replace(/\.gguf$/, '').replace(/[^a-z0-9]/g, '');
+      for (const c of catalog) {
+        const cStem = c.id.toLowerCase().replace(/[^a-z0-9]/g, '');
+        if (cStem.length > 6 && stem.includes(cStem)) { catEntry = c; break; }
+      }
+    }
+    if (!catEntry) continue; // can't serve models we don't know about
+
+    // Skip if already covered by a static entry
+    if (result.has(catEntry.id)) continue;
+    // Also skip if any static entry already maps to this file
+    let alreadyMapped = false;
+    for (const [, v] of result) {
+      if (v.ggufPath === g.path) { alreadyMapped = true; break; }
+    }
+    if (alreadyMapped) continue;
+
+    result.set(catEntry.id, {
+      id: catEntry.id,
+      catalogEntry: catEntry,
+      onDisk: true,
+      ggufPath: g.path,
+    });
+  }
+
+  return [...result.values()];
+}
+
+function basenameOf(p: string): string {
+  const parts = p.split('/');
+  return parts[parts.length - 1] ?? p;
+}
 
 export async function handleModels(config: AppConfig, model?: string, externalSignal?: AbortSignal): Promise<Response> {
-  // When modelEntries is configured, serve the list directly from relay config.
+  // When modelEntries is configured (gateway mode), merge static map with on-disk discovery.
   if (config.modelEntries) {
-    const allModels = Object.keys(config.modelEntries).map((id) => {
-      const entry = config.modelEntries![id];
-      const ctxSize = entry.ctx_size ?? config.upstreamCtxSize;
+    const discovered = discoverModels(config);
+    const allModels = discovered.map((d) => {
+      const entry = d.entry;
+      const cat = d.catalogEntry;
+      const id = d.id;
+
+      const ctxSize = entry?.ctx_size ?? cat?.ctx ?? config.upstreamCtxSize;
+      const multimodal = entry?.multimodal ?? cat?.vision ?? false;
+      const thinkingLevels = entry?.thinking_levels ??
+        (cat?.thinking === 'on' ? ['on'] : cat?.thinking === 'toggle' ? ['on', 'off'] : undefined);
       const profile = activeProfile(config, id);
+      const thinkingSupported = thinkingLevels ? thinkingLevels.length > 0 : profile.thinking.supported;
+
       const caps: string[] = ['completion'];
-      if (entry.multimodal === true) caps.push('multimodal');
+      if (multimodal) caps.push('multimodal');
+
       const meta: Record<string, unknown> = {};
       if (ctxSize) meta.n_ctx = ctxSize;
+      // Tag auto-discovered models so clients know they may need cold-start
+      if (!entry && d.onDisk) meta.auto_discovered = true;
+
       return {
-        id: entry.name ?? id,
+        id,
         object: 'model',
         created: 0,
         owned_by: 'local',
         capabilities: caps,
-        supports_thinking: profile.thinking.supported,
-        thinking_levels: profile.thinking.levels,
+        supports_thinking: thinkingSupported,
+        thinking_levels: thinkingLevels ?? (thinkingSupported ? ['on', 'off'] : undefined),
         meta: Object.keys(meta).length ? meta : undefined,
       };
     });

@@ -1,6 +1,6 @@
 {
   "name": "@skaft/relay",
-  "version": "0.1.4",
+  "version": "0.3.0",
   "description": "Lightweight OpenAI/Anthropic-compatible gateway for local llama.cpp models — with a no-jargon setup TUI that sizes models to your hardware, builds llama.cpp for your GPU, and manages Docker for you.",
   "type": "module",
   "bin": {

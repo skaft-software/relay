@@ -37,18 +37,19 @@ for (const m of golden) {
     ['exp', ta.exp, m.analyze.exp],
     ['n_kv', ta.nKv, m.analyze.n_kv],
     ['n_cache', ta.nCache, m.analyze.n_cache],
+    ['kv_ptok_f32', Math.round(ta.kvPtok), Math.round(m.analyze.kv_ptok_f32)],
   ];
   for (const [name, got, want] of exact) {
     if (got !== want) { fails++; console.log(`FAIL ${m.path} ${name}: got ${got} want ${want}`); }
   }
-  if (!near(ta.kvPtok, m.analyze.kv_ptok, 0.5)) { fails++; console.log(`FAIL ${m.path} kv_ptok: got ${ta.kvPtok} want ${m.analyze.kv_ptok}`); }
+
 
   for (const cs of m.cases) {
     const dram = cs.vram_gb === 24 ? 64 : 32;
     const r = compute(cs.vram_gb * GB, dram * GB, meta, ta);
     if (r.bestCtx !== cs.best_ctx) { fails++; console.log(`FAIL ${m.path}@${cs.vram_gb} best_ctx: ${r.bestCtx} vs ${cs.best_ctx}`); }
-    if (r.nCpuMoe !== cs.n_cpu_moe) { fails++; console.log(`FAIL ${m.path}@${cs.vram_gb} n_cpu_moe: ${r.nCpuMoe} vs ${cs.n_cpu_moe}`); }
-    if ((r.cpuMoe ? 1 : 0) !== (cs.cpu_moe ? 1 : 0)) { fails++; console.log(`FAIL ${m.path}@${cs.vram_gb} cpu_moe: ${r.cpuMoe} vs ${cs.cpu_moe}`); }
+    if (r.cpuMoeLayers !== cs.n_cpu_moe) { fails++; console.log(`FAIL ${m.path}@${cs.vram_gb} n_cpu_moe: ${r.cpuMoeLayers} vs ${cs.n_cpu_moe}`); }
+    if ((r.allExpertsCpu ? 1 : 0) !== (cs.cpu_moe ? 1 : 0)) { fails++; console.log(`FAIL ${m.path}@${cs.vram_gb} cpu_moe: ${r.allExpertsCpu} vs ${cs.cpu_moe}`); }
     if (!near(r.headroomPct, cs.headroom_pct, 0.02)) { fails++; console.log(`FAIL ${m.path}@${cs.vram_gb} headroom_pct: ${r.headroomPct} vs ${cs.headroom_pct}`); }
     if (!near(r.kvGb, cs.kv_gb, 0.002)) { fails++; console.log(`FAIL ${m.path}@${cs.vram_gb} kv_gb: ${r.kvGb} vs ${cs.kv_gb}`); }
     if (!near(r.expGpuGb, cs.exp_gpu, 0.002)) { fails++; console.log(`FAIL ${m.path}@${cs.vram_gb} exp_gpu: ${r.expGpuGb} vs ${cs.exp_gpu}`); }

@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.3.0 - 2026-06-22
+
+### Added
+
+- **GGUF sizing engine (TypeScript)** — `src/sizing/` reads GGUF metadata in pure Node (no Python/gguf dependency), analyzes expert vs. non-expert byte splits per architecture (qwen35moe, deepseek2/MLA, cohere2moe, gemma4/SWA), and computes optimal `n_cpu_moe` offload with 5% VRAM headroom, so a 14 GB MoE model can run on an 8 GB card. The Python `scripts/size-model.py` is retained as the differential-test oracle only.
+- **Catalog sizing** — KV-per-token estimates, backend detection, host profiles, and fit labels; `scripts/build-catalog.py` enriches the model catalog from GGUF metadata.
+- **Interactive setup TUI** (`relay setup`) — event-driven terminal UI (`src/tui/`, `src/setup.ts`) with hardware detection, model download, probe, quant picker, and tunnel/docker/start screens, plus BYO-endpoint and cloud configuration. Terminal-capability detection degrades gracefully: truecolor→256→16→none and Unicode→ASCII, with `--ascii` / `--no-color` / `--plain` overrides.
+- **New CLI subcommands** — `relay doctor` (hardware + network diagnostics, `--json`), `relay provision` (host bootstrap; dry-run by default, mutations gated behind `--apply` which stages scripts/`.env` and leaves the live service untouched), `relay llama` (detect/build llama.cpp for the detected GPU backend), `relay docker`, `relay models`, `relay tunnel` (Cloudflare), `relay probe`, and `relay catalog`. `relay help` now prints usage.
+- **MoE expert offload** — `expert_flag` added to the model config schema.
+- **Anthropic lifecycle integration** — `/v1/messages` ensures the target model is available before proxying.
+
+### Changed
+
+- Tool requests with non-function tools are now rejected with an explicit `unsupported` error instead of being silently dropped.
+- Dynamic per-model upstream routing: the chat handler resolves and forwards the per-model upstream URL.
+- `tsconfig` target bumped to ES2024 (regex `/v` flag support).
+- Documentation: landing page rewrite, light/dark mode, and updated configuration / model-setup / quickstart guides.
+
+### Removed
+
+- Stale Python TUI, legacy installers, and superseded test scripts.
+
+### Known issues
+
+- **Prefix-cache pre-warming was dropped** in the lifecycle refactor. Model switching still works (eager kill-old → start-new) but no longer pre-fills the KV cache on switch, so the first request after a switch pays full prompt-processing latency. Re-introduction is tracked; the `model-switch` test covers the current switching behavior.
+
+## v0.2.2 - 2026-06-16
+
+### Added
+
+- Qwen3.6-27B and Gemma-4-31B dense models (UD-Q2_K_XL) added to the model catalog.
+
 ## v0.2.1 - 2026-06-16
 
 ### Added

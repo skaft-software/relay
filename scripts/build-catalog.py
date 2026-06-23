@@ -11,6 +11,7 @@ from pathlib import Path
 from collections import defaultdict
 
 COLLECTION_URL = "https://huggingface.co/api/collections/unsloth/unsloth-dynamic-20-quants"
+CUSTOM_CATALOG = Path(__file__).resolve().parent.parent / "docs" / "custom-catalog.json"
 OUT = Path(os.environ["HOME"]) / "relay/docs/model-catalog.json"
 
 # ── Model metadata ──
@@ -161,6 +162,7 @@ def infer_meta(repo_id):
     elif "north" in name or "cohere" in name: meta["family"] = "cohere"
     elif "gpt-oss" in name: meta["family"] = "hypernova"
     elif "granite" in name: meta["family"] = "granite"
+    elif "apodex" in name: meta["family"] = "qwen"  # Apodex is a Qwen3.5 fine-tune
     
     if any(t in name for t in ["vl", "vision", "image-edit"]): meta["vision"] = True; meta["lane"] = "vision"
     if "image-edit" in name: meta["lane"] = "image-edit"
@@ -174,7 +176,13 @@ def infer_meta(repo_id):
         e = re.search(r'(\d+)e', name)
         if e: meta["expert_count"] = int(e.group(1))
     
-    if meta["family"] == "qwen": meta["arch"] = "qwen3moe" if meta.get("moe") else "qwen3"
+    if meta["family"] == "qwen":
+        if meta.get("moe"):
+            meta["arch"] = "qwen35moe"  # Qwen3.5+ MoE uses qwen35moe arch
+        elif "qwen3.5" in name or "qwen3.6" in name or "qwq" in name or "apodex" in name:
+            meta["arch"] = "qwen35"  # Qwen3.5/3.6/Apodex use qwen35 arch
+        else:
+            meta["arch"] = "qwen3"
     elif meta["family"] == "gemma": meta["arch"] = "gemma4"
     elif meta["family"] in ("glm", "deepseek", "kimi", "minimax"): meta["arch"] = "deepseek2"
     elif meta["family"] == "mistral": meta["arch"] = "mistral3"
@@ -367,11 +375,24 @@ def main():
                 new_entries.append(e)
                 preserved += 1
     
+    # Merge custom catalog entries (manually curated models outside Unsloth collection)
+    custom_preserved = 0
+    if CUSTOM_CATALOG.exists():
+        custom_entries = json.loads(CUSTOM_CATALOG.read_text())
+        custom_ids = {e["id"] for e in custom_entries}
+        custom_repos = {e.get("hf_repo", "") for e in custom_entries}
+        # Remove any auto-generated entries that overlap with custom ones
+        new_entries = [e for e in new_entries if e["id"] not in custom_ids and e.get("hf_repo", "") not in custom_repos]
+        new_entries.extend(custom_entries)
+        custom_preserved = len(custom_entries)
+        print(f"\nMerged {custom_preserved} custom catalog entries from {CUSTOM_CATALOG}", file=sys.stderr)
+    
     if preserved:
         print(f"\nPreserved {preserved} entries from {len(existing_by_repo) - repos_replaced} repos not in collection", file=sys.stderr)
     
     print(f"\n{'=' * 60}", file=sys.stderr)
-    print(f"Total: {len(new_entries)} entries ({files_found} UD + {preserved} preserved)", file=sys.stderr)
+    total_msg = f"Total: {len(new_entries)} entries ({files_found} UD + {preserved} preserved + {custom_preserved} custom)"
+    print(total_msg, file=sys.stderr)
     
     quant_order = {
         "TQ1_0": 0, "IQ1_S": 1, "IQ1_M": 2, "IQ2_XXS": 3, "IQ2_M": 4,

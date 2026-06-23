@@ -8,7 +8,8 @@ import { resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { packageDir, envFilePath, startScriptsDir, ensureDataDir } from './paths.ts';
-import { sizeModel, buildLaunchFlags, GB } from './sizing/size-model.ts';
+import { sizeModel, buildLaunchFlags, GB, KV_QUANT_RATIO, type FitStrategy, type SizedMode, type SizeResult } from './sizing/size-model.ts';
+export type { FitStrategy };
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -24,12 +25,13 @@ export type CatalogEntry = {
   size_gb?: number;
   download_url?: string;
   filename?: string;
+  hf_repo?: string;
   moe?: boolean;
   arch?: string;
   expert_count?: number;
   active_experts?: number;
   shards?: number;
-  /** GGUF-derived KV bytes-per-token at q4_0 (from the model's own header, via
+  /** GGUF-derived KV bytes-per-token at F32 (from the model's own header, via
    *  `relay catalog enrich`). When present it's the source of truth for the fit
    *  estimate — no hand-maintained per-arch table needed. */
   kv_ptok?: number;
@@ -65,6 +67,7 @@ export const PKG = packageDir();
 export const ENV_PATH = envFilePath();
 export const EXAMPLE_PATH = resolve(PKG, '.env.example');
 export const CATALOG_PATH = resolve(PKG, 'docs', 'model-catalog.json');
+export const CUSTOM_CATALOG_PATH = resolve(PKG, 'docs', 'custom-catalog.json');
 export const START_SCRIPTS_DIR = startScriptsDir();
 export const PROBE_GPU_PATH = resolve(PKG, 'scripts', 'probe-gpu.sh');
 export const PKG_PATH = resolve(PKG, 'package.json');
@@ -128,8 +131,41 @@ export function endpoint(env: EnvMap): string {
 // ── Catalog ─────────────────────────────────────────────────────────────
 
 export function readCatalog(): CatalogEntry[] {
-  if (!existsSync(CATALOG_PATH)) return [];
-  return JSON.parse(readFileSync(CATALOG_PATH, 'utf8')) as CatalogEntry[];
+  let entries: CatalogEntry[] = [];
+  if (existsSync(CATALOG_PATH)) {
+    entries = JSON.parse(readFileSync(CATALOG_PATH, 'utf8')) as CatalogEntry[];
+  }
+  // Merge custom catalog entries (manually curated models outside Unsloth collection).
+  // Custom entries provide the base metadata; main-catalog entries (which may have
+  // GGUF-derived kv_ptok / nonex_frac from `relay catalog enrich`) overlay on top.
+  if (existsSync(CUSTOM_CATALOG_PATH)) {
+    const custom = JSON.parse(readFileSync(CUSTOM_CATALOG_PATH, 'utf8')) as CatalogEntry[];
+    const customById = new Map(custom.map((e) => [e.id, e]));
+    const customRepos = new Set(custom.map((e) => e.hf_repo).filter(Boolean) as string[]);
+    const merged = new Map<string, CatalogEntry>();
+    for (const e of entries) {
+      const customMatch = customById.get(e.id) ?? (e.hf_repo && customRepos.has(e.hf_repo) ? [...customById.values()].find((c) => c.hf_repo === e.hf_repo) : undefined);
+      if (customMatch) {
+        // Start with custom entry (hand-curated metadata), then overlay GGUF-derived
+        // fields from the enriched main-catalog entry.
+        const combined = { ...customMatch };
+        if (e.kv_ptok != null) combined.kv_ptok = e.kv_ptok;
+        if (e.nonex_frac != null) combined.nonex_frac = e.nonex_frac;
+        if (e.arch && e.arch !== '?') combined.arch = e.arch;
+        if (e.expert_count != null) combined.expert_count = e.expert_count;
+        if (e.active_experts != null) combined.active_experts = e.active_experts;
+        merged.set(e.id, combined);
+      } else {
+        merged.set(e.id, e);
+      }
+    }
+    // Add custom entries that have no main-catalog counterpart at all
+    for (const c of custom) {
+      if (!merged.has(c.id)) merged.set(c.id, c);
+    }
+    entries = [...merged.values()];
+  }
+  return entries;
 }
 
 /** Scan the model directory for downloaded GGUFs and return the set of
@@ -273,39 +309,52 @@ export function fmtCtx(ctx: number): string {
  *    gpt-oss    — HyperNova 60B        · 32L · 18432  (head_dim 64)
  *    mistral3   — Devstral-2 24B       · 40L · 46080
  *    qwen35     — Qwen3.6-27B (dense)  · 64L · 73728 */
+/** Per-architecture KV cache bytes-per-token at F32 (architecture-dimension).
+ *  Calibrated against real GGUF analyze().kvPtok values. Apply KV_QUANT_RATIO
+ *  for Q4/Q8 budget math in estimateContextFromCatalog().
+ *
+ *  Measured (model · layers · kvPtok F32):
+ *    qwen3moe   — Qwen3-30B-A3B        · 48L · 49152
+ *    qwen35moe  — Qwen3.6-35B-A3B      · 40L · 40960
+ *    qwen3next  — Qwen3-Coder-Next     · 48L · 12288  (linear/hybrid attn)
+ *    gemma4:moe — Gemma 4 26B-A4B      · 30L · 10240  (SWA)
+ *    gemma4:dense— Gemma 4 31B         · 60L · 40960  (SWA)
+ *    deepseek2  — GLM-4.7-Flash 23B    · 47L · 27072  (MLA latent KV)
+ *    cohere2moe — North-Mini-Code      · 49L · 50176
+ *    gpt-oss    — HyperNova 60B        · 32L · 32768
+ *    mistral3   — Devstral-2 24B       · 40L · 81920
+ *    qwen35     — Qwen3.6-27B (dense)  · 64L · 131072 */
 const KV_PTOK_EST: Record<string, number> = {
-  // ── MoE architectures (measured) ──
-  'qwen3moe':       27648,
-  'qwen35moe':      23040,
-  'qwen3next':       6912,
-  'gemma4:moe':      5760,
-  'deepseek2':      15228,
-  'cohere2moe':     28224,
-  'gpt-oss':        18432,
-  // ── Dense architectures (measured) ──
-  'gemma4:dense':   23040,  // measured (Gemma 4 31B)
-  'qwen35':         73728,  // measured (Qwen3.6-27B dense)
-  'mistral3':       46080,  // measured (Devstral 2 24B — dense)
-  'mistral3:moe':   20000,  // estimate — MoE variants (NVIDIA Nemotron-Super on Mistral arch)
-  // ── Estimates (no GGUF on hand, conservative — errs high so context estimates are safe) ──
-  // MoE estimates
-  'gemma3n:moe':     6000,  // Gemma 3 Nano MoE — SWA, tiny KV per token
-  'glm-dsa:moe':    15000,  // GLM dynamic sparse attention, small KV
-  'glm4:moe':       25000,  // GLM-4 MoE — similar to deepseek2 MLA
-  'glm4moe:moe':    25000,  // GLM-4 MoE variant
-  'granitehybrid:moe': 30000, // IBM Granite hybrid MoE
-  'llama4:moe':     40000,  // Llama 4 MoE — large head_dim (128)
-  'minimax-m2:moe':  4000,  // MiniMax-M2 lightning attention — extremely small KV
-  'nemotron_h_moe:moe': 30000, // NVIDIA Nemotron-H MoE
-  'qwen3vlmoe:moe': 24000,  // Qwen3 VL MoE — same family as qwen35moe
-  // Dense estimates
-  'gemma3:dense':   20000,  // Gemma 3 dense — SWA, small KV
-  'llama:dense':    60000,  // Llama 3/3.1/3.2 — GQA, head_dim 128
-  'phi3:dense':     35000,  // Phi-3/3.5 — small head_dim
-  'qwen3vl:dense':  70000,  // Qwen3 VL — same arch as qwen3
-  'mistral':        90000,  // estimated — no GGUF on hand to calibrate
-  'qwen2':          90000,  // estimated
-  'qwen3':          90000,  // estimated
+  // ── MoE architectures (measured, F32) ──
+  'qwen3moe':       49152,
+  'qwen35moe':      40960,
+  'qwen3next':      12288,
+  'gemma4:moe':     10240,
+  'deepseek2':      27072,
+  'cohere2moe':     50176,
+  'gpt-oss':        32768,
+  // ── Dense architectures (measured, F32) ──
+  'gemma4:dense':   40960,
+  'qwen35':        131072,
+  'mistral3':       81920,
+  'mistral3:moe':   35556,
+  // ── Estimates (no GGUF on hand, conservative — errs high) ──
+  'gemma3n:moe':    10667,
+  'glm-dsa:moe':    26667,
+  'glm4:moe':       44444,
+  'glm4moe:moe':    44444,
+  'granitehybrid:moe': 53333,
+  'llama4:moe':     71111,
+  'minimax-m2:moe':  7111,
+  'nemotron_h_moe:moe': 53333,
+  'qwen3vlmoe:moe': 42667,
+  'gemma3:dense':   35556,
+  'llama:dense':   106667,
+  'phi3:dense':     62222,
+  'qwen3vl:dense': 124444,
+  'mistral':       160000,
+  'qwen2':         160000,
+  'qwen3':         160000,
 };
 
 /** SWA fixed buffer cost in GB — one-time cost for sliding-window layers.
@@ -341,6 +390,15 @@ export type CatalogFitEstimate = {
    *  experts / dense overflow) would exceed available RAM minus a safe reserve —
    *  i.e. it would only "run" via swap/mmap thrash. */
   ramTight: boolean;
+  /** Fit strategy (full-gpu / hybrid / moe-cpu). */
+  strategy: FitStrategy;
+  /** Per-mode context estimates. Always present for balanced; speed and capacity
+   *  are present when they differ from balanced. */
+  modes: {
+    speed?: { ctx: number; strategy: FitStrategy; ctxLabel: string; kvCacheQuant: string };
+    balanced: { ctx: number; strategy: FitStrategy; ctxLabel: string; kvCacheQuant: string };
+    capacity?: { ctx: number; strategy: FitStrategy; ctxLabel: string; kvCacheQuant: string };
+  };
 };
 
 /** How much of the machine belongs to *everything except the model*.
@@ -400,7 +458,7 @@ export function backendForGpu(gpu: GpuProbe): FitBackend {
  *  calibrated arch value. Errs HIGH (predicts less context → never over-promises);
  *  the exact number arrives via download/probe or `relay catalog enrich`. */
 function genericKvPtok(model: CatalogEntry): number {
-  return model.moe ? 30000 : 80000;
+  return model.moe ? 53333 : 142222;
 }
 
 /** Non-expert byte fraction by arch (1 − expert fraction), used only when the
@@ -431,7 +489,24 @@ function moeNonexRatio(model: CatalogEntry, arch: string): number {
   return 0.10;
 }
 
-/** Estimate maximum safe context for a catalog entry on detected hardware.
+/** Compute context for a given KV quant ratio within a VRAM budget.
+ *  Internal helper used by estimateContextFromCatalog for each mode. */
+function ctxForBudget(usableVramGb: number, modelGb: number, kvPtokF32: number, kvQuant: 'q4_0' | 'q8_0', maxCtxCap: number): number {
+  const kvBudgetGb = Math.max(0, usableVramGb - modelGb) * 0.95;
+  const effKv = kvPtokF32 * (KV_QUANT_RATIO[kvQuant] ?? KV_QUANT_RATIO['q4_0']!);
+  if (effKv <= 0) return maxCtxCap;
+  return Math.min(Math.floor(kvBudgetGb * GB / effKv), maxCtxCap);
+}
+
+type ModeEstimate = { ctx: number; strategy: FitStrategy; ctxLabel: string; kvCacheQuant: string };
+
+function stratLabel(s: FitStrategy): string {
+  if (s === 'full-gpu') return 'full GPU';
+  if (s === 'moe-cpu') return 'MoE→CPU';
+  return 'hybrid';
+}
+
+/** Estimate max context for a catalog entry across three modes.
  *  For MoE models, assumes --cpu-moe (all experts on CPU, only shared
  *  weights + KV + compute on GPU). For dense models that don't fit GPU, uses
  *  partial -ngl with DRAM budget.
@@ -448,11 +523,12 @@ export function estimateContextFromCatalog(
 ): CatalogFitEstimate {
   const sizeGb = model.size_gb;
   const tvram = gpu.vram_total_gb;
-  if (!sizeGb || !tvram) return { fit: 'unknown', maxCtx: 0, expertStrategy: 'none', ctxLabel: '?', provenance: 'calc', ramTight: false };
+  if (!sizeGb || !tvram) return {
+    fit: 'unknown', maxCtx: 0, expertStrategy: 'none', ctxLabel: '?',
+    provenance: 'calc', ramTight: false, strategy: 'full-gpu',
+    modes: { balanced: { ctx: 0, strategy: 'full-gpu', ctxLabel: '?', kvCacheQuant: 'q4_0' } },
+  };
 
-  // VRAM overhead is BOTH host- and hardware-dependent: a safety margin, the
-  // host profile's display/OS reserve, and the backend's compute-buffer/driver
-  // cost (CUDA leaner than Vulkan/ROCm).
   const { vramOverheadGb, ramReserveGb } = reservesFor(hostProfile ?? detectHostProfile());
   const backendOverheadGb = BACKEND_VRAM_OVERHEAD_GB[backend ?? backendForGpu(gpu)];
   const overheadGb = 256 / 1024 + vramOverheadGb + backendOverheadGb;
@@ -461,121 +537,150 @@ export function estimateContextFromCatalog(
   const arch = model.arch ?? 'unknown';
   const moe = model.moe === true;
 
-  // Subtract SWA fixed buffer cost (gemma4 sliding-window layers are one-time,
-  // not per-token — same as size-model.ts adds sFixed*swaWindow to nonexBytes).
-  // Try arch:moe or arch:dense first, then bare arch.
   const swaKey = arch + (moe ? ':moe' : ':dense');
   const swaFixed = SWA_FIXED_GB[swaKey] ?? SWA_FIXED_GB[arch] ?? 0;
   usableVram = Math.max(0, usableVram - swaFixed);
 
-  // KV per-token: the model's own GGUF-derived value wins; else a calibrated
-  // per-arch value; else a conservative generic. Never refuse to estimate.
-  const kvPtok = model.kv_ptok ?? KV_PTOK_EST[swaKey] ?? KV_PTOK_EST[arch] ?? genericKvPtok(model);
+  const kvPtokF32 = model.kv_ptok ?? KV_PTOK_EST[swaKey] ?? KV_PTOK_EST[arch] ?? genericKvPtok(model);
 
-  let maxCtx = 0;
-  let expertStrategy: ExpertStrategy = 'none';
-  let fit: FitClass = 'too-large';
+  // ── Compute per-mode context ──
+  const tryMode = (gpuModelGb: number, kvQuant: 'q4_0' | 'q8_0', strategy: FitStrategy): ModeEstimate | null => {
+    const ctx = ctxForBudget(usableVram, gpuModelGb, kvPtokF32, kvQuant, model.ctx);
+    if (ctx < 4096) return null;
+    return { ctx, strategy, ctxLabel: fmtCtx(ctx), kvCacheQuant: kvQuant };
+  };
+
+  // Balance check
+  let balancedMode: ModeEstimate | null = null;
+  let speedMode: ModeEstimate | null = null;
+  let capacityMode: ModeEstimate | null = null;
+  let bestFit: FitClass = 'too-large';
+  let bestExpertStrategy: ExpertStrategy = 'none';
+  let bestStrategy: FitStrategy = 'full-gpu';
+  let cpuResidentGb = 0;
 
   if (moe) {
-    // ── MoE: --cpu-moe strategy (experts on CPU, shared + KV on GPU) ──
     const nonexRatio = moeNonexRatio(model, arch);
     const nonexGb = sizeGb * nonexRatio;
     const expertGb = sizeGb - nonexGb;
 
-    // GPU only needs shared weights + KV cache
-    if (nonexGb <= usableVram && expertGb <= usableDram + usableVram) {
-      const kvBudgetBytes = (usableVram - nonexGb) * GB * 0.95; // 5% overhead
-      maxCtx = kvPtok > 0 ? Math.min(Math.floor(kvBudgetBytes / kvPtok), model.ctx) : model.ctx;
-      expertStrategy = 'cpu-moe';
-      fit = 'partial-offload';
-    }
-    // Try full GPU first
+    // Speed: full GPU only
     if (sizeGb <= usableVram) {
-      const kvBudgetBytes = (usableVram - sizeGb) * GB * 0.95;
-      const fullCtx = kvPtok > 0 ? Math.min(Math.floor(kvBudgetBytes / kvPtok), model.ctx) : model.ctx;
-      if (fullCtx > maxCtx) {
-        maxCtx = fullCtx;
-        expertStrategy = 'full-gpu';
-        fit = 'full-gpu';
-      }
+      const q8 = tryMode(sizeGb, 'q8_0', 'full-gpu');
+      speedMode = q8 ?? tryMode(sizeGb, 'q4_0', 'full-gpu');
+    }
+
+    // Balanced: best of full-GPU (Q8 preferred) and cpu-moe (Q4)
+    const fgQ8 = tryMode(sizeGb, 'q8_0', 'full-gpu');
+    const fgQ4 = tryMode(sizeGb, 'q4_0', 'full-gpu');
+    const moeQ8 = nonexGb <= usableVram && expertGb <= usableDram + usableVram ? tryMode(nonexGb, 'q8_0', 'moe-cpu') : null;
+    const moeQ4 = nonexGb <= usableVram && expertGb <= usableDram + usableVram ? tryMode(nonexGb, 'q4_0', 'moe-cpu') : null;
+
+    // Balanced: pick the config with the most context (minimizing offload tiebreaks on ctx).
+    const balCands = [fgQ8, fgQ4, moeQ8, moeQ4].filter((c): c is ModeEstimate => c !== null);
+    if (balCands.length > 0) {
+      balancedMode = balCands.reduce((a, b) => b.ctx > a.ctx ? b : a);
+    }
+
+    // Capacity: best Q4 ctx (prefer moe-cpu for max ctx)
+    const capCands = [moeQ4, fgQ4].filter((c): c is ModeEstimate => c !== null);
+    capacityMode = capCands.length > 0 ? capCands.reduce((a, b) => b.ctx > a.ctx ? b : a) : null;
+
+    if (balancedMode) {
+      bestFit = balancedMode.strategy === 'full-gpu' ? 'full-gpu' : 'partial-offload';
+      bestExpertStrategy = balancedMode.strategy === 'moe-cpu' ? 'cpu-moe' : 'full-gpu';
+      bestStrategy = balancedMode.strategy;
+      if (balancedMode.strategy === 'moe-cpu') cpuResidentGb = expertGb;
     }
   } else {
-    // ── Dense model ──
+    // Dense model
     if (sizeGb <= usableVram) {
-      // Full GPU: model + KV both fit
-      const kvBudgetBytes = (usableVram - sizeGb) * GB * 0.95;
-      maxCtx = kvPtok > 0 ? Math.min(Math.floor(kvBudgetBytes / kvPtok), model.ctx) : model.ctx;
-      expertStrategy = 'full-gpu';
-      fit = 'full-gpu';
+      // Full GPU
+      const q8 = tryMode(sizeGb, 'q8_0', 'full-gpu');
+      const q4 = tryMode(sizeGb, 'q4_0', 'full-gpu');
+      speedMode = q8 ?? q4;
+      balancedMode = q8 ?? q4;
+      capacityMode = q4;
+      if (balancedMode) { bestFit = 'full-gpu'; bestExpertStrategy = 'full-gpu'; bestStrategy = 'full-gpu'; }
     } else if (sizeGb <= usableVram + usableDram) {
-      // Partial offload: offload layers until KV fits. Target at least 16K ctx.
-      const targetKvBytes = 16384 * kvPtok;
-      const kvGb = targetKvBytes / GB * 1.05; // plus 5% overhead
-      const gpuModelGb = Math.max(0, usableVram - kvGb);
-      const cpuModelGb = sizeGb - gpuModelGb;
-      if (gpuModelGb > 0 && cpuModelGb <= usableDram) {
-        const kvBudgetBytes = (usableVram - gpuModelGb) * GB * 0.95;
-        maxCtx = kvPtok > 0 ? Math.min(Math.floor(kvBudgetBytes / kvPtok), model.ctx) : model.ctx;
-        expertStrategy = 'partial-ngl';
-        fit = 'partial-offload';
+      // Partial offload
+      const gpuModelGb = Math.max(0, usableVram - (16384 * kvPtokF32 * KV_QUANT_RATIO['q4_0']!) / GB * 1.05);
+      if (gpuModelGb > 0) {
+        const hy = tryMode(gpuModelGb, 'q4_0', 'hybrid');
+        balancedMode = hy;
+        capacityMode = hy;
+        if (hy) { bestFit = 'partial-offload'; bestExpertStrategy = 'partial-ngl'; bestStrategy = 'hybrid'; cpuResidentGb = sizeGb - gpuModelGb; }
       } else {
-        // Can't even fit 16K ctx with partial offload
-        const kvBudgetBytes = (usableVram - sizeGb * 0.5) * GB * 0.95;
-        const tryCtx = kvPtok > 0 ? Math.floor(kvBudgetBytes / kvPtok) : 0;
-        if (tryCtx >= 4096) {
-          maxCtx = Math.min(tryCtx, model.ctx);
-          expertStrategy = 'partial-ngl';
-          fit = 'partial-offload';
-        }
+        const tryC = tryMode(sizeGb * 0.5, 'q4_0', 'hybrid');
+        balancedMode = tryC;
+        capacityMode = tryC;
+        if (tryC) { bestFit = 'partial-offload'; bestExpertStrategy = 'partial-ngl'; bestStrategy = 'hybrid'; cpuResidentGb = sizeGb * 0.5; }
       }
     }
   }
 
-  if (maxCtx < 4096 && fit !== 'too-large') {
-    maxCtx = 0;
-    fit = 'too-large';
-    expertStrategy = 'none';
-  }
-
-  // ── RAM-headroom guard: would the CPU-resident bytes actually fit? ──
-  // Without this, a 30 GB MoE on a 30 GB box looks "runnable" but only swaps.
-  let cpuResidentGb = 0;
-  if (expertStrategy === 'cpu-moe') {
-    cpuResidentGb = sizeGb * (1 - moeNonexRatio(model, arch)); // experts streamed from RAM
-  } else if (expertStrategy === 'partial-ngl') {
-    cpuResidentGb = Math.max(0, sizeGb - usableVram);   // CPU share of dense weights
-  }
-  // (fit is 'full-gpu' | 'partial-offload' | 'too-large' here — 'unknown' cases
-  // already returned above.)
-  const ramTight = fit !== 'too-large'
+  const ramTight = bestFit !== 'too-large'
     && cpuResidentGb > Math.max(0, usableDram - ramReserveGb);
 
-  // Provenance: a number clamped to the model's trained ctx is an architectural
-  // ceiling ('arch-max'); otherwise it's a hardware KV-budget calc ('calc').
-  const provenance: CtxProvenance = (maxCtx > 0 && maxCtx >= model.ctx) ? 'arch-max' : 'calc';
+  const provenance: CtxProvenance = (balancedMode && balancedMode.ctx >= model.ctx) ? 'arch-max' : 'calc';
 
-  const ctxLabel = maxCtx > 0 ? fmtCtx(maxCtx)
-    : fit === 'too-large' ? 'no fit'
-    : '?';
-
-  return { fit, maxCtx, expertStrategy, ctxLabel, provenance, ramTight };
+  return {
+    fit: bestFit,
+    maxCtx: balancedMode?.ctx ?? 0,
+    expertStrategy: bestExpertStrategy,
+    ctxLabel: balancedMode?.ctxLabel ?? (bestFit === 'too-large' ? 'no fit' : '?'),
+    provenance,
+    ramTight,
+    strategy: bestStrategy,
+    modes: {
+      ...(speedMode && balancedMode && (speedMode.ctx !== balancedMode.ctx || speedMode.kvCacheQuant !== balancedMode.kvCacheQuant) ? { speed: speedMode } : {}),
+      balanced: balancedMode ?? { ctx: 0, strategy: 'full-gpu' as FitStrategy, ctxLabel: 'no fit', kvCacheQuant: 'q4_0' },
+      ...(capacityMode && balancedMode && (capacityMode.ctx !== balancedMode.ctx || capacityMode.kvCacheQuant !== balancedMode.kvCacheQuant) ? { capacity: capacityMode } : {}),
+    },
+  };
 }
 
-/** Fit label for the model picker. KV-budget- or probe-derived. Three tiers:
+/** Fit label for the model picker — strategy + speed + confidence.
  *
- *   ✓ 256k         fits (KV budget calc says full ctx on this VRAM)
- *   ✓ 128k tested  probe-launched, real llama-server preallocated this ctx
- *   ⚠ 64k tight    fits but VRAM/RAM close — offloads experts, or KV-starved
- *   ✗ no           won't fit at usable ctx (≥4K) on this hardware
+ *   ✓ 128k · full GPU · fast · verified
+ *   ◌ 96k · MoE→CPU · slower · estimated
+ *   ↑ 256k · hybrid · moderate · max ctx
+ *   ⚠ 32k · hybrid · tight · estimated
+ *   ✗ no
  *
- *  Tight = partial offload (MoE --cpu-moe or dense -ngl split). Lowering ctx
- *  frees KV cache VRAM → more expert layers on GPU. Probe to confirm. */
-export function buildFitLabel(est: CatalogFitEstimate): string {
+ *  Speed: fast (full-gpu), moderate (hybrid), slower (moe-cpu), tight (ramTight).
+ *  Confidence: verified (probe-cached), estimated (calc), max ctx (arch-max). */
+export function buildFitLabel(est: CatalogFitEstimate, mode?: 'speed' | 'balanced' | 'capacity'): string {
   if (est.fit === 'too-large' || est.maxCtx <= 0) return '✗ no';
-  if (est.provenance === 'tested') return `✓ ${est.ctxLabel} tested`;
-  const tight = est.ramTight || est.expertStrategy === 'partial-ngl';
-  if (tight) return `⚠ ${est.ctxLabel} tight`;
-  return `✓ ${est.ctxLabel}`;
+
+  // Pick the right mode ctx/strategy
+  const m = mode && est.modes[mode];
+  const ctxLabel = m?.ctxLabel ?? est.ctxLabel;
+  const strategy: FitStrategy = m?.strategy ?? est.strategy;
+  const kvQuant = m?.kvCacheQuant;
+
+  // Prefix: ✓ (full-gpu / tested), ◌ (hybrid/moe-cpu), ↑ (capacity), ⚠ (tight)
+  let prefix: string;
+  if (est.provenance === 'tested') prefix = '✓';
+  else if (mode === 'capacity') prefix = '↑';
+  else if (est.ramTight) prefix = '⚠';
+  else if (strategy === 'full-gpu') prefix = '✓';
+  else prefix = '◌';
+
+  // Speed qualifier
+  let speedLabel: string;
+  if (est.ramTight) speedLabel = 'tight';
+  else if (strategy === 'full-gpu') speedLabel = 'fast';
+  else if (strategy === 'hybrid') speedLabel = 'moderate';
+  else speedLabel = 'slower';
+
+  // Confidence
+  let confLabel: string;
+  if (est.provenance === 'tested') confLabel = 'verified';
+  else if (est.provenance === 'arch-max') confLabel = 'max ctx';
+  else confLabel = 'estimated';
+
+  return `${prefix} ${ctxLabel} · ${stratLabel(strategy)} · ${speedLabel} · ${confLabel}`;
 }
 
 export type QuantTier = 'recommended' | 'ok' | 'not-recommended';
@@ -814,24 +919,29 @@ export type SizeModelResult = {
   maxCtx: number;
   launchFlags: string[];
   expertFlag: string;
-  nCpuMoe: number;
+  cpuMoeLayers: number;
   headroomPct: number;
   kvGb: number;
+  cacheType: string;
+  modes: SizeResult['modes'];
 };
 
 /** Call the TS sizing engine against a downloaded GGUF. Returns null on failure. */
-export function sizeModelTS(ggufPath: string, vramGb: number, dramGb: number): SizeModelResult | null {
+export function sizeModelTS(ggufPath: string, vramGb: number, dramGb: number, kvCacheQuant: 'q4_0' | 'q8_0' = 'q4_0'): SizeModelResult | null {
   try {
     const { result } = sizeModel(ggufPath, Math.trunc(vramGb * GB), Math.trunc(dramGb * GB));
     if (!result.ok) return null;
-    const { launchFlags, expertFlag } = buildLaunchFlags(result);
+    const cacheType = kvCacheQuant;
+    const { launchFlags, expertFlag } = buildLaunchFlags(result, { cacheType });
     return {
       maxCtx: result.bestCtx,
       launchFlags,
       expertFlag,
-      nCpuMoe: result.nCpuMoe,
+      cpuMoeLayers: result.cpuMoeLayers,
       headroomPct: Math.round(result.headroomPct * 100) / 100,
       kvGb: Math.round(result.kvGb * 10000) / 10000,
+      cacheType,
+      modes: result.modes,
     };
   } catch {
     return null;
@@ -848,7 +958,9 @@ export function configureQuickstart(
   modelDir: string,
   gpu?: GpuProbe,
 ): void {
-  const modelEntries: Record<string, { cmd: string; ctx_size: number; multimodal: boolean; thinking_levels?: string[]; expert_flag?: string }> = {};
+  const sizingMode = ((env.get('RELAY_SIZING_MODE') ?? 'balanced') === 'capacity' ? 'capacity' : (env.get('RELAY_SIZING_MODE') ?? 'balanced') === 'speed' ? 'speed' : 'balanced') as 'speed' | 'balanced' | 'capacity';
+  const kvCacheType = (env.get('RELAY_KV_CACHE_TYPE') ?? 'auto') === 'q8_0' ? 'q8_0' as const : 'q4_0' as const;
+  const modelEntries: Record<string, { cmd: string; ctx_size: number; multimodal: boolean; thinking_levels?: string[]; expert_flag?: string; kv_cache_type?: string; sizing_mode?: string; provenance?: string; strategy?: string }> = {};
   const defaultModel = selections[0]!;
   for (const model of selections) {
     const modelPath = modelPaths.get(model.id)!;
@@ -857,14 +969,15 @@ export function configureQuickstart(
     let expertFlag: string | undefined;
 
     // If the GGUF is on disk, use the real TS sizing engine for optimal flags
+    let tuned: SizeModelResult | null = null;
     if (existsSync(modelPath)) {
       const vramGb = gpu?.vram_total_gb ?? 0;
-      // RAM the sizer may use for offloaded experts = what's free now, minus the
-      // host-profile reserve (headless server keeps less, desktop keeps more).
       const dramGb = Math.max(0, detectAvailableRamGb() - reservesFor(detectHostProfile()).ramReserveGb);
-      const tuned = sizeModelTS(modelPath, vramGb, dramGb);
+      tuned = sizeModelTS(modelPath, vramGb, dramGb, kvCacheType);
       if (tuned) {
-        ctxSize = tuned.maxCtx;
+        // Use selected mode's ctx, falling back to balanced
+        const selMode = tuned.modes[sizingMode] ?? tuned.modes.balanced;
+        ctxSize = selMode?.ctx ?? tuned.maxCtx;
         launchFlags = tuned.launchFlags;
         expertFlag = tuned.expertFlag || undefined;
       }
@@ -889,6 +1002,13 @@ export function configureQuickstart(
       ...(model.thinking === 'toggle' ? { thinking_levels: ['on', 'off'] } : {}),
     };
     if (expertFlag) entry.expert_flag = expertFlag;
+    entry.kv_cache_type = kvCacheType;
+    entry.sizing_mode = sizingMode;
+    entry.provenance = 'estimated';
+    if (tuned) {
+      const bal = tuned.modes.balanced;
+      if (bal) entry.strategy = bal.strategy;
+    }
     modelEntries[model.id] = entry as typeof modelEntries[string];
   }
 
@@ -900,7 +1020,7 @@ export function configureQuickstart(
   env.set('RELAY_REPO_DIR', PKG);
   env.set('RELAY_MODEL_DIR', modelDir);
   env.set('RELAY_LLAMA_SERVER_PATH', llamaServerPath);
-  env.set('RELAY_MODEL_FILE_HINT', resolve(modelDir, defaultModel.filename ?? `${defaultModel.id}.gguf`));
+  env.set('RELAY_MODEL_FILE_HINT', modelPaths.get(defaultModel.id) ?? resolve(modelDir, defaultModel.filename ?? `${defaultModel.id}.gguf`));
   env.set('RELAY_SWITCH_MAX_WARM_MODELS', '1');
   ensureApiKey(env);
   env.set('RELAY_MODEL_MAP', JSON.stringify(modelEntries));

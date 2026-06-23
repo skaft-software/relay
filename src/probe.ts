@@ -31,6 +31,10 @@ export type ProbeFacts = {
   kvBufMib?: number;
   computeBufMib?: number;
   expertFlag?: string;
+  /** Median first-token latency in ms from a 128-token prompt (3 runs). */
+  prefillMs?: number;
+  /** Median decode tokens/second across 10 short generations. */
+  decodeTokPerSec?: number;
 };
 
 export type ProbeResult = {
@@ -46,10 +50,10 @@ type CacheEntry = ProbeResult & { key: string; ts: number };
 
 // ── Cache ────────────────────────────────────────────────────────────────
 
-function keyFor(ggufPath: string, vramGb: number): string {
+function keyFor(ggufPath: string, vramGb: number, kvCacheQuant?: string, expertFlag?: string): string {
   let mtime = 0;
   try { mtime = Math.round(statSync(ggufPath).mtimeMs); } catch { /* ignore */ }
-  return `${ggufPath}|${mtime}|${vramGb}`;
+  return `${ggufPath}|${mtime}|${vramGb}|${kvCacheQuant ?? 'q4_0'}|${expertFlag ?? 'none'}`;
 }
 
 function readCache(): Record<string, CacheEntry> {
@@ -62,8 +66,8 @@ function writeCache(c: Record<string, CacheEntry>): void {
 }
 
 /** A previously probed context for this exact file+hardware, or null. */
-export function cachedTestedCtx(ggufPath: string, vramGb: number): number | null {
-  const e = readCache()[keyFor(ggufPath, vramGb)];
+export function cachedTestedCtx(ggufPath: string, vramGb: number, kvCacheQuant = 'q4_0', expertFlag?: string): number | null {
+  const e = readCache()[keyFor(ggufPath, vramGb, kvCacheQuant, expertFlag)];
   return e && e.ok ? e.ctx : null;
 }
 
@@ -165,13 +169,80 @@ export async function probeModel(ggufPath: string, opts: { onLine?: (l: string) 
   await new Promise((r) => setTimeout(r, 1500));
   try { process.kill(-child.pid!, 'SIGKILL'); } catch { /* ignore */ }
 
+  // ── Benchmark: measure prefill + decode speed ──
+  let prefillMs: number | undefined;
+  let decodeTokPerSec: number | undefined;
+  if (healthy) {
+    try {
+      const prompt = 'The quick brown fox jumps over the lazy dog. ';
+      const fullPrompt = prompt.repeat(128); // ~128 tokens
+
+      // Prefill: measure first-token latency (3 runs, take median)
+      const prefillTimes: number[] = [];
+      for (let run = 0; run < 3; run++) {
+        try {
+          const t0 = Date.now();
+          const r = spawnSync('curl', [
+            '-sf', '-m', '60',
+            `http://127.0.0.1:${port}/v1/completions`,
+            '-H', 'Content-Type: application/json',
+            '-d', JSON.stringify({
+              prompt: fullPrompt, max_tokens: 1, temperature: 0,
+              stream: false,
+            }),
+          ], { encoding: 'utf8', timeout: 65000 });
+          if (r.status === 0) {
+            prefillTimes.push(Date.now() - t0);
+          }
+        } catch { /* skip failed run */ }
+      }
+      if (prefillTimes.length > 0) {
+        prefillTimes.sort((a, b) => a - b);
+        prefillMs = prefillTimes[Math.floor(prefillTimes.length / 2)]!;
+      }
+
+      // Decode: measure tok/s over 10 short generations (take median)
+      const decodeRates: number[] = [];
+      for (let run = 0; run < 10; run++) {
+        try {
+          const t0 = Date.now();
+          const r = spawnSync('curl', [
+            '-sf', '-m', '30',
+            `http://127.0.0.1:${port}/v1/completions`,
+            '-H', 'Content-Type: application/json',
+            '-d', JSON.stringify({
+              prompt: 'Say hello in one word.', max_tokens: 50, temperature: 0,
+              stream: false,
+            }),
+          ], { encoding: 'utf8', timeout: 35000 });
+          if (r.status === 0) {
+            const elapsed = (Date.now() - t0) / 1000;
+            const data = JSON.parse(r.stdout);
+            const tokCount = data?.usage?.completion_tokens ?? 1;
+            // Subtract estimated prefill time (~200ms for short prompt)
+            const decodeTime = Math.max(0.1, elapsed - 0.2);
+            decodeRates.push(tokCount / decodeTime);
+          }
+        } catch { /* skip failed run */ }
+      }
+      if (decodeRates.length > 0) {
+        decodeRates.sort((a, b) => a - b);
+        decodeTokPerSec = Math.round(decodeRates[Math.floor(decodeRates.length / 2)]!);
+      }
+    } catch { /* benchmark best-effort */ }
+  }
+
+  if (prefillMs !== undefined) facts.prefillMs = prefillMs;
+  if (decodeTokPerSec !== undefined) facts.decodeTokPerSec = decodeTokPerSec;
+
   const result: ProbeResult = healthy
     ? { ok: true, ctx, facts, binary: working.path, loadSeconds }
     : { ok: false, ctx, facts, binary: working.path, loadSeconds, error: died ? 'server died (likely OOM — see ' + logPath + ')' : 'health timeout' };
 
   // Cache it.
   const cache = readCache();
-  cache[keyFor(ggufPath, vramGb)] = { ...result, key: keyFor(ggufPath, vramGb), ts: Date.now() };
+  const k = keyFor(ggufPath, vramGb, tuned.launchFlags?.find((f, i, arr) => f === '--cache-type-k' ? arr[i+1] : undefined) ?? 'q4_0', tuned.expertFlag);
+  cache[k] = { ...result, key: k, ts: Date.now() };
   writeCache(cache);
   return result;
 }

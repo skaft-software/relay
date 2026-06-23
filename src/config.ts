@@ -109,6 +109,12 @@ export type AppConfig = {
   cloudModels?: Record<string, CloudModelEntry>;
   /** Per-request auth header injected by cloud mode for upstream requests. */
   upstreamAuthHeader?: string;
+  /** KV cache quantization type for sizing: q4_0 or q8_0. Default 'auto' → q4_0. */
+  kvCacheType?: 'q4_0' | 'q8_0' | 'auto';
+  /** Default sizing mode: speed, balanced, or capacity. */
+  sizingMode?: 'speed' | 'balanced' | 'capacity' | 'auto';
+  /** Max prefill time in seconds before warning. 0 = no limit. */
+  maxPrefillSecs?: number;
 };
 
 export type UnknownFieldPolicy = 'pass_through' | 'strip' | 'reject';
@@ -201,6 +207,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     relayMode: readRelayMode(env.RELAY_MODE),
     cloudFallbackUrl: readOptional(env.RELAY_CLOUD_FALLBACK_URL),
     cloudModels: readCloudModels(env.RELAY_CLOUD_MODELS),
+    kvCacheType: readKvCacheType(env.RELAY_KV_CACHE_TYPE),
+    sizingMode: readSizingMode(env.RELAY_SIZING_MODE),
+    maxPrefillSecs: readMaxPrefillSecs(env.RELAY_MAX_PREFILL_SECS),
   };
 }
 
@@ -397,6 +406,26 @@ function readModelEntries(value: string | undefined): Record<string, ModelEntry>
  * 1. Per-model `multimodal` flag in modelEntries (explicit opt-in/opt-out)
  * 2. Global `upstreamVisionOk` config flag (backward compat)
  */
+function readKvCacheType(value: string | undefined): 'q4_0' | 'q8_0' | 'auto' {
+  const raw = readOptional(value) ?? 'auto';
+  if (raw === 'q4_0' || raw === 'q8_0' || raw === 'auto') return raw;
+  return 'auto';
+}
+
+function readSizingMode(value: string | undefined): 'speed' | 'balanced' | 'capacity' | 'auto' {
+  const raw = readOptional(value) ?? 'auto';
+  if (raw === 'speed' || raw === 'balanced' || raw === 'capacity' || raw === 'auto') return raw;
+  return 'auto';
+}
+
+function readMaxPrefillSecs(value: string | undefined): number | undefined {
+  const raw = readOptional(value);
+  if (!raw) return undefined;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return undefined;
+  return parsed;
+}
+
 export function isModelMultimodal(config: AppConfig, model?: string): boolean {
   if (model && config.modelEntries?.[model]?.multimodal === true) return true;
   if (model && config.modelEntries?.[model]?.multimodal === false) return false;

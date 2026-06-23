@@ -9,8 +9,11 @@
  */
 
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 import type { AppConfig, ModelEntry } from './config.ts';
+import { discoverModels } from './openai/models.ts';
 
 export type ModelAvailability = {
   ok: boolean;
@@ -251,6 +254,52 @@ export class ModelLifecycle {
     }
 
     if (!entry) {
+      // Auto-discover: check if this model is on disk and in the catalog.
+      // If so, auto-generate a ModelEntry so it can be cold-started on first request.
+      const discovered = discoverModels(this.config);
+      const found = discovered.find((d) =>
+        d.id === modelName || d.id.toLowerCase() === modelName.toLowerCase()
+      );
+      if (found?.onDisk && found.ggufPath && found.catalogEntry) {
+        // Prefer an existing start script if one was already generated.
+        const repoDir = process.env.RELAY_REPO_DIR ?? resolve(process.env.HOME ?? '/home', 'relay');
+        const specificScript = resolve(repoDir, 'start-scripts', `start-${found.id}.sh`);
+        const genericScript = resolve(repoDir, 'start-scripts', 'start-generic.sh');
+        const altGenericScript = resolve(process.env.HOME ?? '/home', '.relay', 'start-scripts', 'start-generic.sh');
+
+        let scriptPath: string;
+        if (existsSync(specificScript)) {
+          scriptPath = specificScript;
+        } else if (existsSync(genericScript)) {
+          scriptPath = genericScript;
+        } else if (existsSync(altGenericScript)) {
+          scriptPath = altGenericScript;
+        } else {
+          scriptPath = genericScript; // will fail at start time with clear error
+        }
+
+        const cat = found.catalogEntry;
+        entry = {
+          cmd: scriptPath,
+          ctx_size: cat.ctx,
+          multimodal: cat.vision,
+          thinking_levels: cat.thinking === 'on' ? ['on'] : cat.thinking === 'toggle' ? ['on', 'off'] : undefined,
+        } as ModelEntry;
+        // Stash the GGUF path so startModelProcess can pass it as MODEL_PATH env var
+        // (only needed for the generic wrapper; existing scripts hardcode the path).
+        (entry as any).__ggufPath = found.ggufPath;
+        // Register so future requests find it directly.
+        entries[found.id] = entry;
+        modelName = found.id;
+        this.log('info', 'auto-discovered model, created start entry', {
+          model: modelName,
+          script: scriptPath,
+          gguf: found.ggufPath,
+        });
+      }
+    }
+
+    if (!entry) {
       const reachable = await this.probeDefault(externalSignal);
       if (reachable) {
         this.modelAvailable = true;
@@ -441,10 +490,20 @@ export class ModelLifecycle {
     });
 
     try {
-      const child = this.runCommand(resolvedCmd, resolvedArgv, {
+      const extraEnv: Record<string, string> = {
         LLAMA_PORT: String(port),
         MODEL: modelName,
-      });
+      };
+      // Pass the GGUF file path for auto-discovered models using the generic wrapper.
+      const ggufPath = (entry as any).__ggufPath as string | undefined;
+      if (ggufPath) {
+        extraEnv.MODEL_PATH = ggufPath;
+        extraEnv.CTX_SIZE = String(entry.ctx_size ?? 32768);
+        // Pass llama-server path — try RELAY_LLAMA_SERVER_PATH, then convention paths
+        const serverPath = process.env.RELAY_LLAMA_SERVER_PATH ?? '/usr/local/bin/llama-server';
+        extraEnv.LLAMA_SERVER_PATH = serverPath;
+      }
+      const child = this.runCommand(resolvedCmd, resolvedArgv, extraEnv);
       if (!child) {
         this.log('error', 'start command produced no child process', { model: modelName });
         return null;

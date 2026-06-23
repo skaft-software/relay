@@ -7,6 +7,12 @@
  * models keep only attention + active params on the GPU and stream experts from
  * RAM (`--n-cpu-moe N` / `--cpu-moe`), so a 14 GB model can run on an 8 GB card.
  *
+ * Three-mode sizing: compute() now returns speed / balanced / capacity strategies
+ * from a single sweep. The caller picks the winner per objective:
+ *   speed    → max ctx with zero offload, Q8 KV preferred
+ *   balanced → max ctx minimizing offload (backward-compat default)
+ *   capacity → absolute max ctx, Q4 KV forced
+ *
  * The Python script in scripts/ is retained as the differential-test oracle:
  * tests/sizing.test.ts asserts this port reproduces its numbers on real GGUFs.
  */
@@ -14,23 +20,40 @@ import { readGguf, type GgufModel, type MetaValue, type TensorInfo } from './ggu
 
 export const GB = 1073741824;
 const MB = 1048576;
-const KV_Q4_RATIO = 0.5625;
 const SAFETY_MARGIN_MB = 256;
-const COMPUTE_BUFS_MB = 500;
+const COMPUTE_BUFS_MB = 1024;
 const EMPIRICAL_OVERHEAD_PCT = 5;
 export const DEFAULT_HEADROOM_PCT = 5;
+
+/** KV quant byte ratio (fraction of F32 element size). */
+export const KV_QUANT_RATIO: Record<string, number> = {
+  q4_0: 0.5625,
+  q8_0: 1.0,
+};
 
 /** Expert byte fraction by architecture, used only when tensor names don't tag experts. */
 const EXPERT_FRACS: Record<string, number> = {
   qwen35moe: 0.94, qwen3moe: 0.94, qwen3next: 0.94,
-  deepseek2: 0.93, gemma4: 0.91, cohere2moe: 0.90,
+  deepseek2: 0.85, gemma4: 0.91, cohere2moe: 0.90,
 };
 
+/** Tensor-name patterns that identify per-expert (offloadable) weights. */
 const EXPERT_PATTERNS = [
-  '_exps.', '_shexp.', 'ffn_gate_inp.', 'ffn_gate_inp_shexp.',
-  'ffn_gate_exps.', 'ffn_gate_shexp.', 'ffn_down_exps.', 'ffn_down_shexp.',
-  'ffn_up_exps.', 'ffn_up_shexp.',
+  '_exps.', 'ffn_gate_inp.', 'ffn_gate_exps.',
+  'ffn_down_exps.', 'ffn_up_exps.',
 ];
+
+/** Tensor-name patterns that identify the shared expert — a per-token dense layer
+ *  that must stay on GPU for DeepSeek architectures (MLA: latent attention). */
+const SHARED_EXPERT_PATTERNS = [
+  '_shexp.', 'ffn_gate_inp_shexp.', 'ffn_gate_shexp.',
+  'ffn_down_shexp.', 'ffn_up_shexp.',
+];
+
+/** Architectures whose shared expert is per-token dense and must stay on GPU. */
+const SHARED_EXPERT_ARCHS = new Set(['deepseek2']);
+
+export type FitStrategy = 'full-gpu' | 'hybrid' | 'moe-cpu';
 
 export interface Meta {
   arch: string;
@@ -51,24 +74,44 @@ export interface Meta {
 export interface Analysis {
   nonex: number;
   exp: number;
+  /** F32 architecture-dimension bytes-per-token (before quantization). */
   kvPtok: number;
   nKv: number;
   nCache: number;
   fsize: number;
 }
 
-export interface SizeResult {
-  ok: boolean;
-  error?: string;
-  bestCtx: number;
-  nCpuMoe: number;
-  cpuMoe: boolean;
+export interface SizedMode {
+  strategy: FitStrategy;
+  ctx: number;
+  cpuMoeLayers: number;
+  allExpertsCpu: boolean;
+  kvCacheQuant: 'q4_0' | 'q8_0';
   headroomPct: number;
   headroomGb: number;
   kvGb: number;
   expGpuGb: number;
   expCpuGb: number;
   nonexGb: number;
+}
+
+export interface SizeResult {
+  ok: boolean;
+  error?: string;
+  /** @deprecated Use modes.balanced.ctx instead. Kept for backward compat. */
+  bestCtx: number;
+  /** @deprecated Use modes.balanced.cpuMoeLayers instead. */
+  cpuMoeLayers: number;
+  /** @deprecated Use modes.balanced.allExpertsCpu instead. */
+  allExpertsCpu: boolean;
+  headroomPct: number;
+  headroomGb: number;
+  kvGb: number;
+  expGpuGb: number;
+  expCpuGb: number;
+  nonexGb: number;
+  /** Three-mode sizing: speed / balanced / capacity. null = no viable config. */
+  modes: Record<'speed' | 'balanced' | 'capacity', SizedMode | null>;
 }
 
 function asNum(v: MetaValue | undefined): number {
@@ -115,28 +158,34 @@ export function analyze(meta: Meta): Analysis {
     const sd = t.dims;
     const last = sd[sd.length - 1] ?? 0;
 
-    // ── KV per layer (q4_0) ──
+    // ── KV per layer (F32 architecture-dimension bytes, no quantization) ──
     if (tn.startsWith('blk.') && tn.endsWith('.weight')) {
       const ln = parseInt(tn.split('.')[1] ?? '', 10);
       if (Number.isInteger(ln) && ln >= 0 && ln < nl) {
         if (arch === 'deepseek2') {
-          if (tn.includes('attn_kv_a_mqa')) kvPerLayer[ln]! += last * KV_Q4_RATIO;
+          if (tn.includes('attn_kv_a_mqa')) kvPerLayer[ln]! += last;
         } else if (arch === 'qwen3next' || arch === 'gemma4') {
-          if (tn.includes('attn_k.')) kvPerLayer[ln]! += 2 * last * KV_Q4_RATIO;
+          if (tn.includes('attn_k.')) kvPerLayer[ln]! += 2 * last;
         } else {
           if (tn.includes('attn_k.') && !tn.includes('norm')) {
-            kvPerLayer[ln]! += 2 * last * KV_Q4_RATIO;
+            kvPerLayer[ln]! += 2 * last;
           } else if (tn.includes('attn_qkv.')) {
             const kd = typeof nkv === 'number' && nkv > 0 && kl ? nkv * kl : 512;
-            kvPerLayer[ln]! += 2 * kd * KV_Q4_RATIO;
+            kvPerLayer[ln]! += 2 * kd;
           }
         }
       }
     }
 
-    // ── Expert vs non-expert ──
-    if (EXPERT_PATTERNS.some((p) => tn.includes(p))) expEls += els;
-    else nonexEls += els;
+    // ── Expert vs non-expert (shared expert stays GPU for DeepSeek) ──
+    if (SHARED_EXPERT_ARCHS.has(arch) && SHARED_EXPERT_PATTERNS.some((p) => tn.includes(p))) {
+      // DeepSeek shared expert: per-token dense, must stay on GPU → nonexEls
+      nonexEls += els;
+    } else if (EXPERT_PATTERNS.some((p) => tn.includes(p))) {
+      expEls += els;
+    } else {
+      nonexEls += els;
+    }
   }
 
   const total = expEls + nonexEls;
@@ -180,7 +229,136 @@ export function analyze(meta: Meta): Analysis {
 }
 
 function fail(error: string): SizeResult {
-  return { ok: false, error, bestCtx: 0, nCpuMoe: 0, cpuMoe: false, headroomPct: 0, headroomGb: 0, kvGb: 0, expGpuGb: 0, expCpuGb: 0, nonexGb: 0 };
+  return {
+    ok: false, error,
+    bestCtx: 0, cpuMoeLayers: 0, allExpertsCpu: false,
+    headroomPct: 0, headroomGb: 0, kvGb: 0,
+    expGpuGb: 0, expCpuGb: 0, nonexGb: 0,
+    modes: { speed: null, balanced: null, capacity: null },
+  };
+}
+
+/** Sweep all offload configs for a given KV quant, returning the best find
+ *  for each offload class (full-gpu, hybrid, moe-cpu). Used internally by
+ *  compute() to derive the three modes from a single evaluation pass. */
+function sweepModes(
+  budget: number,
+  base: number,
+  exp: number,
+  epl: number,
+  kvp: number,
+  tctx: number,
+  nl: number,
+  dramFree: number,
+  draft: number,
+  minHeadroomPct: number,
+): {
+  speedCtx: number; speedNcmoe: number; speedCpumoe: boolean; speedEg: number; speedEc: number;
+  bestCtx: number; bestNcmoe: number; bestCpumoe: boolean; bestEg: number; bestEc: number;
+  maxCtx: number; maxNcmoe: number; maxCpumoe: boolean; maxEg: number; maxEc: number;
+} {
+  const tryCfg = (offloaded: number, forceCpu: boolean): [number, number, number] => {
+    const eg = forceCpu ? 0 : Math.max(0, exp - offloaded * epl);
+    const ec = exp - eg;
+    const ka = budget - base - Math.trunc(eg);
+    if (ka <= 4096 || kvp <= 0) return [0, eg, ec];
+    return [Math.min(Math.trunc(ka / kvp), tctx), eg, ec];
+  };
+
+  // ── Full GPU (speed objective) ──
+  const [sCtx, sEg, sEc] = tryCfg(0, false);
+  let speedCtx = sCtx, speedNcmoe = 0, speedCpumoe = false, speedEg = sEg, speedEc = sEc;
+
+  // ── Best overall (balanced objective) — sweep all ──
+  let bestCtx = sCtx, bestNcmoe = 0, bestCpumoe = false, bestEg = sEg, bestEc = sEc;
+
+  for (let o = 1; o <= nl; o++) {
+    const [ctx, eg, ec] = tryCfg(o, false);
+    if (ctx <= 0) continue;
+    if (Math.trunc(ec) + draft + 2 * GB > dramFree) break;
+    if (ctx > bestCtx) { bestCtx = ctx; bestNcmoe = o; bestEg = eg; bestEc = ec; }
+  }
+
+  // --cpu-moe
+  const [mcCtx, mcEg, mcEc] = tryCfg(0, true);
+  if (mcCtx > 0 && Math.trunc(mcEc) + draft + 2 * GB <= dramFree && mcCtx > bestCtx) {
+    bestCtx = mcCtx; bestNcmoe = 0; bestCpumoe = true; bestEg = mcEg; bestEc = mcEc;
+  }
+
+  // ── Absolute max ctx (capacity objective) — same as best overall ──
+  let maxCtx = bestCtx, maxNcmoe = bestNcmoe, maxCpumoe = bestCpumoe, maxEg = bestEg, maxEc = bestEc;
+
+  // Headroom enforcement (applies to balanced and capacity)
+  const enforceHeadroom = (inCtx: number, inNcmoe: number, inCpumoe: boolean, inEg: number, inEc: number): [number, number, boolean, number, number] => {
+    const minHrBytes = Math.trunc((budget * minHeadroomPct) / 100);
+    const hrBytes = budget - base - Math.trunc(inEg) - draft - Math.trunc(kvp * inCtx);
+    if (hrBytes >= minHrBytes) return [inCtx, inNcmoe, inCpumoe, inEg, inEc];
+
+    // Try higher offload
+    for (let o = inNcmoe + 1; o <= nl; o++) {
+      const [ctxS, egS, ecS] = tryCfg(o, false);
+      if (ctxS <= 0) continue;
+      const hrS = budget - base - Math.trunc(egS) - draft - Math.trunc(kvp * ctxS);
+      if (hrS >= minHrBytes && Math.trunc(ecS) + draft + 2 * GB <= dramFree) {
+        return [ctxS, o, false, egS, ecS];
+      }
+    }
+    // Try --cpu-moe
+    {
+      const [ctxS, egS, ecS] = tryCfg(0, true);
+      if (ctxS > 0) {
+        const hrS = budget - base - draft - Math.trunc(kvp * ctxS);
+        if (hrS >= minHrBytes && Math.trunc(ecS) + draft + 2 * GB <= dramFree) {
+          return [ctxS, 0, true, egS, ecS];
+        }
+      }
+    }
+    // Reduce ctx to meet headroom
+    const kvAvail = Math.max(0, budget - base - Math.trunc(inEg) - draft - minHrBytes);
+    const safeCtx = kvp > 0 ? Math.min(Math.trunc(kvAvail / kvp), tctx) : 0;
+    if (safeCtx > 4096) return [safeCtx, inNcmoe, inCpumoe, inEg, inEc];
+    return [inCtx, inNcmoe, inCpumoe, inEg, inEc];
+  };
+
+  [bestCtx, bestNcmoe, bestCpumoe, bestEg, bestEc] =
+    enforceHeadroom(bestCtx, bestNcmoe, bestCpumoe, bestEg, bestEc);
+  [maxCtx, maxNcmoe, maxCpumoe, maxEg, maxEc] =
+    enforceHeadroom(maxCtx, maxNcmoe, maxCpumoe, maxEg, maxEc);
+
+  return {
+    speedCtx, speedNcmoe, speedCpumoe, speedEg, speedEc,
+    bestCtx, bestNcmoe, bestCpumoe, bestEg, bestEc,
+    maxCtx, maxNcmoe, maxCpumoe, maxEg, maxEc,
+  };
+}
+
+function toMode(
+  kvCacheQuant: 'q4_0' | 'q8_0',
+  ctx: number, ncmoe: number, cpumoe: boolean, eg: number, ec: number,
+  budget: number, base: number, kvp: number, draft: number, nonexGb: number,
+): SizedMode | null {
+  if (ctx <= 4096) return null;
+  let strategy: FitStrategy;
+  if (cpumoe) strategy = 'moe-cpu';
+  else if (ncmoe > 0) strategy = 'hybrid';
+  else strategy = 'full-gpu';
+
+  const headroomGb = budget / GB - base / GB - eg / GB - draft / GB - (kvp * ctx) / GB;
+  const headroomPct = budget > 0 ? (headroomGb / (budget / GB)) * 100 : 0;
+
+  return {
+    strategy,
+    ctx,
+    cpuMoeLayers: cpumoe ? 0 : ncmoe,
+    allExpertsCpu: cpumoe,
+    kvCacheQuant,
+    headroomPct,
+    headroomGb,
+    kvGb: (kvp * ctx) / GB,
+    expGpuGb: eg / GB,
+    expCpuGb: ec / GB,
+    nonexGb,
+  };
 }
 
 export function compute(
@@ -205,88 +383,53 @@ export function compute(
   const tctx = meta.trainCtx;
   const nl = meta.nl;
   const epl = nl > 0 ? exp / nl : exp;
-  let kvp = ta.kvPtok;
-  if (kvp <= 0 && ta.nKv > 0) kvp = 0.001;
 
-  let bestCtx = 0;
-  let bestNcmoe = 0;
-  let bestCpumoe = false;
-  let bestEg = 0;
-  let bestEc = 0;
+  // ── Sweep Q8 (preferred for speed/balanced) ──
+  const kvpQ8 = ta.kvPtok * KV_QUANT_RATIO['q8_0']!;
+  const q8 = sweepModes(budget, base, exp, epl, kvpQ8 <= 0 && ta.nKv > 0 ? 0.001 : kvpQ8, tctx, nl, dramFree, draft, minHeadroomPct);
 
-  const tryCfg = (offloaded: number, forceCpu: boolean): [number, number, number] => {
-    const eg = forceCpu ? 0 : Math.max(0, exp - offloaded * epl);
-    const ec = exp - eg;
-    const ka = budget - base - Math.trunc(eg);
-    if (ka <= 4096 || kvp <= 0) return [0, eg, ec];
-    return [Math.min(Math.trunc(ka / kvp), tctx), eg, ec];
-  };
+  // ── Sweep Q4 (fallback for speed, default for capacity) ──
+  const kvpQ4 = ta.kvPtok * KV_QUANT_RATIO['q4_0']!;
+  const q4 = sweepModes(budget, base, exp, epl, kvpQ4 <= 0 && ta.nKv > 0 ? 0.001 : kvpQ4, tctx, nl, dramFree, draft, minHeadroomPct);
 
-  // Full GPU
-  {
-    const [ctx, eg, ec] = tryCfg(0, false);
-    if (ctx > 0) { bestCtx = ctx; bestEg = eg; bestEc = ec; }
-  }
-  // Partial offload scan (even a full-GPU fit may not be the best context)
-  for (let o = 1; o <= nl; o++) {
-    const [ctx, eg, ec] = tryCfg(o, false);
-    if (ctx <= 0) continue;
-    if (Math.trunc(ec) + draft + 2 * GB > dramFree) break;
-    if (ctx > bestCtx) { bestCtx = ctx; bestNcmoe = o; bestEg = eg; bestEc = ec; }
-  }
-  // --cpu-moe (all experts on CPU)
-  {
-    const [ctx, eg, ec] = tryCfg(0, true);
-    if (ctx > 0 && Math.trunc(ec) + draft + 2 * GB <= dramFree && ctx > bestCtx) {
-      bestCtx = ctx; bestNcmoe = 0; bestCpumoe = true; bestEg = eg; bestEc = ec;
-    }
+  const nonexGb = ta.nonex / GB;
+
+  // ── Derive three modes ──
+  // speed: Q8 full-GPU if it fits; else Q4 full-GPU.
+  let speedMode = toMode('q8_0', q8.speedCtx, 0, false, q8.speedEg, q8.speedEc, budget, base, kvpQ8, draft, nonexGb);
+  if (!speedMode) {
+    speedMode = toMode('q4_0', q4.speedCtx, 0, false, q4.speedEg, q4.speedEc, budget, base, kvpQ4, draft, nonexGb);
   }
 
-  if (bestCtx <= 4096) return fail('Cannot fit model — no room for KV cache');
-
-  // Enforce minimum headroom: trade context for safety if needed.
-  const minHrBytes = Math.trunc((budget * minHeadroomPct) / 100);
-  const bestHrBytes = budget - base - Math.trunc(bestEg) - draft - Math.trunc(kvp * bestCtx);
-  if (bestHrBytes < minHrBytes) {
-    let safeFound = false;
-    for (let o = bestNcmoe + 1; o <= nl; o++) {
-      const [ctxS, egS, ecS] = tryCfg(o, false);
-      if (ctxS <= 0) continue;
-      const hrS = budget - base - Math.trunc(egS) - draft - Math.trunc(kvp * ctxS);
-      if (hrS >= minHrBytes && Math.trunc(ecS) + draft + 2 * GB <= dramFree) {
-        bestCtx = ctxS; bestNcmoe = o; bestEg = egS; bestEc = ecS; safeFound = true; break;
-      }
-    }
-    if (!safeFound) {
-      const [ctxS, egS, ecS] = tryCfg(0, true);
-      if (ctxS > 0) {
-        const hrS = budget - base - draft - Math.trunc(kvp * ctxS);
-        if (hrS >= minHrBytes && Math.trunc(ecS) + draft + 2 * GB <= dramFree) {
-          bestCtx = ctxS; bestNcmoe = 0; bestCpumoe = true; bestEg = egS; bestEc = ecS; safeFound = true;
-        }
-      }
-    }
-    if (!safeFound) {
-      const kvAvail = Math.max(0, budget - base - Math.trunc(bestEg) - draft - minHrBytes);
-      const safeCtx = kvp > 0 ? Math.min(Math.trunc(kvAvail / kvp), tctx) : 0;
-      if (safeCtx > 4096) bestCtx = safeCtx;
-    }
+  // balanced: default Q4 (safer, matches --cache-type-k default). Fall back to Q8 if Q4 does not fit.
+  let balancedMode = toMode('q4_0', q4.bestCtx, q4.bestNcmoe, q4.bestCpumoe, q4.bestEg, q4.bestEc, budget, base, kvpQ4, draft, nonexGb);
+  if (!balancedMode) {
+    const alt = toMode('q8_0', q8.bestCtx, q8.bestNcmoe, q8.bestCpumoe, q8.bestEg, q8.bestEc, budget, base, kvpQ8, draft, nonexGb);
+    if (alt) balancedMode = alt;
   }
 
-  const headroomGb = budget / GB - base / GB - bestEg / GB - draft / GB - (kvp * bestCtx) / GB;
-  const headroomPct = budget > 0 ? (headroomGb / (budget / GB)) * 100 : 0;
+  // capacity: best Q4 overall (forced Q4).
+  const capacityMode = toMode('q4_0', q4.maxCtx, q4.maxNcmoe, q4.maxCpumoe, q4.maxEg, q4.maxEc, budget, base, kvpQ4, draft, nonexGb);
 
+  const modes: SizeResult['modes'] = { speed: speedMode, balanced: balancedMode, capacity: capacityMode };
+
+  if (!balancedMode || balancedMode.ctx <= 4096) {
+    return fail('Cannot fit model — no room for KV cache');
+  }
+
+  // Fill backward-compat flat fields from balanced
   return {
     ok: true,
-    bestCtx,
-    nCpuMoe: bestNcmoe,
-    cpuMoe: bestCpumoe,
-    headroomPct,
-    headroomGb,
-    kvGb: (kvp * bestCtx) / GB,
-    expGpuGb: bestEg / GB,
-    expCpuGb: bestEc / GB,
-    nonexGb: ta.nonex / GB,
+    bestCtx: balancedMode.ctx,
+    cpuMoeLayers: balancedMode.cpuMoeLayers,
+    allExpertsCpu: balancedMode.allExpertsCpu,
+    headroomPct: balancedMode.headroomPct,
+    headroomGb: balancedMode.headroomGb,
+    kvGb: balancedMode.kvGb,
+    expGpuGb: balancedMode.expGpuGb,
+    expCpuGb: balancedMode.expCpuGb,
+    nonexGb: balancedMode.nonexGb,
+    modes,
   };
 }
 
@@ -298,7 +441,7 @@ export function sizeModel(path: string, vramBytes: number, dramBytes: number): {
   return { meta, analysis, result };
 }
 
-/** Build launch flags from a sizing result, mirroring size-model.py"s output format.
+/** Build launch flags from a sizing result, mirroring size-model.py's output format.
   * Returns flat [flag, value, flag, value, ...] for use by generateStartScript. */
 export function buildLaunchFlags(
   result: SizeResult,
@@ -320,10 +463,10 @@ export function buildLaunchFlags(
   ];
 
   let expertFlag = "";
-  if (result.cpuMoe) {
+  if (result.allExpertsCpu) {
     expertFlag = "--cpu-moe";
-  } else if (result.nCpuMoe > 0) {
-    expertFlag = `--n-cpu-moe ${result.nCpuMoe}`;
+  } else if (result.cpuMoeLayers > 0) {
+    expertFlag = `--n-cpu-moe ${result.cpuMoeLayers}`;
   }
 
   return { launchFlags: flags, expertFlag };

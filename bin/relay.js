@@ -26,7 +26,7 @@ if (!Number.isFinite(nodeMajor) || nodeMajor < 22) {
 
 // ── Help ────────────────────────────────────────────────────────────────
 
-if (args.includes('--help') || args.includes('-h')) {
+if (args.includes('--help') || args.includes('-h') || args[0] === 'help') {
   console.log(`
   relay — local AI gateway for coding agents
 

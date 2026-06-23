@@ -3,11 +3,9 @@
  *
  * Covers:
  *  - Eager switch: kill old → start new → pre-warm
- *  - Prefix cache: add, evict, getTopPrefixes
  *  - Upstream URL resolution per model
  *  - Lifecycle status includes activeModels
  *  - switchPolicy defaults to eager
- *  - Pre-warming is best-effort (survives upstream errors)
  */
 
 import assert from 'node:assert/strict';
@@ -50,10 +48,7 @@ function baseConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     lifecycleShutdownConfirmTimeoutMs: 100,
     switchPolicy: 'eager',
     modelPortBase: 8081,
-    switchPrewarm: false,
     switchMaxWarmModels: 2,
-    prefixCacheMaxEntries: 50,
-    prefixCacheMaxTokens: 1_000_000,
     modelEntries: {
       qwen: {
         cmd: 'echo qwen-start',
@@ -82,41 +77,6 @@ function createMockChild(): ChildProcess {
   (emitter as any).unref = () => {};
   return emitter;
 }
-
-// ── Prefix cache tests ───────────────────────────────────────────────────
-
-test('prefix cache: add and retrieve top prefixes', () => {
-  const config = baseConfig();
-  const lifecycle = new ModelLifecycle(config);
-
-  // Add some prefixes — duplicates increase hitCount
-  lifecycle.cachePrefix([
-    { role: 'system', content: 'You are a coding agent' },
-    { role: 'user', content: 'Fix the bug' },
-  ]);
-  lifecycle.cachePrefix([
-    { role: 'system', content: 'You are a coding agent' },
-    { role: 'user', content: 'Fix the bug' },
-  ]);
-  lifecycle.cachePrefix([
-    { role: 'system', content: 'You are a translator' },
-    { role: 'user', content: 'Translate this' },
-  ]);
-
-  // Cache should have 2 unique entries (one duplicated)
-  // We can't inspect private fields, but we verify no crash
-  const status = lifecycle.getLifecycleStatus();
-  assert.equal(status.enabled, true);
-});
-
-test('prefix cache: empty cache does not crash pre-warming', async () => {
-  const config = baseConfig();
-  const lifecycle = new ModelLifecycle(config);
-
-  // getUpstreamUrl with no running models returns config upstream
-  const url = lifecycle.getUpstreamUrl('qwen');
-  assert.equal(url, config.upstreamBaseUrl);
-});
 
 // ── Upstream URL resolution tests ───────────────────────────────────────
 
@@ -157,7 +117,7 @@ test('eager switch: ensureModelAvailable starts model when none running', async 
       setTimeout(() => child.emit('exit', 0), 10);
       return child;
     },
-    probe: async (_port: number) => false,
+    probe: async (_port?: number) => false,
   });
 
   const result = await lifecycle.ensureModelAvailable('qwen');
@@ -182,7 +142,7 @@ test('eager switch: successful start with healthy probe', async () => {
     spawnProcess: (_cmd, _argv) => {
       return createMockChild();
     },
-    probe: async (_port: number) => true,
+    probe: async (_port?: number) => true,
   });
 
   const result = await lifecycle.ensureModelAvailable('qwen');
@@ -218,7 +178,7 @@ test('eager switch: switching models kills old process', async () => {
       };
       return child;
     },
-    probe: async (_port: number) => true,
+    probe: async (_port?: number) => true,
   });
 
   // Start qwen

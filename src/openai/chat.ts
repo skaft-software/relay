@@ -7,6 +7,7 @@ import { createLogger } from '../logger.ts';
 import { logStreamingResponseDiagnostics, logUpstreamPayloadDiagnostics } from '../truncation-diagnostics.ts';
 import { canonicalToUpstreamChatRequest, openAIChatRequestToCanonical } from '../internal/openai-chat.ts';
 import { canonicalToOpenAIChatCompletion, upstreamChatCompletionToCanonical } from '../internal/response.ts';
+import { activeProfile } from '../profile.ts';
 import type { ModelLifecycle } from '../lifecycle.ts';
 
 type JsonObject = Record<string, any>;
@@ -146,6 +147,21 @@ export async function createChatCompletion(
     : config.upstreamBaseUrl;
   const original = body;
   const { body: normalized, strippedFields } = normalizeChatRequest(original, config);
+
+  // Thinking models (Qwen3, DeepSeek R1, etc.) emit reasoning tokens that
+  // consume the max_tokens budget before any visible output.  When the client
+  // doesn't set max_tokens (or sets it too low), default to 4096 so the model
+  // has enough budget to think *and* reply.
+  const modelName = typeof (original as any).model === 'string' ? (original as any).model : undefined;
+  if (modelName) {
+    const profile = activeProfile(config, modelName);
+    if (profile.thinking.supported && profile.thinking.levels.length > 0) {
+      const currentMax = typeof normalized.max_tokens === 'number' ? normalized.max_tokens : undefined;
+      if (currentMax === undefined || currentMax < 1024) {
+        normalized.max_tokens = 4096;
+      }
+    }
+  }
   logUpstreamPayloadDiagnostics(logger, {
     route: '/v1/chat/completions',
     upstream_route: '/v1/chat/completions',

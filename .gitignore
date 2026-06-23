@@ -12,3 +12,4 @@ __pycache__/
 .pytest_cache/
 start-scripts/
 .hamr/
+docs/.vitepress/dist/

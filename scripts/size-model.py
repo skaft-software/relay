@@ -63,10 +63,10 @@ GPU_LAYERS = 999          # -ngl: offload all transformer layers to GPU
 KV_CACHE_TYPE = "q4_0"    # --cache-type-k/v: quantized KV (max_ctx assumes this)
 CORRECTNESS_FLAGS = ["--jinja"]  # always-on flags needed for correct output
 SAFETY_MARGIN_MB = 256      # VRAM reserved for driver/HIP context
-COMPUTE_BUFS_MB = 500        # flash attention, intermediate tensors, scratch
+COMPUTE_BUFS_MB = 1024       # flash attention, intermediate tensors, scratch (matches TS)
 EMPIRICAL_OVERHEAD_PCT = 5   # empirically measured overhead: 1.3-3.1% on 9070XT
 SAFE_SAFETY_MARGIN_MB = 512  # --safe mode: double the safety margin
-SAFE_COMPUTE_BUFS_MB = 1024  # --safe mode: double compute buffer estimate
+SAFE_COMPUTE_BUFS_MB = 2048  # --safe mode: double compute buffer estimate
 DEFAULT_HEADROOM_PCT = 5     # minimum VRAM headroom % — verified 5% keeps system stable
 
 # ── Hardware detection ───────────────────────────────────────────────
@@ -250,7 +250,7 @@ def analyze(meta):
             els *= int(d)
         sd = [int(d) for d in t.shape]
 
-        # ── KV per layer (q4_0) ──
+        # ── KV per layer (F32 architecture-dimension bytes, no quantization) ──
         if tn.startswith("blk.") and tn.endswith(".weight"):
             parts = tn.split(".")
             try:
@@ -261,16 +261,16 @@ def analyze(meta):
             if arch == "deepseek2":
                 # MLA: single compressed latent vector
                 if "attn_kv_a_mqa" in tn:
-                    kv_per_layer[ln] += sd[-1] * KV_Q4_RATIO
+                    kv_per_layer[ln] += sd[-1]
 
             elif arch in ("qwen3next", "gemma4"):
                 if "attn_k." in tn:
-                    kv_per_layer[ln] += 2 * sd[-1] * KV_Q4_RATIO
+                    kv_per_layer[ln] += 2 * sd[-1]
 
             else:
                 # Standard GQA / dense / cohere2moe
                 if "attn_k." in tn and "norm" not in tn:
-                    kv_per_layer[ln] += 2 * sd[-1] * KV_Q4_RATIO
+                    kv_per_layer[ln] += 2 * sd[-1]
                 elif "attn_qkv." in tn:
                     # Fused QKV: K portion = nkv * head_dim
                     kd = (
@@ -282,24 +282,24 @@ def analyze(meta):
                         )
                         else 512
                     )
-                    kv_per_layer[ln] += 2 * kd * KV_Q4_RATIO
+                    kv_per_layer[ln] += 2 * kd
 
-        # ── Expert vs non-expert ──
-        if any(
-            p in tn
-            for p in [
-                "_exps.",
-                "_shexp.",
-                "ffn_gate_inp.",
-                "ffn_gate_inp_shexp.",
-                "ffn_gate_exps.",
-                "ffn_gate_shexp.",
-                "ffn_down_exps.",
-                "ffn_down_shexp.",
-                "ffn_up_exps.",
-                "ffn_up_shexp.",
-            ]
-        ):
+        # ── Expert vs non-expert (shared expert stays GPU for DeepSeek) ──
+        SHARED_EXPERT_PATTERNS = [
+            "_shexp.", "ffn_gate_inp_shexp.", "ffn_gate_shexp.",
+            "ffn_down_shexp.", "ffn_up_shexp.",
+        ]
+        EXPERT_PATTERNS = [
+            "_exps.",
+            "ffn_gate_inp.",
+            "ffn_gate_exps.",
+            "ffn_down_exps.",
+            "ffn_up_exps.",
+        ]
+        if arch == "deepseek2" and any(p in tn for p in SHARED_EXPERT_PATTERNS):
+            # DeepSeek shared expert: per-token dense, must stay on GPU
+            nonex_els += els
+        elif any(p in tn for p in EXPERT_PATTERNS):
             exp_els += els
         else:
             nonex_els += els
@@ -323,7 +323,8 @@ def analyze(meta):
     else:
         nonex_bytes, exp_bytes = fsize, 0
 
-    kv_ptok = sum(kv_per_layer)
+    kv_ptok_f32 = sum(kv_per_layer)
+    kv_ptok_q4 = kv_ptok_f32 * KV_Q4_RATIO
     n_kv = sum(1 for v in kv_per_layer if v > 0)
 
     # SWA split (Gemma4): sliding layers have large KV heads (nv=8) but fixed window;
@@ -343,14 +344,16 @@ def analyze(meta):
                 # Global layer: grows with context
                 g_ptok += kv_per_layer[i]
         nonex_bytes += int(s_fixed * win)
-        kv_ptok, n_cache = g_ptok, sum(1 for v in nkv_meta if v <= 2)
+        kv_ptok_f32, n_cache = g_ptok, sum(1 for v in nkv_meta if v <= 2)
+        kv_ptok_q4 = kv_ptok_f32 * KV_Q4_RATIO
     else:
         n_cache = n_kv
 
     return {
         "nonex": nonex_bytes,
         "exp": exp_bytes,
-        "kv_ptok": kv_ptok,
+        "kv_ptok_f32": kv_ptok_f32,
+        "kv_ptok_q4": kv_ptok_q4,
         "n_kv": n_kv,
         "n_cache": n_cache,
         "fsize": fsize,
@@ -373,7 +376,7 @@ def compute(vram, dram_free, meta, ta, draft=0, safety_factor=1.0, min_headroom_
     if base >= budget:
         return (0, 0, False, {"error": "Base footprint exceeds VRAM"})
 
-    exp, kvp, tctx, nl = ta["exp"], ta["kv_ptok"], meta["train_ctx"], meta["nl"]
+    exp, kvp, tctx, nl = ta["exp"], ta["kv_ptok_q4"], meta["train_ctx"], meta["nl"]
     epl = exp / nl if nl > 0 else exp
     if kvp <= 0 and ta["n_kv"] > 0:
         kvp = 0.001  # safety
@@ -486,6 +489,8 @@ def compute(vram, dram_free, meta, ta, draft=0, safety_factor=1.0, min_headroom_
             "exp_cpu": best_ec / GB,
             "kv_gb": (kvp * best_ctx) / GB,
             "kv_ptok": kvp,
+            "kv_ptok_f32": ta.get("kv_ptok_f32", kvp / KV_Q4_RATIO),
+            "kv_ptok_q4": kvp,
             "n_cache": ta["n_cache"],
             "n_kv": ta["n_kv"],
             "n_cpu_moe": best_ncmoe,
@@ -915,6 +920,8 @@ def build_result(mpath, meta, ctx, ncm, cpm, bd, draft_path=None):
         "headroom_gb": bd.get("headroom_gb"),
         "vram_budget_gb": bd.get("vram_budget"),
         "kv_gb": bd.get("kv_gb"),
+        "kv_ptok_f32": bd.get("kv_ptok_f32"),
+        "kv_ptok_q4": bd.get("kv_ptok_q4"),
         "dram_need_gb": bd.get("dram_need"),
         "max_overhead_pct": bd.get("max_overhead_pct"),
     }
@@ -1054,7 +1061,7 @@ def main():
     print(f"# {os.path.basename(mpath)}")
     print(f"#   arch={meta['arch']}  L={meta['nl']}  train_ctx={meta['train_ctx']}  experts={meta['nexp']}/{meta['nact']}")
     print(f"#   file={meta['fsize']/GB:.1f}GB  nonex={ta['nonex']/GB:.2f}GB  exp={ta['exp']/GB:.2f}GB")
-    print(f"#   kv_ptok={ta['kv_ptok']:.1f}B  kv_layers={ta['n_kv']}(growing={ta['n_cache']})")
+    print(f"#   kv_ptok_f32={ta['kv_ptok_f32']:.1f}B  kv_ptok_q4={ta['kv_ptok_q4']:.1f}B  kv_layers={ta['n_kv']}(growing={ta['n_cache']})")
 
     draft = 0
     if dpath and os.path.exists(dpath):

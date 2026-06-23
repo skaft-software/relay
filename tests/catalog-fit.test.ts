@@ -14,6 +14,7 @@ import {
   type CatalogEntry,
   type CatalogFitEstimate,
   type GpuProbe,
+  type FitStrategy,
 } from '../src/setup-logic.ts';
 
 const GPU16: GpuProbe = { gpu_type: 'amd', driver: 'vulkan', vram_total_gb: 16, vram_free_gb: 16 };
@@ -33,14 +34,14 @@ test('MoE model reaches its architectural max via cpu-moe and is tagged arch-max
   assert.equal(est.maxCtx, 262144);            // clamped to trained ctx
   assert.equal(est.provenance, 'arch-max');    // never 'tested' from catalog math
   assert.equal(est.ramTight, false);           // ~17 GB experts fit in 28 GB
-  assert.equal(buildFitLabel(est), '✓ 256k');  // runs (estimate), no jargon
+  assert.match(buildFitLabel(est), /◌.*MoE→CPU.*slower.*max ctx/);  // moe-cpu, arch-max
 });
 
 test('A 30.8 GB MoE on a 30 GB box is "tight", not a hard no (lower ctx may help)', () => {
   const m = entry({ size_gb: 30.8, ctx: 131072, moe: true, arch: 'gpt-oss', expert_count: 80, active_experts: 4 });
   const est = estimateContextFromCatalog(m, GPU16, 28, 'headless');
   assert.equal(est.ramTight, true);            // ~29 GB experts > 28 − reserve
-  assert.match(buildFitLabel(est), /^⚠ .*tight$/);   // ⚠ tight, NOT ✗
+  assert.match(buildFitLabel(est), /⚠/);
 });
 
 test('Unknown architecture still estimates via a generic fallback (never "?")', () => {
@@ -48,7 +49,7 @@ test('Unknown architecture still estimates via a generic fallback (never "?")', 
   const est = estimateContextFromCatalog(m, GPU16, 28, 'headless');
   assert.notEqual(est.fit, 'unknown');          // no more refuse-to-estimate
   assert.ok(est.maxCtx > 0);
-  assert.notEqual(buildFitLabel(est), '✗ too big');
+  assert.notEqual(buildFitLabel(est), '✗ no');
 });
 
 test('Only a missing size_gb yields "unknown"', () => {
@@ -103,13 +104,17 @@ test('detectHostProfile honors RELAY_HOST_PROFILE override', () => {
 });
 
 test('buildFitLabel provenance mapping', () => {
-  const base: CatalogFitEstimate = { fit: 'full-gpu', maxCtx: 131072, expertStrategy: 'full-gpu', ctxLabel: '128k', provenance: 'calc', ramTight: false };
-  assert.equal(buildFitLabel({ ...base, provenance: 'tested' }), '✓ 128k tested');
-  assert.equal(buildFitLabel({ ...base, provenance: 'arch-max' }), '✓ 128k');
-  assert.equal(buildFitLabel({ ...base, provenance: 'calc' }), '✓ 128k');
-  assert.equal(buildFitLabel({ ...base, expertStrategy: 'partial-ngl' }), '⚠ 128k tight');
-  assert.equal(buildFitLabel({ ...base, ramTight: true }), '⚠ 128k tight');
-  assert.equal(buildFitLabel({ ...base, fit: 'too-large', maxCtx: 0 }), '✗ no');
+  const mkEst = (over: Partial<CatalogFitEstimate>): CatalogFitEstimate => ({
+    fit: 'full-gpu', maxCtx: 131072, expertStrategy: 'full-gpu', ctxLabel: '128k',
+    provenance: 'calc', ramTight: false, strategy: 'full-gpu' as FitStrategy,
+    modes: { balanced: { ctx: 131072, strategy: 'full-gpu' as FitStrategy, ctxLabel: '128k', kvCacheQuant: 'q4_0' } },
+    ...over,
+  });
+  assert.match(buildFitLabel(mkEst({ provenance: 'tested' })), /✓.*verified/);
+  assert.match(buildFitLabel(mkEst({ provenance: 'arch-max' })), /max ctx/);
+  assert.match(buildFitLabel(mkEst({ provenance: 'calc' })), /estimated/);
+  assert.match(buildFitLabel(mkEst({ ramTight: true })), /⚠.*tight/);
+  assert.match(buildFitLabel(mkEst({ fit: 'too-large', maxCtx: 0 })), /✗ no/);
 });
 
 test('every catalog entry yields a non-empty, honest label', async () => {

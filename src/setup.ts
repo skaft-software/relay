@@ -32,15 +32,13 @@ import {
 } from './setup-theme.ts';
 
 // ── Fit label ─────────────────────────────────────────────────────────────
-// Provenance-tagged, color-coded fit label for a model row. Green = a real fit
-// (architectural max or empirically tested); yellow = calculated-but-untested;
-// red = won't fit / RAM-tight. Honest by construction (see buildFitLabel).
-function coloredFit(est: L.CatalogFitEstimate): string {
-  const lbl = L.buildFitLabel(est);
-  if (est.fit === 'too-large' || est.maxCtx <= 0) return r(lbl);   // ✗ no fit
-  if (est.provenance === 'tested') return g(lbl);                  // ✓ confirmed
-  if (est.ramTight || est.expertStrategy === 'partial-ngl') return y(lbl); // ⚠ tight
-  return g(lbl);                                                   // ✓ runs (estimate)
+// Three-mode colored fit label. Uses the active sizing mode for the quant picker.
+function coloredFit(est: L.CatalogFitEstimate, mode?: 'speed' | 'balanced' | 'capacity'): string {
+  const lbl = L.buildFitLabel(est, mode);
+  if (est.fit === 'too-large' || est.maxCtx <= 0) return r(lbl);
+  if (est.provenance === 'tested') return g(lbl);
+  if (est.ramTight) return y(lbl);
+  return g(lbl);
 }
 
 // ── Plain-language legends ──────────────────────────────────────────────────
@@ -332,7 +330,7 @@ class RelayTUI {
   }
 
   private estFor(m: CatalogEntry): L.CatalogFitEstimate {
-    if (!this.gpu || !m.size_gb) return { fit: 'unknown', maxCtx: 0, expertStrategy: 'none', ctxLabel: '?', provenance: 'calc', ramTight: false };
+    if (!this.gpu || !m.size_gb) return { fit: 'unknown', maxCtx: 0, expertStrategy: 'none', ctxLabel: '?', provenance: 'calc', ramTight: false, strategy: 'full-gpu' as L.FitStrategy, modes: { balanced: { ctx: 0, strategy: 'full-gpu' as L.FitStrategy, ctxLabel: '?', kvCacheQuant: 'q4_0' } } };
     const est = L.estimateContextFromCatalog(m, this.gpu, this.dramGb, undefined, this.backend);
     const path = this.disk().pathById.get(m.id);
     if (path) {
@@ -673,8 +671,6 @@ class RelayTUI {
       if (ql.includes('q2') || ql.includes('iq2')) return 4;
       return 5;
     };
-    // Comfortable fits first, then tight, then won't-fit; within a tier, best
-    // quality first. (Sort by fit — the user's ask — with quality as tiebreak.)
     const tierOf = (m: CatalogEntry): number => {
       const e = this.estFor(m);
       if (e.fit === 'too-large' || e.maxCtx <= 0) return 2;
@@ -689,23 +685,24 @@ class RelayTUI {
     comps.push(new Spacer(1));
     comps.push(new Block([`  ${a(b(modelName))}  ${d(`(${quants.length} quants — best fit first)`)}`]));
     comps.push(new Spacer(1));
-    comps.push(new Block([fitLegendLine()]));
-    comps.push(new Block(glossaryLines()));
-    comps.push(new Spacer(1));
 
     const pad = (s: string, w: number): string => s + ' '.repeat(Math.max(0, w - visibleWidth(s)));
     const G = '  ';
     const rowAvail = Math.max(16, this.terminal.columns - 4);
-    const colQuant = 11, colFit = 18, colSize = 6, LEAD = 2;
-    const showFit = rowAvail >= LEAD + colQuant + G.length + colFit;
-    const showSize = showFit && rowAvail >= LEAD + colQuant + G.length + colFit + G.length + colSize;
-    const showRec = showSize && rowAvail >= LEAD + colQuant + G.length + colFit + G.length + colSize + G.length + 12;
+    const colQuant = 11, colMode = 18, colSize = 6, LEAD = 2;
+    const wide = rowAvail >= 100;
+    const showModes = rowAvail >= LEAD + colQuant + G.length + colMode;
+    const showSize = showModes && rowAvail >= LEAD + colQuant + G.length + colMode + G.length + colSize;
 
+    // On wide terminals, show three mode columns. On narrow, show the active mode.
     const items: Array<{ value: string; label: string; desc: string }> = [];
     const hdr = ['  ' + pad(d('quant'), colQuant)];
-    if (showFit) hdr.push(pad(d('runs?'), colFit));
+    if (wide && showModes) {
+      hdr.push(pad(d('SPEED'), colMode), pad(d('BALANCED'), colMode), pad(d('CAPACITY'), colMode));
+    } else if (showModes) {
+      hdr.push(pad(d('fit / ctx'), colMode));
+    }
     if (showSize) hdr.push(pad(d('size'), colSize));
-    if (showRec) hdr.push(d('quality'));
     items.push({ value: '', label: hdr.join(G), desc: '' });
     items.push({ value: '', label: `  ${g('●')} ${d('downloaded')} ${d('○ not')}  ${g('★ recommended')} ${d('= IQ3/IQ4')}  ${r('avoid')} ${d('= 1–2 bit')}`, desc: '' });
     items.push({ value: '', label: '', desc: '' });
@@ -713,15 +710,34 @@ class RelayTUI {
     for (const m of sorted) {
       const onDisk = ids.has(m.id);
       const marker = onDisk ? g('●') : d('○');
-      const tier = L.quantTier(m.quant);
-      const rec = tier === 'recommended' ? g('★ recommended') : tier === 'not-recommended' ? r('avoid (lossy)') : d('ok');
+      const est = this.estFor(m);
       const sizeGb = typeof m.size_gb === 'number' ? m.size_gb.toFixed(1).replace(/\.0$/, '') : '?';
       const parts = [`${marker} ${pad(m.quant.toUpperCase(), colQuant)}`];
-      if (showFit) parts.push(pad(this.fitLabel(m), colFit));
+      if (wide && showModes) {
+        // Show ctx for each mode
+        const sCtx = est.modes.speed?.ctxLabel ?? d('—');
+        const bCtx = est.modes.balanced.ctxLabel;
+        const cCtx = est.modes.capacity?.ctxLabel ?? bCtx;
+        parts.push(pad(sCtx, colMode), pad(bCtx, colMode), pad(cCtx, colMode));
+      } else if (showModes) {
+        parts.push(pad(coloredFit(est, 'balanced'), colMode));
+      }
       if (showSize) parts.push(pad(sizeGb + 'GB' + (m.shards ? `·${m.shards}` : ''), colSize));
-      if (showRec) parts.push(rec);
       items.push({ value: m.id, label: parts.join(G), desc: '' });
     }
+
+    // Legend
+    const legendLines = [
+      `  ${g('full GPU')} ${d('= fast')} · ${y('hybrid')} ${d('= moderate speed')} · ${y('MoE→CPU')} ${d('= slower')} · ${r('tight')} ${d('= RAM near limit')}`,
+    ];
+    if (wide) {
+      legendLines.push(`  ${d('verified = probe succeeded · estimated = budget calc · max ctx = at architecture ceiling')}`);
+      legendLines.push(`  ${d('m=cycle mode  Enter=pick  Esc=back')}`);
+    } else {
+      legendLines.push(`  ${d('m=cycle mode (speed→balanced→capacity)  Enter=pick  Esc=back')}`);
+    }
+    comps.push(new Block(legendLines));
+    comps.push(new Spacer(1));
 
     const menu = new MenuList(items, Math.max(8, this.terminal.rows - 13));
     menu.onSelect = (id) => {
@@ -731,8 +747,6 @@ class RelayTUI {
     };
     menu.onCancel = () => this.showModelList(this.modelListEntries);
     comps.push(menu);
-    comps.push(new Spacer(1));
-    comps.push(new Block([`  ${d('↑/↓ browse · Enter to pick · Esc back to models')}`]));
 
     this.tui.clear();
     for (const comp of comps) this.tui.addChild(comp);
@@ -885,12 +899,20 @@ class RelayTUI {
 
   private applyQuickstart(): void {
     if (this.selectedModels.length === 0) return;
+    const pick = this.selectedModels[0]!;
+    // Configure EVERY installed model (user's pick stays default/first), resolving each
+    // real on-disk path so nested hf-cli snapshot layouts aren't missed.
+    const installed = listModels(this.modelDir).filter((r) => r.installed).map((r) => r.model);
+    const ordered = [pick, ...installed.filter((m) => m.id !== pick.id)];
     const modelPaths = new Map<string, string>();
-    for (const model of this.selectedModels) {
-      const defaultPath = resolve(this.modelDir, model.filename ?? `${model.id}.gguf`);
-      modelPaths.set(model.id, defaultPath);
-    }
-    L.configureQuickstart(this.env, this.selectedModels, modelPaths, this.llamaServerPath, this.modelDir, this.gpu);
+    const selections = ordered.filter((model) => {
+      const p = installedPath(model, this.modelDir);
+      if (!p) return false;
+      modelPaths.set(model.id, p);
+      return true;
+    });
+    if (selections.length === 0) return;
+    L.configureQuickstart(this.env, selections, modelPaths, this.llamaServerPath, this.modelDir, this.gpu);
   }
 
   // ── Install cloudflared ───────────────────────────────────────────────
@@ -1213,7 +1235,7 @@ class RelayTUI {
       value: rr.model.id,
       label: rr.model.id,
       desc: kind === 'download'
-        ? `~${rr.model.size_gb ?? '?'} GB · ${L.buildFitLabel(this.gpu ? L.estimateContextFromCatalog(rr.model, this.gpu) : { fit: 'unknown', maxCtx: 0, expertStrategy: 'none', ctxLabel: '?', provenance: 'calc', ramTight: false })}`
+        ? `~${rr.model.size_gb ?? '?'} GB · ${L.buildFitLabel(this.gpu ? L.estimateContextFromCatalog(rr.model, this.gpu) : { fit: 'unknown', maxCtx: 0, expertStrategy: 'none', ctxLabel: '?', provenance: 'calc', ramTight: false, strategy: 'full-gpu' as L.FitStrategy, modes: { balanced: { ctx: 0, strategy: 'full-gpu' as L.FitStrategy, ctxLabel: '?', kvCacheQuant: 'q4_0' } } })}`
         : kind === 'probe'
         ? `${rr.sizeOnDiskGb ?? '?'} GB on disk — launch it & verify the real fit`
         : `${rr.sizeOnDiskGb ?? '?'} GB on disk — frees space`,
