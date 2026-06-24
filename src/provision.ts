@@ -45,11 +45,34 @@ export type LlamaServer = {
   source: 'env' | 'path' | 'convention' | 'none';
 };
 
+export type GpuInfo = {
+  /** Backend-relative index, e.g. 0 for CUDA0 / Vulkan0. */
+  index: number;
+  /** Device handle as llama.cpp names it (CUDA0, Vulkan1, ROCm0, …). Matches what `--device` expects. */
+  device: string;
+  name: string;
+  vramGb: number;
+  /** Free VRAM if the probe reported it (only `--list-devices` does). */
+  freeVramGb?: number;
+};
+
 export type Hardware = {
   vendor: 'nvidia' | 'amd' | 'apple' | 'none';
+  /** First GPU's name — back-compat single-GPU label. */
   gpuName?: string;
+  /**
+   * Conservative single-model VRAM budget in GB = the largest single card.
+   * Equal to the one card's VRAM on single-GPU boxes (no behavioral change there).
+   */
   vramGb: number;
   ramGb: number;
+  /** Every GPU the machine exposes. Empty when vendor === 'none'. */
+  gpus: GpuInfo[];
+  gpuCount: number;
+  /** Largest single card's VRAM (= the single-model budget basis, = vramGb). */
+  maxGpuVramGb: number;
+  /** Sum of all cards' VRAM — the physical ceiling reachable via splitting. */
+  totalGpuVramGb: number;
 };
 
 export type ModelFile = {
@@ -160,25 +183,123 @@ function ramGb(): number {
   return 0;
 }
 
-export function detectHardware(): Hardware {
-  // NVIDIA
+// ── GPU enumeration (pure parsers — fixture-testable) ──────────────────────
+
+/** Map a llama.cpp device handle + name to a relay vendor. */
+export function gpuVendor(device: string, name: string): Hardware['vendor'] {
+  const d = device.toLowerCase();
+  if (d.startsWith('cuda')) return 'nvidia';
+  if (d.startsWith('rocm') || d.startsWith('hip')) return 'amd';
+  if (d.startsWith('metal') || d.startsWith('mtl')) return 'apple';
+  // Vulkan (or anything else): fall back to the human name.
+  const n = name.toLowerCase();
+  if (n.includes('nvidia') || /\bgeforce|\bquadro|\btesla|\brtx|\bgtx\b/.test(n)) return 'nvidia';
+  if (n.includes('amd') || n.includes('radeon') || n.includes('rocm') || /\bgfx\d/.test(n)) return 'amd';
+  if (n.includes('apple') || n.includes('metal')) return 'apple';
+  return 'none';
+}
+
+/**
+ * Parse `llama-server --list-devices` output. This is the authoritative,
+ * cross-vendor source: the device handles it prints (CUDA0, Vulkan1, ROCm0)
+ * are exactly what `--device` accepts. Example line:
+ *   `  Vulkan0: AMD Radeon RX 9070 XT (RADV GFX1201) (16304 MiB, 6345 MiB free)`
+ */
+export function parseListDevices(out: string): GpuInfo[] {
+  const gpus: GpuInfo[] = [];
+  const re = /^\s*([A-Za-z]+)(\d+):\s*(.+?)\s*\((\d+)\s*MiB(?:,\s*(\d+)\s*MiB\s*free)?\)\s*$/;
+  for (const line of out.split('\n')) {
+    const m = re.exec(line);
+    if (!m) continue;
+    const [, prefix, idx, name, totalMib, freeMib] = m;
+    const device = prefix! + idx!;
+    const vramGb = Math.round(Number(totalMib) / 1024);
+    if (!vramGb) continue;
+    const g: GpuInfo = { index: Number(idx), device, name: name!.trim(), vramGb };
+    if (freeMib) g.freeVramGb = Math.round(Number(freeMib) / 1024);
+    gpus.push(g);
+  }
+  return gpus;
+}
+
+/**
+ * Parse `nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader,nounits`.
+ * One line per GPU — read them ALL (the previous code read only line 0).
+ */
+export function parseNvidiaSmi(out: string): GpuInfo[] {
+  const gpus: GpuInfo[] = [];
+  for (const line of out.trim().split('\n')) {
+    if (!line.trim()) continue;
+    const parts = line.split(',').map((s) => s.trim());
+    if (parts.length < 3) continue;
+    const [idx, name, mib] = parts;
+    const vramGb = Math.round(Number(mib) / 1024);
+    if (!vramGb) continue;
+    gpus.push({ index: Number(idx), device: 'CUDA' + Number(idx), name: name!, vramGb });
+  }
+  return gpus;
+}
+
+/** Roll a GPU list up into the Hardware summary fields. */
+export function summarizeGpus(gpus: GpuInfo[], vendor: Hardware['vendor']): Hardware {
+  const vrams = gpus.map((g) => g.vramGb);
+  const maxGpuVramGb = vrams.length ? Math.max(...vrams) : 0;
+  const totalGpuVramGb = vrams.reduce((a, b) => a + b, 0);
+  return {
+    vendor: gpus.length ? vendor : 'none',
+    gpuName: gpus[0]?.name,
+    vramGb: maxGpuVramGb,
+    ramGb: ramGb(),
+    gpus,
+    gpuCount: gpus.length,
+    maxGpuVramGb,
+    totalGpuVramGb,
+  };
+}
+
+export function detectHardware(serverPath?: string): Hardware {
+  // Authoritative: ask the actual llama-server binary. Works for CUDA, Vulkan
+  // and ROCm uniformly and yields device handles that match `--device`.
+  const server = serverPath ?? detectLlamaServer().path ?? undefined;
+  if (server) {
+    try {
+      const out = execFileSync(server, ['--list-devices'],
+        { encoding: 'utf8', timeout: 8000, stdio: ['ignore', 'pipe', 'ignore'] });
+      const gpus = parseListDevices(out);
+      if (gpus.length) {
+        const vendor = gpuVendor(gpus[0]!.device, gpus[0]!.name);
+        return summarizeGpus(gpus, vendor);
+      }
+    } catch { /* fall through to vendor tools */ }
+  }
+
+  // Fallback: NVIDIA via nvidia-smi (now reads every GPU).
   try {
-    const out = execFileSync('nvidia-smi', ['--query-gpu=name,memory.total', '--format=csv,noheader,nounits'],
-      { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-    const [name, mib] = out.split('\n')[0]!.split(',').map((s) => s.trim());
-    if (name) return { vendor: 'nvidia', gpuName: name, vramGb: Math.round(Number(mib) / 1024), ramGb: ramGb() };
+    const out = execFileSync('nvidia-smi', ['--query-gpu=index,name,memory.total', '--format=csv,noheader,nounits'],
+      { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] });
+    const gpus = parseNvidiaSmi(out);
+    if (gpus.length) return summarizeGpus(gpus, 'nvidia');
   } catch { /* ignore */ }
-  // AMD
+
+  // Fallback: AMD via rocm-smi (sum all cards, not just the first match).
   try {
     const out = execFileSync('rocm-smi', ['--showmeminfo', 'vram', '--csv'],
       { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] });
-    const total = /(\d{9,})/.exec(out);
-    if (total) return { vendor: 'amd', gpuName: amdName(), vramGb: Math.round(Number(total[1]) / 1024 ** 3), ramGb: ramGb() };
+    const totals = [...out.matchAll(/(\d{9,})/g)].map((m) => Number(m[1]));
+    if (totals.length) {
+      const gpus: GpuInfo[] = totals.map((bytes, i) => ({
+        index: i, device: 'ROCm' + i, name: amdName() ?? 'AMD GPU', vramGb: Math.round(bytes / 1024 ** 3),
+      })).filter((g) => g.vramGb > 0);
+      if (gpus.length) return summarizeGpus(gpus, 'amd');
+    }
   } catch { /* ignore */ }
-  // AMD via vulkaninfo fallback
+
+  // Fallback: AMD/other via vulkaninfo (single heap — no multi-GPU detail).
   const vk = vulkanVram();
-  if (vk.vramGb > 0) return { vendor: 'amd', gpuName: vk.name, vramGb: vk.vramGb, ramGb: ramGb() };
-  return { vendor: 'none', vramGb: 0, ramGb: ramGb() };
+  if (vk.vramGb > 0) {
+    return summarizeGpus([{ index: 0, device: 'Vulkan0', name: vk.name ?? 'GPU', vramGb: vk.vramGb }], 'amd');
+  }
+  return summarizeGpus([], 'none');
 }
 
 function amdName(): string | undefined {
@@ -495,6 +616,10 @@ export function renderStartScript(model: ModelFile, entry: MapEntry, llama: Llam
       ['--jinja'],
     ];
   }
+  if (entry.gpu) {
+    const present = new Set(args.map((a) => a[0]!));
+    for (const pair of gpuLaunchFlags(entry.gpu, present)) args.push(pair);
+  }
   if (entry.multimodal && model.mmproj) args.push(['--mmproj', shq(model.mmproj)]);
   if (model.draft) args.push(['--model-draft', shq(model.draft)]);
   const body = args.map((a) => '  ' + a.join(' ') + ' \\').join('\n');
@@ -518,7 +643,54 @@ export type MapEntry = {
   multimodal?: boolean;
   expert_flag?: string;
   thinking_levels?: string[];
+  gpu?: GpuConfig;
 };
+
+/**
+ * Per-model GPU placement, mapped 1:1 onto llama.cpp flags. Every field is
+ * optional; only the ones set are emitted. Round-trips through the models map
+ * JSON (reconcileMap preserves user edits), so this is the user-facing knob.
+ */
+export type GpuConfig = {
+  /** `--device` — comma-separated handles, e.g. "CUDA0" or "CUDA0,CUDA1", or "none". */
+  device?: string;
+  /** `--split-mode` — how to spread the model across GPUs. */
+  splitMode?: 'none' | 'layer' | 'row' | 'tensor';
+  /** `--tensor-split` — per-GPU proportions, e.g. [3,1] for a 24G+8G pair. */
+  tensorSplit?: number[];
+  /** `--main-gpu` — primary device for scratch/KV. */
+  mainGpu?: number;
+  /** `-ngl` — exact layer count, or 'all' for full offload. Omit to leave the default / let --fit decide. */
+  gpuLayers?: number | 'all';
+  /** `--fit on|off` — let llama.cpp auto-fit unset args to device memory. */
+  fit?: boolean;
+  /** `--fit-target` — per-device free-VRAM margin (MiB). */
+  fitTarget?: number[];
+};
+
+/**
+ * Turn a GpuConfig into flag pairs for renderStartScript. Pure + exported so
+ * the NVIDIA / multi-GPU mapping is unit-tested without the hardware.
+ * `present` is the set of flags already in the base args, so we never duplicate
+ * one (e.g. -ngl is in the default args).
+ */
+export function gpuLaunchFlags(gpu: GpuConfig, present: ReadonlySet<string> = new Set()): string[][] {
+  const out: string[][] = [];
+  const push = (flag: string, value?: string) => {
+    if (present.has(flag)) return;
+    out.push(value === undefined ? [flag] : [flag, value]);
+  };
+  if (gpu.device) push('--device', gpu.device);
+  if (gpu.splitMode) push('--split-mode', gpu.splitMode);
+  if (gpu.tensorSplit && gpu.tensorSplit.length) push('--tensor-split', gpu.tensorSplit.join(','));
+  if (typeof gpu.mainGpu === 'number') push('--main-gpu', String(gpu.mainGpu));
+  if (gpu.gpuLayers !== undefined && !present.has('-ngl') && !present.has('--n-gpu-layers') && !present.has('--gpu-layers')) {
+    out.push(['-ngl', gpu.gpuLayers === 'all' ? '999' : String(gpu.gpuLayers)]);
+  }
+  if (gpu.fit !== undefined) push('--fit', gpu.fit ? 'on' : 'off');
+  if (gpu.fitTarget && gpu.fitTarget.length) push('--fit-target', gpu.fitTarget.join(','));
+  return out;
+}
 
 export function modelMapEntry(fit: ModelFit, containerScriptPath: string, port: number, tuned?: SizeModelResult): MapEntry {
   const ctx_size = tuned?.maxCtx || fit.ctxSize;
@@ -590,7 +762,12 @@ export function generateMap(
         tuned[fit.model.id] = sizeResult;
       }
     }
-    out[fit.model.id] = modelMapEntry(fit, containerScriptDir + '/start-' + fit.model.id + '.sh', port, sizeResult);
+    const entry = modelMapEntry(fit, containerScriptDir + '/start-' + fit.model.id + '.sh', port, sizeResult);
+    // Multi-GPU default: let llama.cpp pipeline-parallel across visible cards and
+    // auto-fit unset args. We do NOT pre-compute a tensor-split — `--fit on` is the
+    // safe cross-vendor default. A user can override per-model via the map's `gpu`.
+    if (plan.hw.gpuCount > 1 && !entry.gpu) entry.gpu = { fit: true };
+    out[fit.model.id] = entry;
   }
   return { map: out, tuned };
 }
@@ -778,6 +955,25 @@ export function buildPlan(opts?: ProvisionOptions, env: NodeJS.ProcessEnv = proc
   return { layout, llama, hw, models, backend, profile, buildPlan };
 }
 
+/** One honest hardware summary line. Pure + exported for snapshot testing. */
+export function formatHardware(hw: Hardware): string {
+  if (hw.vendor === 'none' || hw.gpuCount === 0) {
+    return 'none · no GPU · CPU only · ' + hw.ramGb + 'GB RAM';
+  }
+  const plural = hw.gpuCount === 1 ? 'GPU' : 'GPUs';
+  const name = hw.gpuName ? ' · ' + hw.gpuName : '';
+  // Per-card VRAM: collapse to "16GB each" when uniform, else "24GB + 8GB".
+  const vrams = hw.gpus.map((g) => g.vramGb);
+  const uniform = vrams.every((v) => v === vrams[0]);
+  const perCard = hw.gpuCount === 1
+    ? hw.maxGpuVramGb + 'GB'
+    : uniform
+      ? hw.maxGpuVramGb + 'GB each'
+      : vrams.map((v) => v + 'GB').join(' + ');
+  return hw.vendor + ' · ' + hw.gpuCount + ' ' + plural + name + ' · ' + perCard +
+    ' · ' + hw.totalGpuVramGb + 'GB total VRAM · ' + hw.ramGb + 'GB RAM';
+}
+
 function printPlan(plan: Plan, skipDocker = false): void {
   const { layout, llama, hw, models, backend, profile, buildPlan } = plan;
   const w = (s: string, n: number) => (s.length >= n ? s : s + ' '.repeat(n - s.length));
@@ -789,7 +985,10 @@ function printPlan(plan: Plan, skipDocker = false): void {
   console.log('               models=' + layout.modelsDir);
   console.log('               scripts=' + layout.scriptsDir + '  logs=' + layout.logsDir);
   console.log('  llama-server ' + (llama.path ?? '(none — would build)') + '  [' + llama.backend + ', via ' + llama.source + ']');
-  console.log('  hardware     ' + hw.vendor + (hw.gpuName ? ' ' + hw.gpuName : '') + ' · ' + hw.vramGb + 'GB VRAM · ' + hw.ramGb + 'GB RAM');
+  console.log('  hardware     ' + formatHardware(hw));
+  if (hw.gpuCount > 1) {
+    console.log('               single-model budget: ' + hw.maxGpuVramGb + 'GB  ·  total physical VRAM: ' + hw.totalGpuVramGb + 'GB  ·  multi-GPU split: available');
+  }
   console.log('  models       ' + models.length + ' found in ' + layout.modelsDir + '\n');
   for (const f of models) {
     const flags = [
@@ -805,6 +1004,11 @@ function printPlan(plan: Plan, skipDocker = false): void {
 
   if (hw.vendor === 'none') {
     console.log('\n  ⚠ Warning: No GPU detected. Models will run CPU-only (very slow).');
+  }
+  if (hw.gpuCount > 1) {
+    console.log('\n  ℹ ' + hw.gpuCount + ' GPUs: defaulting to llama.cpp --fit on (pipeline-parallel across all cards).');
+    console.log('    For finer control set a per-model "gpu" block in RELAY_MODEL_MAP, e.g.');
+    console.log('    "gpu": { "splitMode": "layer", "tensorSplit": [' + hw.gpus.map((g) => g.vramGb).join(', ') + '], "device": "' + hw.gpus.map((g) => g.device).join(',') + '" }');
   }
   if (profile === 'nano' && hw.ramGb > 0 && hw.ramGb < 8) {
     console.log('  ⚠ Warning: Less than 8GB RAM. Nano profile may still be tight.');

@@ -19,6 +19,12 @@ import {
   selectBackend,
   resolveLayout,
   fitModel,
+  parseListDevices,
+  parseNvidiaSmi,
+  summarizeGpus,
+  gpuVendor,
+  gpuLaunchFlags,
+  formatHardware,
   type Hardware,
   type ModelFile,
 } from '../src/provision.ts';
@@ -41,7 +47,12 @@ function model(overrides: Partial<ModelFile> = {}): ModelFile {
 }
 
 function hw(overrides: Partial<Hardware> = {}): Hardware {
-  return { vendor: 'nvidia', vramGb: 24, ramGb: 32, ...overrides };
+  const base: Hardware = {
+    vendor: 'nvidia', vramGb: 24, ramGb: 32,
+    gpus: [{ index: 0, device: 'CUDA0', name: 'NVIDIA Test', vramGb: 24 }],
+    gpuCount: 1, maxGpuVramGb: 24, totalGpuVramGb: 24,
+  };
+  return { ...base, ...overrides };
 }
 
 // ── CLI argument parsing / safety gate ─────────────────────────────────────
@@ -157,4 +168,123 @@ test('resolveLayout: explicit models dir wins; scripts/logs live under ~/.relay'
   assert.match(layout.relayHome, /\.relay$/);
   assert.match(layout.scriptsDir, /\.relay\/start-scripts$/);
   assert.match(layout.logsDir, /\.relay\/logs$/);
+});
+
+// ── GPU enumeration: --list-devices (authoritative, cross-vendor) ─────────────
+
+test('parseListDevices: single AMD Vulkan card with free VRAM', () => {
+  // Real output from the RX 9070 XT box this was developed on.
+  const out = 'WARNING: radv is not a conformant Vulkan implementation, testing use only.\n' +
+    'Available devices:\n' +
+    '  Vulkan0: AMD Radeon RX 9070 XT (RADV GFX1201) (16304 MiB, 6345 MiB free)\n';
+  const gpus = parseListDevices(out);
+  assert.equal(gpus.length, 1);
+  assert.deepEqual(gpus[0], { index: 0, device: 'Vulkan0', name: 'AMD Radeon RX 9070 XT (RADV GFX1201)', vramGb: 16, freeVramGb: 6 });
+});
+
+test('parseListDevices: two NVIDIA CUDA cards (device handles match --device)', () => {
+  const out = 'Available devices:\n' +
+    '  CUDA0: NVIDIA GeForce RTX 3090 (24576 MiB, 24000 MiB free)\n' +
+    '  CUDA1: NVIDIA GeForce RTX 3090 (24576 MiB, 23900 MiB free)\n';
+  const gpus = parseListDevices(out);
+  assert.equal(gpus.length, 2);
+  assert.deepEqual(gpus.map((g) => g.device), ['CUDA0', 'CUDA1']);
+  assert.equal(summarizeGpus(gpus, gpuVendor(gpus[0]!.device, gpus[0]!.name)).vendor, 'nvidia');
+});
+
+test('parseListDevices: heterogeneous multi-GPU (24G + 8G) without free column', () => {
+  const out = '  CUDA0: NVIDIA RTX 3090 (24576 MiB)\n  CUDA1: NVIDIA RTX 3070 (8192 MiB)\n';
+  const gpus = parseListDevices(out);
+  const sum = summarizeGpus(gpus, 'nvidia');
+  assert.equal(sum.gpuCount, 2);
+  assert.equal(sum.maxGpuVramGb, 24);
+  assert.equal(sum.totalGpuVramGb, 32);
+  assert.equal(sum.vramGb, 24); // single-model budget = largest card
+  assert.equal(gpus[0]!.freeVramGb, undefined);
+});
+
+test('parseListDevices: ignores non-device lines and CPU entries', () => {
+  const out = 'Available devices:\n  CPU: AMD Ryzen (no VRAM)\n  garbage line\n';
+  assert.equal(parseListDevices(out).length, 0);
+});
+
+test('gpuVendor: classifies by device prefix then by name', () => {
+  assert.equal(gpuVendor('CUDA0', 'whatever'), 'nvidia');
+  assert.equal(gpuVendor('ROCm0', 'AMD'), 'amd');
+  assert.equal(gpuVendor('Vulkan0', 'AMD Radeon RX 9070 XT'), 'amd');
+  assert.equal(gpuVendor('Vulkan0', 'NVIDIA GeForce RTX 4090'), 'nvidia');
+  assert.equal(gpuVendor('Metal0', 'Apple M3 Max'), 'apple');
+});
+
+// ── GPU enumeration: nvidia-smi fallback (reads EVERY GPU, not just line 0) ────
+
+test('parseNvidiaSmi: parses all GPUs (regression: previously read only line 0)', () => {
+  const out = '0, NVIDIA GeForce RTX 3090, 24576\n1, NVIDIA GeForce RTX 3090, 24576\n';
+  const gpus = parseNvidiaSmi(out);
+  assert.equal(gpus.length, 2);
+  assert.equal(summarizeGpus(gpus, 'nvidia').totalGpuVramGb, 48);
+  assert.equal(summarizeGpus(gpus, 'nvidia').vramGb, 24);
+});
+
+test('summarizeGpus: empty list collapses to vendor none', () => {
+  const sum = summarizeGpus([], 'nvidia');
+  assert.equal(sum.vendor, 'none');
+  assert.equal(sum.gpuCount, 0);
+  assert.equal(sum.totalGpuVramGb, 0);
+});
+
+// ── GpuConfig → llama.cpp launch flags ───────────────────────────────────────
+
+test('gpuLaunchFlags: maps every field to its llama.cpp flag', () => {
+  const flags = gpuLaunchFlags({
+    device: 'CUDA0,CUDA1', splitMode: 'layer', tensorSplit: [3, 1],
+    mainGpu: 0, gpuLayers: 'all', fit: true, fitTarget: [1024, 512],
+  });
+  const flat = flags.map((p) => p.join(' '));
+  assert.ok(flat.includes('--device CUDA0,CUDA1'));
+  assert.ok(flat.includes('--split-mode layer'));
+  assert.ok(flat.includes('--tensor-split 3,1'));
+  assert.ok(flat.includes('--main-gpu 0'));
+  assert.ok(flat.includes('-ngl 999'));
+  assert.ok(flat.includes('--fit on'));
+  assert.ok(flat.includes('--fit-target 1024,512'));
+});
+
+test('gpuLaunchFlags: exact gpuLayers number, fit off, and no duplicates of present flags', () => {
+  const flags = gpuLaunchFlags({ gpuLayers: 20, fit: false, device: 'CUDA0' }, new Set(['-ngl', '--device']));
+  const flat = flags.map((p) => p.join(' '));
+  assert.ok(!flat.some((f) => f.startsWith('-ngl')));      // already present → skipped
+  assert.ok(!flat.some((f) => f.startsWith('--device')));  // already present → skipped
+  assert.ok(flat.includes('--fit off'));
+});
+
+test('gpuLaunchFlags: empty config emits nothing', () => {
+  assert.deepEqual(gpuLaunchFlags({}), []);
+});
+
+// ── Honest hardware reporting ────────────────────────────────────────────────
+
+test('formatHardware: single GPU', () => {
+  const line = formatHardware(hw({ vendor: 'amd', gpuName: 'AMD Radeon RX 9070 XT', vramGb: 16, ramGb: 31,
+    gpus: [{ index: 0, device: 'Vulkan0', name: 'AMD Radeon RX 9070 XT', vramGb: 16 }],
+    gpuCount: 1, maxGpuVramGb: 16, totalGpuVramGb: 16 }));
+  assert.equal(line, 'amd · 1 GPU · AMD Radeon RX 9070 XT · 16GB · 16GB total VRAM · 31GB RAM');
+});
+
+test('formatHardware: uniform multi-GPU says "each"; mixed lists each card', () => {
+  const uniform = formatHardware(hw({ vendor: 'nvidia', gpuName: 'RTX 3090', vramGb: 24, ramGb: 64,
+    gpus: [{ index: 0, device: 'CUDA0', name: 'RTX 3090', vramGb: 24 }, { index: 1, device: 'CUDA1', name: 'RTX 3090', vramGb: 24 }],
+    gpuCount: 2, maxGpuVramGb: 24, totalGpuVramGb: 48 }));
+  assert.match(uniform, /2 GPUs .* 24GB each · 48GB total VRAM/);
+  const mixed = formatHardware(hw({ vendor: 'nvidia', gpuName: 'RTX 3090', vramGb: 24, ramGb: 64,
+    gpus: [{ index: 0, device: 'CUDA0', name: 'RTX 3090', vramGb: 24 }, { index: 1, device: 'CUDA1', name: 'RTX 3070', vramGb: 8 }],
+    gpuCount: 2, maxGpuVramGb: 24, totalGpuVramGb: 32 }));
+  assert.match(mixed, /24GB \+ 8GB · 32GB total VRAM/);
+});
+
+test('formatHardware: no GPU', () => {
+  assert.equal(
+    formatHardware(hw({ vendor: 'none', gpus: [], gpuCount: 0, maxGpuVramGb: 0, totalGpuVramGb: 0, vramGb: 0, ramGb: 31 })),
+    'none · no GPU · CPU only · 31GB RAM',
+  );
 });
