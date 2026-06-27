@@ -285,8 +285,8 @@ function sweepModes(
     bestCtx = mcCtx; bestNcmoe = 0; bestCpumoe = true; bestEg = mcEg; bestEc = mcEc;
   }
 
-  // ── Absolute max ctx (capacity objective) — same as best overall ──
-  let maxCtx = bestCtx, maxNcmoe = bestNcmoe, maxCpumoe = bestCpumoe, maxEg = bestEg, maxEc = bestEc;
+  // ── Absolute max ctx (capacity objective) — force --cpu-moe for max ctx ──
+  let maxCtx = mcCtx, maxNcmoe = 0, maxCpumoe = true, maxEg = mcEg, maxEc = mcEc;
 
   // Headroom enforcement (applies to balanced and capacity)
   const enforceHeadroom = (inCtx: number, inNcmoe: number, inCpumoe: boolean, inEg: number, inEc: number): [number, number, boolean, number, number] => {
@@ -401,10 +401,10 @@ export function compute(
     speedMode = toMode('q4_0', q4.speedCtx, 0, false, q4.speedEg, q4.speedEc, budget, base, kvpQ4, draft, nonexGb);
   }
 
-  // balanced: default Q4 (safer, matches --cache-type-k default). Fall back to Q8 if Q4 does not fit.
-  let balancedMode = toMode('q4_0', q4.bestCtx, q4.bestNcmoe, q4.bestCpumoe, q4.bestEg, q4.bestEc, budget, base, kvpQ4, draft, nonexGb);
+  // balanced: default Q8_0 for better context accuracy. Fall back to Q4_0 if Q8_0 does not fit.
+  let balancedMode = toMode('q8_0', q8.bestCtx, q8.bestNcmoe, q8.bestCpumoe, q8.bestEg, q8.bestEc, budget, base, kvpQ8, draft, nonexGb);
   if (!balancedMode) {
-    const alt = toMode('q8_0', q8.bestCtx, q8.bestNcmoe, q8.bestCpumoe, q8.bestEg, q8.bestEc, budget, base, kvpQ8, draft, nonexGb);
+    const alt = toMode('q4_0', q4.bestCtx, q4.bestNcmoe, q4.bestCpumoe, q4.bestEg, q4.bestEc, budget, base, kvpQ4, draft, nonexGb);
     if (alt) balancedMode = alt;
   }
 
@@ -441,19 +441,19 @@ export function sizeModel(path: string, vramBytes: number, dramBytes: number): {
   return { meta, analysis, result };
 }
 
-/** Build launch flags from a sizing result, mirroring size-model.py's output format.
+/** Build launch flags from a sized mode, mirroring size-model.py's output format.
   * Returns flat [flag, value, flag, value, ...] for use by generateStartScript. */
 export function buildLaunchFlags(
-  result: SizeResult,
+  mode: SizedMode,
   opts?: { gpuLayers?: number; parallel?: number; flashAttn?: string; cacheType?: string },
 ): { launchFlags: string[]; expertFlag: string } {
   const gpuLayers = opts?.gpuLayers ?? 999;
   const parallel = opts?.parallel ?? 1;
   const flashAttn = opts?.flashAttn ?? "on";
-  const cacheType = opts?.cacheType ?? "q4_0";
+  const cacheType = opts?.cacheType ?? mode.kvCacheQuant;
 
   const flags: string[] = [
-    "--ctx-size", String(result.bestCtx),
+    "--ctx-size", String(mode.ctx),
     "-ngl", String(gpuLayers),
     "--parallel", String(parallel),
     "--flash-attn", flashAttn,
@@ -463,10 +463,10 @@ export function buildLaunchFlags(
   ];
 
   let expertFlag = "";
-  if (result.allExpertsCpu) {
+  if (mode.allExpertsCpu) {
     expertFlag = "--cpu-moe";
-  } else if (result.cpuMoeLayers > 0) {
-    expertFlag = `--n-cpu-moe ${result.cpuMoeLayers}`;
+  } else if (mode.cpuMoeLayers > 0) {
+    expertFlag = `--n-cpu-moe ${mode.cpuMoeLayers}`;
   }
 
   return { launchFlags: flags, expertFlag };

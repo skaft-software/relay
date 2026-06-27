@@ -266,10 +266,21 @@ export function classifyFitFromCatalog(model: CatalogEntry, gpu: GpuProbe): FitC
   return estimate <= combinedBudget ? 'partial-offload' : 'too-large';
 }
 
+/** Coarse catalog-only context recommendation.
+ *
+ *  This is a fast fallback that uses only file-size and VRAM totals — it
+ *  does NOT account for KV cache cost, per-layer offloading, or expert
+ *  placement. The arbitrary clamps (65k/32k) are placeholders.
+ *
+ *  @deprecated   Use the real sizing engine (sizeModelTS) whenever the GGUF
+ *  is on disk.  `configureQuickstart` already prefers sizeModelTS results;
+ *  this function only runs as a fallback before the sizing engine fires.
+ */
 export function recommendedContext(model: CatalogEntry, gpu?: GpuProbe): number {
   if (!gpu) return model.ctx;
   const fit = classifyFit(model, gpu);
   if (fit === 'full-gpu') return model.ctx;
+  // Conservative clamp when we have no per-layer KV budget:
   if (fit === 'partial-offload') return Math.min(model.ctx, 65_536);
   return Math.min(model.ctx, 32_768);
 }
@@ -811,6 +822,18 @@ export function shEscape(value: string): string {
 
 // ── Start script generation ─────────────────────────────────────────────
 
+/** Writes a start-<modelId>.sh script to the start-scripts directory.
+ *
+ *  When launchFlags from the sizing engine are available, they are the single
+ *  source of truth for llama.cpp flags.  Otherwise a sensible fallback template
+ *  is used (--flash-attn, q4_0 KV, -ngl 99).
+ *
+ *  NOTE on sibling generator in provision.ts: `renderStartScript` generates
+ *  scripts for `relay provision --apply` with similar launchFlags support but
+ *  also handles GpuConfig (multi-GPU placement), mmproj, and model-draft.
+ *  The two generators are kept in sync manually — changes here should be
+ *  reflected in renderStartScript and vice-versa.
+ */
 export function generateStartScript(input: {
   modelId: string;
   modelLabel: string;
@@ -932,7 +955,12 @@ export function sizeModelTS(ggufPath: string, vramGb: number, dramGb: number, kv
     const { result } = sizeModel(ggufPath, Math.trunc(vramGb * GB), Math.trunc(dramGb * GB));
     if (!result.ok) return null;
     const cacheType = kvCacheQuant;
-    const { launchFlags, expertFlag } = buildLaunchFlags(result, { cacheType });
+    // Build launch flags from balanced mode (the backward-compat default).
+    // configureQuickstart overrides these per-selected mode later.
+    const balMode = result.modes.balanced;
+    const { launchFlags, expertFlag } = balMode
+      ? buildLaunchFlags(balMode, { cacheType })
+      : { launchFlags: [] as string[], expertFlag: '' };
     return {
       maxCtx: result.bestCtx,
       launchFlags,
@@ -959,7 +987,8 @@ export function configureQuickstart(
   gpu?: GpuProbe,
 ): void {
   const sizingMode = ((env.get('RELAY_SIZING_MODE') ?? 'balanced') === 'capacity' ? 'capacity' : (env.get('RELAY_SIZING_MODE') ?? 'balanced') === 'speed' ? 'speed' : 'balanced') as 'speed' | 'balanced' | 'capacity';
-  const kvCacheType = (env.get('RELAY_KV_CACHE_TYPE') ?? 'auto') === 'q8_0' ? 'q8_0' as const : 'q4_0' as const;
+  // Default to q8_0 for better context accuracy and reduced hallucination; use q4_0 only if explicitly requested.
+  const kvCacheType = (env.get('RELAY_KV_CACHE_TYPE') ?? 'q8_0') === 'q4_0' ? 'q4_0' as const : 'q8_0' as const;
   const modelEntries: Record<string, { cmd: string; ctx_size: number; multimodal: boolean; thinking_levels?: string[]; expert_flag?: string; kv_cache_type?: string; sizing_mode?: string; provenance?: string; strategy?: string }> = {};
   const defaultModel = selections[0]!;
   for (const model of selections) {
@@ -978,8 +1007,14 @@ export function configureQuickstart(
         // Use selected mode's ctx, falling back to balanced
         const selMode = tuned.modes[sizingMode] ?? tuned.modes.balanced;
         ctxSize = selMode?.ctx ?? tuned.maxCtx;
-        launchFlags = tuned.launchFlags;
-        expertFlag = tuned.expertFlag || undefined;
+        // Build launch flags from the selected mode so --ctx-size and --n-cpu-moe
+        // match the chosen strategy (speed → full-GPU, capacity → --cpu-moe).
+        launchFlags = selMode
+          ? buildLaunchFlags(selMode, { cacheType: kvCacheType }).launchFlags
+          : tuned.launchFlags;
+        expertFlag = selMode
+          ? buildLaunchFlags(selMode, { cacheType: kvCacheType }).expertFlag
+          : tuned.expertFlag;
       }
     }
 
