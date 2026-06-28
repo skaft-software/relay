@@ -112,9 +112,27 @@ export class LlmJobQueue {
   }
 
   submit(input: LlmJobRequest): LlmJobSnapshot {
-    if (!input || typeof input !== 'object') throw new Error('job body must be an object');
-    if (!input.request || typeof input.request !== 'object')
-      throw new Error('job.request must be an object');
+    if (!input || typeof input !== 'object') {
+      const err: any = new Error('job body must be an object');
+      err.status = 400;
+      err.type = 'invalid_request_error';
+      throw err;
+    }
+    if (!input.request || typeof input.request !== 'object') {
+      const err: any = new Error('job.request must be an object');
+      err.status = 400;
+      err.type = 'invalid_request_error';
+      throw err;
+    }
+    // Reject excessively large job payloads (default 1 MiB) to prevent memory exhaustion.
+    const bodyBytes = Buffer.byteLength(JSON.stringify(input.request));
+    if (bodyBytes > 1_048_576) {
+      const err: any = new Error(`job.request exceeds maximum size of 1 MiB (${Math.round(bodyBytes / 1024)} KiB)`);
+      err.status = 413;
+      err.type = 'invalid_request_error';
+      err.code = 'request_too_large';
+      throw err;
+    }
     const id = input.id || crypto.randomUUID();
     const kind: LlmJobKind = input.kind ?? 'openai.chat';
     const job: JobRecord = {

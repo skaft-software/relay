@@ -14,7 +14,8 @@ export type ModelEntry = {
   cmd: string;
   /** Optional health URL (defaults to probing upstreamBaseUrl).
    *  @deprecated Per-model health checks always use http://127.0.0.1:${port}/health.
-   *  This field is parsed but not consulted by the lifecycle. */
+   *  This field is parsed but not consulted by the lifecycle.
+   *  Will be removed in v0.4.0. */
   health_url?: string;
   /** Startup timeout in seconds (defaults to modelStartTimeoutMs / 1000) */
   timeout_sec?: number;
@@ -99,7 +100,9 @@ export type AppConfig = {
   switchPolicy?: 'eager';
   /** Starting port number for dynamic model port allocation. */
   modelPortBase?: number;
-  /** Maximum number of concurrent model processes to keep warm. */
+  /** Maximum number of concurrent model processes to keep warm.
+   *  Enforced by lifecycle.shutdownIdleModels() which prunes oldest warm
+   *  models (LRU by lastUsedAt) when exceeded. */
   switchMaxWarmModels?: number;
   /** Relay mode: gateway (default, manages local models) or cloud (proxies to external APIs). */
   relayMode?: 'gateway' | 'cloud';

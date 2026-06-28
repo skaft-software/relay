@@ -37,11 +37,15 @@ test('MoE model reaches its architectural max via cpu-moe and is tagged arch-max
   assert.match(buildFitLabel(est), /◌.*MoE→CPU.*slower.*max ctx/);  // moe-cpu, arch-max
 });
 
-test('A 30.8 GB MoE on a 30 GB box is "tight", not a hard no (lower ctx may help)', () => {
+test('A 30.8 GB MoE on a 30 GB box is "too-large" — experts must fit DRAM only', () => {
+  // expertGb ≈ 28.3 GB (8% nonex of 30.8 GB).  DRAM-only check: 28.3 > 28 GB →
+  // experts don't fit in available RAM.  The old DRAM+VRAM check falsely said
+  // "fits" and marked it "tight".
   const m = entry({ size_gb: 30.8, ctx: 131072, moe: true, arch: 'gpt-oss', expert_count: 80, active_experts: 4 });
   const est = estimateContextFromCatalog(m, GPU16, 28, 'headless');
-  assert.equal(est.ramTight, true);            // ~29 GB experts > 28 − reserve
-  assert.match(buildFitLabel(est), /⚠/);
+  assert.equal(est.fit, 'too-large');
+  assert.equal(est.ramTight, false);
+  assert.equal(buildFitLabel(est), '✗ no');
 });
 
 test('Unknown architecture still estimates via a generic fallback (never "?")', () => {

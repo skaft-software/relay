@@ -8,9 +8,10 @@
  *  - Idle shutdown: per-model idle timers, cascading (least-recently-used first)
  */
 
-import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { execFileSync, execSync, spawn, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { platform } from 'node:os';
 
 import type { AppConfig, ModelEntry } from './config.ts';
 import { discoverModels } from './openai/models.ts';
@@ -128,6 +129,9 @@ export class ModelLifecycle {
   private nextPort: number;
   /** Session ID currently associated with each loaded model. */
   private modelSessions = new Map<string, string>();
+  /** Persistent port assignments: remembered even after model unload so the
+   *  same model reuses its port across switches. */
+  private rememberedPorts = new Map<string, number>();
   constructor(config: AppConfig, hooks: LifecycleHooks = {}) {
     this.config = config;
     this.hooks = hooks;
@@ -143,16 +147,13 @@ export class ModelLifecycle {
     if (config.lazyModelEnabled && !hooks.spawnProcess) {
       try {
         const portBase = config.modelPortBase ?? 8081;
-        const portArgs: string[] = [];
         for (let p = portBase - 1; p < portBase + 10; p++) {
-          portArgs.push(`${p}/tcp`);
+          killPortProcess(p);
         }
-        execFileSync('fuser', ['-k', ...portArgs], { timeout: 3000, stdio: 'ignore' });
       } catch (error) {
-        if (isFuserNoMatch(error)) return;
         // Best-effort — orphan cleanup failure shouldn't block startup.
-        // Log at warn so permission/missing-binary issues are visible.
-        if (this.hooks.log) this.hooks.log('warn', 'startup orphan cleanup via fuser failed', {});
+        const reason = error instanceof Error ? error.message : String(error);
+        if (this.hooks.log) this.hooks.log('warn', 'startup orphan cleanup failed', { reason });
       }
     }
   }
@@ -434,13 +435,40 @@ export class ModelLifecycle {
   // ── Process management ───────────────────────────────────────────────
 
   private allocatePort(modelName: string): number {
-    // Use fixed port from model entry if configured
+    // Use fixed port from model entry if configured.
+    // Reject duplicate fixed-port assignments across different models.
     const entry = this.config.modelEntries?.[modelName];
-    if (entry?.port) return entry.port;
+    if (entry?.port) {
+      for (const [otherName, proc] of this.activeProcesses) {
+        if (otherName !== modelName && proc.port === entry.port) {
+          throw new Error(
+            `Port ${entry.port} is already in use by model "${otherName}". ` +
+            `Model "${modelName}" cannot use the same fixed port. ` +
+            `Remove the duplicate port assignment or auto-allocate by omitting the port field.`
+          );
+        }
+      }
+      return entry.port;
+    }
 
-    // Check if this model already has a port assigned
+    // Check if this model already has a port assigned (active process).
     const existing = this.activeProcesses.get(modelName);
     if (existing) return existing.port;
+
+    // Reuse a remembered port if available (sticky allocation across unloads).
+    const remembered = this.rememberedPorts.get(modelName);
+    if (remembered !== undefined) {
+      // Verify it's not in use by another active model
+      let collision = false;
+      for (const proc of this.activeProcesses.values()) {
+        if (proc.port === remembered) { collision = true; break; }
+      }
+      if (!collision) {
+        killPortProcess(remembered);
+        return remembered;
+      }
+      // Collision — the remembered port was taken. Fall through to fresh allocation.
+    }
 
     // Allocate next available port
     const port = this.nextPort++;
@@ -449,16 +477,9 @@ export class ModelLifecycle {
       if (proc.port === port) return this.allocatePort(modelName);
     }
     // Kill any orphaned process from a previous Relay instance on this port.
-    // Detached child processes survive restarts as init orphans — fuser -k
-    // cleans them up before we bind.
-    try {
-      execFileSync('fuser', ['-k', `${port}/tcp`], { timeout: 2000, stdio: 'ignore' });
-    } catch (error) {
-      if (isFuserNoMatch(error)) return port;
-      // Best-effort — orphan cleanup failure shouldn't block startup.
-      // Log at warn so permission/missing-binary issues are visible.
-      if (this.hooks.log) this.hooks.log('warn', 'per-port orphan cleanup via fuser failed', { port });
-    }
+    killPortProcess(port);
+    // Remember this port for future reloads.
+    this.rememberedPorts.set(modelName, port);
     return port;
   }
 
@@ -475,12 +496,17 @@ export class ModelLifecycle {
       return null;
     }
 
-    // Inject port into command/args
+    // Sanitize model name for shell interpolation — escape single quotes so
+    // '...' quoting survives shell parsing. Model names come from admin config
+    // and GGUF discovery, not from untrusted client requests, but defense-in-depth
+    // is cheap here.
+    const safeModel = sanitizeForShell(modelName);
+    const safePort = String(port);
     const resolvedCmd = startCmd
-      ? startCmd.replace(/\$\{PORT\}/g, String(port)).replace(/\$\{MODEL\}/g, modelName)
+      ? startCmd.replace(/\$\{PORT\}/g, safePort).replace(/\$\{MODEL\}/g, safeModel)
       : '';
     const resolvedArgv = argv
-      ? argv.map((a) => a.replace(/\$\{PORT\}/g, String(port)).replace(/\$\{MODEL\}/g, modelName))
+      ? argv.map((a) => a.replace(/\$\{PORT\}/g, safePort).replace(/\$\{MODEL\}/g, safeModel))
       : undefined;
 
     this.log('info', 'starting model process', {
@@ -559,6 +585,10 @@ export class ModelLifecycle {
         });
       }
 
+      // Remember the port for sticky allocation across reloads.
+      if (!entry?.port) {
+        this.rememberedPorts.set(modelName, port);
+      }
       this.activeProcesses.set(modelName, proc);
       this.lastStartAt = new Date().toISOString();
       this.lastError = undefined;
@@ -608,8 +638,8 @@ export class ModelLifecycle {
     this.log('info', 'killing model process', { model: modelName, pid, port });
 
 
-    // Phase 1: Graceful SIGTERM
-    if (typeof (proc.child as any).kill === 'function' && pid) {
+    // Phase 1: Graceful SIGTERM (Unix only — Windows doesn't have POSIX signals)
+    if (platform() !== 'win32' && typeof (proc.child as any).kill === 'function' && pid) {
       try {
         (proc.child as any).kill('SIGTERM');
         await new Promise<void>((resolve) => {
@@ -625,22 +655,22 @@ export class ModelLifecycle {
       }
     }
 
-    // Phase 2: Verify death + escalate via fuser on port
+    // Phase 2: Verify death + escalate via port cleanup.
     // shell:true + detached:true leaves model process alive in its own
-    // process group after the shell parent dies. fuser -k is the
-    // ground truth for whether anything is still listening.
+    // process group after the shell parent dies. Platform-aware cleanup
+    // kills anything still listening on the port.
     if (port) {
-      try {
-        execFileSync('fuser', ['-k', '-TERM', port + '/tcp'], { timeout: 2000, stdio: 'ignore' });
-      } catch { /* fuser may not exist in Docker */ }
+      try { killPortProcess(port); } catch { /* best-effort */ }
       await sleep(500);
-      try {
-        execFileSync('fuser', ['-k', '-KILL', port + '/tcp'], { timeout: 2000, stdio: 'ignore' });
-      } catch { /* best-effort */ }
+      try { killPortProcess(port); } catch { /* best-effort */ }
     }
-    // Also kill the process group (negative PID) as last resort
-    if (pid) {
+    // Also kill the process group (negative PID) as last resort (Unix only).
+    if (pid && platform() !== 'win32') {
       try { process.kill(-pid, 'SIGKILL'); } catch { /* already dead */ }
+    }
+    // On Windows, also try taskkill by PID as fallback.
+    if (pid && platform() === 'win32') {
+      try { execSync(`taskkill /PID ${pid} /F /T`, { timeout: 5000, stdio: 'ignore' }); } catch { /* already dead */ }
     }
 
     this.activeProcesses.delete(modelName);
@@ -708,6 +738,24 @@ export class ModelLifecycle {
       if (proc.keepWarm) continue;
       this.log('info', 'idle shutdown: killing inactive model', { model: name });
       await this.killProcess(name);
+    }
+
+    // Enforce switchMaxWarmModels limit: prune oldest warm models if over the limit
+    const maxWarm = this.config.switchMaxWarmModels ?? 2;
+    const warmModels = [...this.activeProcesses.entries()].filter(
+      ([name, proc]) => proc.keepWarm && name !== this.currentModelName,
+    );
+    if (warmModels.length > maxWarm) {
+      warmModels.sort((a, b) => a[1].lastUsedAt - b[1].lastUsedAt);
+      const toKill = warmModels.slice(0, warmModels.length - maxWarm);
+      for (const [name] of toKill) {
+        this.log('info', 'pruning warm model to stay under switchMaxWarmModels limit', {
+          model: name,
+          maxWarm,
+          warmCount: warmModels.length,
+        });
+        await this.killProcess(name);
+      }
     }
 
     // If current model has no keepWarm flag (default model from legacy config), kill it too
@@ -1123,6 +1171,32 @@ export function redact(value: string): string {
     .replace(/Bearer\s+[A-Za-z0-9._\-]+/gi, 'Bearer [REDACTED]');
 }
 
+/** Kill any process listening on the given TCP port.
+ *  Uses fuser on Linux/macOS and netstat+taskkill on Windows. */
+function killPortProcess(port: number): void {
+  if (platform() === 'win32') {
+    try {
+      const output = execSync(`netstat -ano | findstr :${port}`, { timeout: 5000, stdio: 'pipe' }).toString();
+      const pids = new Set<string>();
+      for (const line of output.split(/\r?\n/)) {
+        const match = line.trim().match(/\s(\d+)\s*$/);
+        if (match) pids.add(match[1]);
+      }
+      for (const pid of pids) {
+        try { execSync(`taskkill /PID ${pid} /F /T`, { timeout: 5000, stdio: 'ignore' }); } catch { /* already dead */ }
+      }
+    } catch { /* no process on port or netstat unavailable */ }
+    return;
+  }
+  // Linux / macOS
+  try {
+    execFileSync('fuser', ['-k', `${port}/tcp`], { timeout: 3000, stdio: 'ignore' });
+  } catch (error) {
+    // fuser exit code 1 = "no process on that port" — that's fine.
+    if (!isFuserNoMatch(error)) throw error;
+  }
+}
+
 function isFuserNoMatch(error: unknown): boolean {
   return Boolean(
     error
@@ -1134,4 +1208,10 @@ function isFuserNoMatch(error: unknown): boolean {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Escape a string for safe interpolation inside a single-quoted shell string.
+ *  Replaces ' with '\'' so the shell doesn't break out of quoting. */
+function sanitizeForShell(value: string): string {
+  return value.replace(/'/g, "'\\''");
 }

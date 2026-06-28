@@ -12,7 +12,7 @@
  */
 import { execFileSync } from 'node:child_process';
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { join, dirname, basename } from 'node:path';
+import { join, dirname, basename, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // ── Types ────────────────────────────────────────────────────────────────
@@ -434,8 +434,20 @@ function inferQuant(stem: string): string {
   return m ? m[1]!.toLowerCase() : 'unknown';
 }
 
-function isMoe(stem: string): boolean {
-  return /\b(a\d+b|moe|\d+x\d+b|next|qwen3-?(coder-)?(next|30b|35b|80b))\b/i.test(stem);
+function readCatalog(): Set<string> {
+  const catalogPath = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'docs', 'model-catalog.json');
+  try {
+    const raw = readFileSync(catalogPath, 'utf8');
+    const entries = JSON.parse(raw) as Array<{ id: string; moe?: boolean }>;
+    return new Set(entries.filter((e) => e.moe).map((e) => e.id));
+  } catch {
+    return new Set();
+  }
+}
+
+function isMoe(stem: string, catalogMoe?: boolean): boolean {
+  if (catalogMoe) return true;
+  return /\b(a\d+b|moe|\d+x\d+b|qwen3-?(coder-)?(next|30b|35b|80b))\b/i.test(stem);
 }
 
 export function scanModels(dir: string): ModelFile[] {
@@ -448,6 +460,8 @@ export function scanModels(dir: string): ModelFile[] {
     return !sh || sh[1] === '00001';
   });
 
+  const catalogMoeIds = readCatalog();
+
   const built: BuiltModel[] = bases.map((path) => {
     const b = basename(path);
     const stem = b.replace(SHARD_RE, '').replace(/\.gguf$/i, '');
@@ -458,13 +472,18 @@ export function scanModels(dir: string): ModelFile[] {
           .reduce((s, f) => s + safeSize(f), 0)
       : safeSize(path);
     const sizeGb = Math.round((sizeBytes / 1024 ** 3) * 10) / 10;
+    const stemSlug = slug(stem);
+    const stemTokens = stemSlug.split('-').filter(Boolean);
+    const catalogMoe = [...catalogMoeIds].some((catId) =>
+      catId.split('-').filter(Boolean).every((t) => stemTokens.includes(t))
+    );
     return {
       id: slug(stem),
       label: prettyLabel(stem),
       path,
       sizeGb,
       quant: inferQuant(stem),
-      moe: isMoe(stem),
+      moe: isMoe(stem, catalogMoe),
       vision: false,
       shards,
       incomplete: sizeBytes > 0 && sizeGb < 0.3,
@@ -516,7 +535,10 @@ export function fitModel(model: ModelFile, hw: Hardware, profile: Profile = 'ful
   else if (model.sizeGb <= gpuBudget + ramBudget) fit = 'partial-offload';
   else fit = 'too-large';
 
-  const ngl = fit === 'full-gpu' || fit === 'unknown' ? 999 : 0;
+  // Never emit -ngl 999 for partial-offload — that would pretend the model
+  // fully fits GPU when it doesn't.  0 means "let llama.cpp decide" (via --fit)
+  // or "no GPU offload" for MoE.
+  const ngl = fit === 'full-gpu' ? 999 : 0;
 
   let ctxSize: number;
   if (profile === 'nano') {

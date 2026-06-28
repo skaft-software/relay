@@ -108,14 +108,22 @@ export function ensureOpenAIStreamDone(body: ReadableStream<Uint8Array>, include
   });
 }
 
-export async function* parseSSEStream(body: ReadableStream<Uint8Array>): AsyncGenerator<ParsedSSEFrame> {
+export async function* parseSSEStream(body: ReadableStream<Uint8Array>, chunkTimeoutMs?: number): AsyncGenerator<ParsedSSEFrame> {
   const decoder = new TextDecoder();
   const reader = body.getReader();
+  const readTimeout = chunkTimeoutMs ?? 300_000; // default 5 min per chunk
   let buffer = '';
   while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    const result = await Promise.race([
+      reader.read(),
+      new Promise<ReadableStreamReadResult<Uint8Array>>((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error('SSE stream chunk read timed out')), readTimeout);
+      }),
+    ]);
+    clearTimeout(timeoutId);
+    if (result.done) break;
+    buffer += decoder.decode(result.value, { stream: true });
     const frames = splitFrames(buffer);
     buffer = frames.remainder;
     for (const block of frames.complete) {

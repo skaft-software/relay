@@ -87,6 +87,10 @@ export interface SizedMode {
   cpuMoeLayers: number;
   allExpertsCpu: boolean;
   kvCacheQuant: 'q4_0' | 'q8_0';
+  /** -ngl layer count for dense models that fully fit GPU; undefined for
+   *  partial-offload / moe-cpu where a real gpuLayers cannot be computed
+   *  from sizing alone (the engine only budgets the non-expert portion). */
+  gpuLayers?: number;
   headroomPct: number;
   headroomGb: number;
   kvGb: number;
@@ -335,7 +339,7 @@ function sweepModes(
 function toMode(
   kvCacheQuant: 'q4_0' | 'q8_0',
   ctx: number, ncmoe: number, cpumoe: boolean, eg: number, ec: number,
-  budget: number, base: number, kvp: number, draft: number, nonexGb: number,
+  budget: number, base: number, kvp: number, draft: number, nonexGb: number, nl: number,
 ): SizedMode | null {
   if (ctx <= 4096) return null;
   let strategy: FitStrategy;
@@ -346,12 +350,20 @@ function toMode(
   const headroomGb = budget / GB - base / GB - eg / GB - draft / GB - (kvp * ctx) / GB;
   const headroomPct = budget > 0 ? (headroomGb / (budget / GB)) * 100 : 0;
 
+  // Dense full-gpu: every layer fits, so gpuLayers = nl.
+  // Hybrid or moe-cpu: we cannot compute a reliable layer count from sizing
+  // alone (the engine only knows nonex bytes, not per-layer weights), so omit
+  // gpuLayers to prevent false "partial offload" claims with -ngl 999.
+  const gpuLayers: number | undefined =
+    strategy === 'full-gpu' ? nl : undefined;
+
   return {
     strategy,
     ctx,
     cpuMoeLayers: cpumoe ? 0 : ncmoe,
     allExpertsCpu: cpumoe,
     kvCacheQuant,
+    gpuLayers,
     headroomPct,
     headroomGb,
     kvGb: (kvp * ctx) / GB,
@@ -396,20 +408,20 @@ export function compute(
 
   // ── Derive three modes ──
   // speed: Q8 full-GPU if it fits; else Q4 full-GPU.
-  let speedMode = toMode('q8_0', q8.speedCtx, 0, false, q8.speedEg, q8.speedEc, budget, base, kvpQ8, draft, nonexGb);
+  let speedMode = toMode('q8_0', q8.speedCtx, 0, false, q8.speedEg, q8.speedEc, budget, base, kvpQ8, draft, nonexGb, nl);
   if (!speedMode) {
-    speedMode = toMode('q4_0', q4.speedCtx, 0, false, q4.speedEg, q4.speedEc, budget, base, kvpQ4, draft, nonexGb);
+    speedMode = toMode('q4_0', q4.speedCtx, 0, false, q4.speedEg, q4.speedEc, budget, base, kvpQ4, draft, nonexGb, nl);
   }
 
   // balanced: default Q8_0 for better context accuracy. Fall back to Q4_0 if Q8_0 does not fit.
-  let balancedMode = toMode('q8_0', q8.bestCtx, q8.bestNcmoe, q8.bestCpumoe, q8.bestEg, q8.bestEc, budget, base, kvpQ8, draft, nonexGb);
+  let balancedMode = toMode('q8_0', q8.bestCtx, q8.bestNcmoe, q8.bestCpumoe, q8.bestEg, q8.bestEc, budget, base, kvpQ8, draft, nonexGb, nl);
   if (!balancedMode) {
-    const alt = toMode('q4_0', q4.bestCtx, q4.bestNcmoe, q4.bestCpumoe, q4.bestEg, q4.bestEc, budget, base, kvpQ4, draft, nonexGb);
+    const alt = toMode('q4_0', q4.bestCtx, q4.bestNcmoe, q4.bestCpumoe, q4.bestEg, q4.bestEc, budget, base, kvpQ4, draft, nonexGb, nl);
     if (alt) balancedMode = alt;
   }
 
   // capacity: best Q4 overall (forced Q4).
-  const capacityMode = toMode('q4_0', q4.maxCtx, q4.maxNcmoe, q4.maxCpumoe, q4.maxEg, q4.maxEc, budget, base, kvpQ4, draft, nonexGb);
+  const capacityMode = toMode('q4_0', q4.maxCtx, q4.maxNcmoe, q4.maxCpumoe, q4.maxEg, q4.maxEc, budget, base, kvpQ4, draft, nonexGb, nl);
 
   const modes: SizeResult['modes'] = { speed: speedMode, balanced: balancedMode, capacity: capacityMode };
 
@@ -441,20 +453,40 @@ export function sizeModel(path: string, vramBytes: number, dramBytes: number): {
   return { meta, analysis, result };
 }
 
-/** Build launch flags from a sized mode, mirroring size-model.py's output format.
-  * Returns flat [flag, value, flag, value, ...] for use by generateStartScript. */
+/** Build launch flags from a sized mode.
+ *
+ *  Source-of-truth invariant: the mode's kvCacheQuant is always used for
+ *  --cache-type-k/v — no external override is accepted.  Callers must not
+ *  pre-compute flags with a mismatched cache type.
+ *
+ *  Dense full-gpu modes carry a real gpuLayers (== nl) → emitted as -ngl.
+ *  Hybrid / moe-cpu modes have gpuLayers === undefined — we emit the mode's
+ *  ctx but never pretend at -ngl 999 for a model that doesn't fully fit GPU.
+ *
+ *  Returns flat [flag, value, flag, value, ...] for use by generateStartScript.
+ */
 export function buildLaunchFlags(
   mode: SizedMode,
-  opts?: { gpuLayers?: number; parallel?: number; flashAttn?: string; cacheType?: string },
+  opts?: { parallel?: number; flashAttn?: string; gpuLayers?: number },
 ): { launchFlags: string[]; expertFlag: string } {
-  const gpuLayers = opts?.gpuLayers ?? 999;
   const parallel = opts?.parallel ?? 1;
   const flashAttn = opts?.flashAttn ?? "on";
-  const cacheType = opts?.cacheType ?? mode.kvCacheQuant;
+
+  // Use the mode's own kvCacheQuant — never override from caller.
+  const cacheType = mode.kvCacheQuant;
+
+  // gpuLayers: prefer caller override (for backward compat with provision.ts
+  // which may have user-set gpuLayers), else the mode's own computed value,
+  // else 999 for full-gpu (all layers fit), else undefined for partial.
+  let ng = opts?.gpuLayers;
+  if (ng === undefined) ng = mode.gpuLayers;
+  if (ng === undefined && mode.strategy === 'full-gpu') ng = 999;
+  // For non-full-gpu modes with no gpuLayers, omit -ngl to avoid false claims.
+  // (The lifecycle / probe will handle partial offload at runtime.)
 
   const flags: string[] = [
     "--ctx-size", String(mode.ctx),
-    "-ngl", String(gpuLayers),
+    ...(ng !== undefined ? ["-ngl", String(ng)] : []),
     "--parallel", String(parallel),
     "--flash-attn", flashAttn,
     "--cache-type-k", cacheType,

@@ -582,10 +582,14 @@ export function estimateContextFromCatalog(
     }
 
     // Balanced: best of full-GPU (Q8 preferred) and cpu-moe (Q4)
+    // Balanced: best of full-GPU (Q8 preferred) and cpu-moe (Q4)
     const fgQ8 = tryMode(sizeGb, 'q8_0', 'full-gpu');
     const fgQ4 = tryMode(sizeGb, 'q4_0', 'full-gpu');
-    const moeQ8 = nonexGb <= usableVram && expertGb <= usableDram + usableVram ? tryMode(nonexGb, 'q8_0', 'moe-cpu') : null;
-    const moeQ4 = nonexGb <= usableVram && expertGb <= usableDram + usableVram ? tryMode(nonexGb, 'q4_0', 'moe-cpu') : null;
+    // Expert offload MUST fit in DRAM only (not DRAM+VRAM).  VRAM is the GPU
+    // budget for non-expert weights + KV + compute buffers — it is NOT a
+    // secondary RAM for CPU-resident experts.
+    const moeQ8 = nonexGb <= usableVram && expertGb <= usableDram ? tryMode(nonexGb, 'q8_0', 'moe-cpu') : null;
+    const moeQ4 = nonexGb <= usableVram && expertGb <= usableDram ? tryMode(nonexGb, 'q4_0', 'moe-cpu') : null;
 
     // Balanced: pick the config with the most context (minimizing offload tiebreaks on ctx).
     const balCands = [fgQ8, fgQ4, moeQ8, moeQ4].filter((c): c is ModeEstimate => c !== null);
@@ -949,17 +953,22 @@ export type SizeModelResult = {
   modes: SizeResult['modes'];
 };
 
-/** Call the TS sizing engine against a downloaded GGUF. Returns null on failure. */
+/** Call the TS sizing engine against a downloaded GGUF. Returns null on failure.
+ *
+ *  The kvCacheQuant param is only used as a fallback for backward-compat launch
+ *  flags returned in the SizeModelResult.  The modes themselves always carry
+ *  their own kvCacheQuant — callers MUST use the selected mode's kvCacheQuant
+ *  when generating final launch flags (configureQuickstart does this).
+ */
 export function sizeModelTS(ggufPath: string, vramGb: number, dramGb: number, kvCacheQuant: 'q4_0' | 'q8_0' = 'q4_0'): SizeModelResult | null {
   try {
     const { result } = sizeModel(ggufPath, Math.trunc(vramGb * GB), Math.trunc(dramGb * GB));
     if (!result.ok) return null;
-    const cacheType = kvCacheQuant;
-    // Build launch flags from balanced mode (the backward-compat default).
-    // configureQuickstart overrides these per-selected mode later.
+    // Build backward-compat launch flags from balanced mode using the caller's
+    // requested cacheType (used only by legacy callers that pre-choose a quant).
     const balMode = result.modes.balanced;
     const { launchFlags, expertFlag } = balMode
-      ? buildLaunchFlags(balMode, { cacheType })
+      ? buildLaunchFlags(balMode, { gpuLayers: balMode.gpuLayers })
       : { launchFlags: [] as string[], expertFlag: '' };
     return {
       maxCtx: result.bestCtx,
@@ -968,7 +977,7 @@ export function sizeModelTS(ggufPath: string, vramGb: number, dramGb: number, kv
       cpuMoeLayers: result.cpuMoeLayers,
       headroomPct: Math.round(result.headroomPct * 100) / 100,
       kvGb: Math.round(result.kvGb * 10000) / 10000,
-      cacheType,
+      cacheType: balMode?.kvCacheQuant ?? kvCacheQuant,
       modes: result.modes,
     };
   } catch {
@@ -987,33 +996,39 @@ export function configureQuickstart(
   gpu?: GpuProbe,
 ): void {
   const sizingMode = ((env.get('RELAY_SIZING_MODE') ?? 'balanced') === 'capacity' ? 'capacity' : (env.get('RELAY_SIZING_MODE') ?? 'balanced') === 'speed' ? 'speed' : 'balanced') as 'speed' | 'balanced' | 'capacity';
-  // Default to q8_0 for better context accuracy and reduced hallucination; use q4_0 only if explicitly requested.
-  const kvCacheType = (env.get('RELAY_KV_CACHE_TYPE') ?? 'q8_0') === 'q4_0' ? 'q4_0' as const : 'q8_0' as const;
   const modelEntries: Record<string, { cmd: string; ctx_size: number; multimodal: boolean; thinking_levels?: string[]; expert_flag?: string; kv_cache_type?: string; sizing_mode?: string; provenance?: string; strategy?: string }> = {};
   const defaultModel = selections[0]!;
+
+  // Track the default model's configured ctx so UPSTREAM_CTX_SIZE matches.
+  let defaultCtxSize: number | undefined;
+
   for (const model of selections) {
     const modelPath = modelPaths.get(model.id)!;
     let ctxSize = recommendedContext(model, gpu);
     let launchFlags: string[] | undefined;
     let expertFlag: string | undefined;
+    // The actual kvCacheQuant from the selected sizing mode (not the env default).
+    let modeCacheType: string | undefined;
 
     // If the GGUF is on disk, use the real TS sizing engine for optimal flags
     let tuned: SizeModelResult | null = null;
     if (existsSync(modelPath)) {
       const vramGb = gpu?.vram_total_gb ?? 0;
       const dramGb = Math.max(0, detectAvailableRamGb() - reservesFor(detectHostProfile()).ramReserveGb);
-      tuned = sizeModelTS(modelPath, vramGb, dramGb, kvCacheType);
+      tuned = sizeModelTS(modelPath, vramGb, dramGb);
       if (tuned) {
-        // Use selected mode's ctx, falling back to balanced
+        // Use selected mode's ctx, falling back to balanced.
         const selMode = tuned.modes[sizingMode] ?? tuned.modes.balanced;
         ctxSize = selMode?.ctx ?? tuned.maxCtx;
-        // Build launch flags from the selected mode so --ctx-size and --n-cpu-moe
-        // match the chosen strategy (speed → full-GPU, capacity → --cpu-moe).
+        modeCacheType = selMode?.kvCacheQuant;
+
+        // Build launch flags ONCE from the selected mode — using its OWN
+        // kvCacheQuant.  No env-default override is passed.
         launchFlags = selMode
-          ? buildLaunchFlags(selMode, { cacheType: kvCacheType }).launchFlags
+          ? buildLaunchFlags(selMode, { gpuLayers: selMode.gpuLayers }).launchFlags
           : tuned.launchFlags;
         expertFlag = selMode
-          ? buildLaunchFlags(selMode, { cacheType: kvCacheType }).expertFlag
+          ? buildLaunchFlags(selMode, { gpuLayers: selMode.gpuLayers }).expertFlag
           : tuned.expertFlag;
       }
     }
@@ -1029,6 +1044,10 @@ export function configureQuickstart(
       launchFlags,
       expertFlag,
     });
+
+    // Track the default model's final ctx for UPSTREAM_CTX_SIZE.
+    if (model.id === defaultModel.id) defaultCtxSize = ctxSize;
+
     const entry: Record<string, unknown> = {
       cmd: scriptPath,
       ctx_size: ctxSize,
@@ -1037,7 +1056,8 @@ export function configureQuickstart(
       ...(model.thinking === 'toggle' ? { thinking_levels: ['on', 'off'] } : {}),
     };
     if (expertFlag) entry.expert_flag = expertFlag;
-    entry.kv_cache_type = kvCacheType;
+    // Use the actual launched mode's kvCacheQuant, not the env default.
+    entry.kv_cache_type = modeCacheType ?? tuned?.cacheType;
     entry.sizing_mode = sizingMode;
     entry.provenance = 'estimated';
     if (tuned) {
@@ -1051,7 +1071,9 @@ export function configureQuickstart(
   env.set('RELAY_MODEL_LIFECYCLE_ENABLED', 'true');
   env.set('RELAY_SWITCH_POLICY', 'eager');
   env.set('DEFAULT_MODEL', defaultModel.id);
-  env.set('UPSTREAM_CTX_SIZE', String(recommendedContext(defaultModel, gpu)));
+  // UPSTREAM_CTX_SIZE should match the configured default model's actual ctx,
+  // not a generic recommendedContext that ignores sizing mode.
+  env.set('UPSTREAM_CTX_SIZE', String(defaultCtxSize ?? recommendedContext(defaultModel, gpu)));
   env.set('RELAY_REPO_DIR', PKG);
   env.set('RELAY_MODEL_DIR', modelDir);
   env.set('RELAY_LLAMA_SERVER_PATH', llamaServerPath);
