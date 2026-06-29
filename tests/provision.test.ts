@@ -25,6 +25,8 @@ import {
   gpuVendor,
   gpuLaunchFlags,
   formatHardware,
+  planGpuPlacement,
+  effectiveSizingVramGb,
   type Hardware,
   type ModelFile,
 } from '../src/provision.ts';
@@ -160,6 +162,21 @@ test('fitModel: MoE too-large offloads all experts to CPU', () => {
   assert.equal(f.cpuMoe, '--cpu-moe');
 });
 
+test('fitModel: multi-GPU budget can make a model a full GPU fit', () => {
+  const multi = hw({
+    vramGb: 24,
+    maxGpuVramGb: 24,
+    totalGpuVramGb: 48,
+    gpuCount: 2,
+    gpus: [
+      { index: 0, device: 'CUDA0', name: 'RTX 3090', vramGb: 24 },
+      { index: 1, device: 'CUDA1', name: 'RTX 3090', vramGb: 24 },
+    ],
+  });
+  const f = fitModel(model({ sizeGb: 40 }), multi);
+  assert.equal(f.fit, 'full-gpu');
+});
+
 // ── Layout resolution ───────────────────────────────────────────────────────
 
 test('resolveLayout: explicit models dir wins; scripts/logs live under ~/.relay', () => {
@@ -260,6 +277,36 @@ test('gpuLaunchFlags: exact gpuLayers number, fit off, and no duplicates of pres
 
 test('gpuLaunchFlags: empty config emits nothing', () => {
   assert.deepEqual(gpuLaunchFlags({}), []);
+});
+
+test('planGpuPlacement: multi-GPU uses llama.cpp device handles with layer split', () => {
+  const multi = hw({
+    vendor: 'nvidia', vramGb: 24, maxGpuVramGb: 24, totalGpuVramGb: 48, gpuCount: 2,
+    gpus: [
+      { index: 0, device: 'CUDA0', name: 'RTX 3090', vramGb: 24 },
+      { index: 1, device: 'CUDA1', name: 'RTX 3090', vramGb: 24 },
+    ],
+  });
+  const placement = planGpuPlacement(multi);
+  assert.deepEqual(placement?.config, {
+    device: 'CUDA0,CUDA1',
+    splitMode: 'layer',
+    tensorSplit: [24, 24],
+  });
+  assert.equal(placement?.effectiveVramGb, 46);
+  assert.equal(effectiveSizingVramGb(multi), 46);
+});
+
+test('planGpuPlacement: excludes tiny integrated GPUs from split plans', () => {
+  const mixed = hw({
+    vendor: 'amd', vramGb: 16, maxGpuVramGb: 16, totalGpuVramGb: 18, gpuCount: 2,
+    gpus: [
+      { index: 0, device: 'Vulkan0', name: 'AMD Radeon RX 7900', vramGb: 16 },
+      { index: 1, device: 'Vulkan1', name: 'AMD integrated graphics', vramGb: 2 },
+    ],
+  });
+  assert.deepEqual(planGpuPlacement(mixed)?.config, { device: 'Vulkan0' });
+  assert.equal(effectiveSizingVramGb(mixed), 16);
 });
 
 // ── Honest hardware reporting ────────────────────────────────────────────────

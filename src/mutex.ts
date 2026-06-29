@@ -13,6 +13,7 @@ export class RequestMutex {
   private waiters: Array<{
     resolve: () => void;
     reject: (err: Error) => void;
+    cleanup?: () => void;
   }> = [];
 
   /**
@@ -40,7 +41,7 @@ export class RequestMutex {
         reject(new Error('aborted'));
       };
 
-      const entry = { resolve, reject };
+      const entry = { resolve, reject, cleanup: () => { signal?.removeEventListener('abort', onAbort); } };
       signal?.addEventListener('abort', onAbort, { once: true });
 
       this.waiters.push(entry);
@@ -55,6 +56,8 @@ export class RequestMutex {
     // Drain until we find a waiter that hasn't been removed via abort.
     while (this.waiters.length > 0) {
       const next = this.waiters.shift()!;
+      // Clean up the abort listener to prevent memory leaks.
+      if (next.cleanup) next.cleanup();
       next.resolve();
       return;
     }

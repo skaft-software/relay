@@ -285,10 +285,10 @@ export class ModelLifecycle {
           ctx_size: cat.ctx,
           multimodal: cat.vision,
           thinking_levels: cat.thinking === 'on' ? ['on'] : cat.thinking === 'toggle' ? ['on', 'off'] : undefined,
-        } as ModelEntry;
-        // Stash the GGUF path so startModelProcess can pass it as MODEL_PATH env var
-        // (only needed for the generic wrapper; existing scripts hardcode the path).
-        (entry as any).__ggufPath = found.ggufPath;
+          // Store the GGUF path for the generic wrapper script.
+          // This is a runtime-only field, not part of the user's config.
+          __ggufPath: found.ggufPath,
+        } as ModelEntry & { __ggufPath: string };
         // Register so future requests find it directly.
         entries[found.id] = entry;
         modelName = found.id;
@@ -470,8 +470,11 @@ export class ModelLifecycle {
       // Collision — the remembered port was taken. Fall through to fresh allocation.
     }
 
-    // Allocate next available port
+    // Allocate next available port. Guard against port exhaustion.
     const port = this.nextPort++;
+    if (port > 65530) {
+      throw new Error(`Port allocation exhausted (nextPort=${port}). Too many models or port base too high.`);
+    }
     // Ensure we don't collide with existing processes
     for (const proc of this.activeProcesses.values()) {
       if (proc.port === port) return this.allocatePort(modelName);
@@ -505,8 +508,12 @@ export class ModelLifecycle {
     const resolvedCmd = startCmd
       ? startCmd.replace(/\$\{PORT\}/g, safePort).replace(/\$\{MODEL\}/g, safeModel)
       : '';
+    // For argv mode, strip shell metacharacters from model name substitution
+    // to prevent injection via shell=true spawn. Shell quoting is unreliable in
+    // argv arrays — defense-in-depth by rejecting dangerous chars.
+    const safeModelArgv = modelName.replace(/[;&|`$(){}!\n\r]/g, '_');
     const resolvedArgv = argv
-      ? argv.map((a) => a.replace(/\$\{PORT\}/g, safePort).replace(/\$\{MODEL\}/g, safeModel))
+      ? argv.map((a) => a.replace(/\$\{PORT\}/g, safePort).replace(/\$\{MODEL\}/g, safeModelArgv))
       : undefined;
 
     this.log('info', 'starting model process', {
@@ -521,7 +528,7 @@ export class ModelLifecycle {
         MODEL: modelName,
       };
       // Pass the GGUF file path for auto-discovered models using the generic wrapper.
-      const ggufPath = (entry as any).__ggufPath as string | undefined;
+      const ggufPath = (entry as ModelEntry & { __ggufPath?: string }).__ggufPath;
       if (ggufPath) {
         extraEnv.MODEL_PATH = ggufPath;
         extraEnv.CTX_SIZE = String(entry.ctx_size ?? 32768);

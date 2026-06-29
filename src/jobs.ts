@@ -109,6 +109,13 @@ export class LlmJobQueue {
     for (const [key, entry] of this.idempotencyKeys) {
       if (now - entry.createdAt > this.idempotencyTtlMs) this.idempotencyKeys.delete(key);
     }
+    // Hard cap to prevent unbounded memory growth from idempotency key churn.
+    if (this.idempotencyKeys.size > 10_000) {
+      const entries = [...this.idempotencyKeys.entries()].sort((a, b) => a[1].createdAt - b[1].createdAt);
+      for (const [key] of entries.slice(0, entries.length - 5000)) {
+        this.idempotencyKeys.delete(key);
+      }
+    }
   }
 
   submit(input: LlmJobRequest): LlmJobSnapshot {

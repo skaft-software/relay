@@ -121,6 +121,33 @@ test('buildFitLabel provenance mapping', () => {
   assert.match(buildFitLabel(mkEst({ fit: 'too-large', maxCtx: 0 })), /✗ no/);
 });
 
+test('custom catalog includes every Ornith 35B quantized GGUF', async () => {
+  const { readCatalog } = await import('../src/setup-logic.ts');
+  const byId = new Map(readCatalog().map((m) => [m.id, m]));
+  const expectedQuants = [
+    'iq2_m', 'iq2_s', 'iq2_xs', 'iq2_xxs',
+    'iq3_m', 'iq3_xs', 'iq3_xxs',
+    'iq4_nl', 'iq4_xs',
+    'q2_k', 'q2_k_l',
+    'q3_k_l', 'q3_k_m', 'q3_k_s', 'q3_k_xl',
+    'q4_0', 'q4_1', 'q4_k_l', 'q4_k_m', 'q4_k_s',
+    'q5_k_l', 'q5_k_m', 'q5_k_s',
+    'q6_k', 'q6_k_l',
+    'q8_0',
+  ];
+  for (const quant of expectedQuants) {
+    const entry = byId.get(`ornith-1.0-35b-${quant}`);
+    assert.ok(entry, `Ornith ${quant} entry missing`);
+    assert.equal(entry.hf_repo, 'bartowski/deepreinforce-ai_Ornith-1.0-35B-GGUF');
+    assert.equal(entry.moe, true);
+    assert.equal(entry.vision, true);
+    assert.equal(entry.thinking, 'on');
+    assert.equal(entry.ctx, 262144);
+    assert.equal(entry.expert_count, 256);
+    assert.equal(entry.active_experts, 8);
+  }
+});
+
 test('every catalog entry yields a non-empty, honest label', async () => {
   const { readCatalog } = await import('../src/setup-logic.ts');
   for (const m of readCatalog()) {

@@ -248,12 +248,12 @@ class RelayTUI {
     this.terminal = new ProcessTerminal();
     this.tui = new TUI(this.terminal);
     this.env = L.seedEnv();
-    this.gpu = L.probeGpu();
+    this.modelDir = this.env.get('RELAY_MODEL_DIR') ?? L.resolveHome('~/models');
+    this.llamaServerPath = this.env.get('RELAY_LLAMA_SERVER_PATH') ?? L.detectLlamaServerPath();
+    this.gpu = L.probeGpu(this.llamaServerPath);
     this.backend = this.gpu ? L.backendForGpu(this.gpu) : 'cpu';
     this.dramGb = L.detectAvailableRamGb();
     this.hwLabel = this.detectHwLabel();
-    this.modelDir = this.env.get('RELAY_MODEL_DIR') ?? L.resolveHome('~/models');
-    this.llamaServerPath = this.env.get('RELAY_LLAMA_SERVER_PATH') ?? L.detectLlamaServerPath();
 
     // Ctrl+C exits from anywhere
     this.tui.addInputListener((data) => {
@@ -612,7 +612,7 @@ class RelayTUI {
     comps.push(new HRule());
     comps.push(new Spacer(1));
     comps.push(new Block([`  ${a(b('Choose a model'))}  ${d(`(${models.length} models — pick one, then its quant)`)}`]));
-    if (this.gpu) comps.push(new Block([`  ${d(`VRAM: ${this.gpu.vram_total_gb}GB (${(this.gpu.vram_total_gb - 2).toFixed(1)}GB usable) · DRAM offload: ${this.dramGb}GB`)}`]));
+    if (this.gpu) comps.push(new Block([`  ${d(`${L.formatGpuProbe(this.gpu)} · DRAM offload: ${this.dramGb}GB`)}`]));
     comps.push(new Spacer(1));
     comps.push(new Block([fitLegendLine()]));
     comps.push(new Spacer(1));

@@ -1,5 +1,5 @@
 /**
- * Model sizing — a faithful TypeScript port of scripts/size-model.py.
+ * Model sizing — TypeScript sizing engine, evolved from scripts/size-model.py.
  *
  * Given a GGUF and a hardware budget (VRAM + spare DRAM), it works out the best
  * expert-offload configuration and the maximum context that fits with a safety
@@ -7,14 +7,14 @@
  * models keep only attention + active params on the GPU and stream experts from
  * RAM (`--n-cpu-moe N` / `--cpu-moe`), so a 14 GB model can run on an 8 GB card.
  *
- * Three-mode sizing: compute() now returns speed / balanced / capacity strategies
- * from a single sweep. The caller picks the winner per objective:
- *   speed    → max ctx with zero offload, Q8 KV preferred
- *   balanced → max ctx minimizing offload (backward-compat default)
- *   capacity → absolute max ctx, Q4 KV forced
+ * Three-mode sizing: compute() returns speed / balanced / capacity strategies.
+ * The caller picks the winner per objective:
+ *   speed    → fastest full-GPU config that still leaves headroom
+ *   balanced → long context with double-digit headroom and a performance floor
+ *   capacity → longest stable context, Q4 KV forced, more CPU offload allowed
  *
- * The Python script in scripts/ is retained as the differential-test oracle:
- * tests/sizing.test.ts asserts this port reproduces its numbers on real GGUFs.
+ * The Python script in scripts/ is retained as a standalone diagnostic, but
+ * Relay setup/provision use this TS engine as the source of truth.
  */
 import { readGguf, type GgufModel, type MetaValue, type TensorInfo } from './gguf.ts';
 
@@ -23,7 +23,12 @@ const MB = 1048576;
 const SAFETY_MARGIN_MB = 256;
 const COMPUTE_BUFS_MB = 1024;
 const EMPIRICAL_OVERHEAD_PCT = 5;
-export const DEFAULT_HEADROOM_PCT = 5;
+const CPU_OFFLOAD_DRAM_RESERVE_BYTES = 2 * GB;
+const MOE_PROMPT_BATCH_EXTRA_BYTES = 512 * MB;
+const MIN_USEFUL_CTX = 4096;
+const BALANCED_MOE_MIN_EXPERT_GPU_FRAC = 0.30;
+const BALANCED_DENSE_MIN_GPU_LAYER_FRAC = 0.55;
+export const DEFAULT_HEADROOM_PCT = 12;
 
 /** KV quant byte ratio (fraction of F32 element size). */
 export const KV_QUANT_RATIO: Record<string, number> = {
@@ -72,13 +77,21 @@ export interface Meta {
 }
 
 export interface Analysis {
+  /** GPU-resident non-expert/static bytes for MoE; total bytes for dense. */
   nonex: number;
+  /** Offloadable expert bytes for MoE models. Zero for dense models. */
   exp: number;
   /** F32 architecture-dimension bytes-per-token (before quantization). */
   kvPtok: number;
   nKv: number;
   nCache: number;
   fsize: number;
+  /** Per-transformer-block bytes from GGUF tensor payloads (weights only). */
+  layerBytes?: number[];
+  /** Per-block expert bytes (MoE only). */
+  expertLayerBytes?: number[];
+  /** Bytes outside transformer blocks, plus fixed SWA KV, that cannot be moved by -ngl. */
+  nonLayerBytes?: number;
 }
 
 export interface SizedMode {
@@ -87,9 +100,9 @@ export interface SizedMode {
   cpuMoeLayers: number;
   allExpertsCpu: boolean;
   kvCacheQuant: 'q4_0' | 'q8_0';
-  /** -ngl layer count for dense models that fully fit GPU; undefined for
-   *  partial-offload / moe-cpu where a real gpuLayers cannot be computed
-   *  from sizing alone (the engine only budgets the non-expert portion). */
+  /** -ngl layer count. Dense hybrid modes carry a real partial layer count;
+   *  MoE expert-offload modes use 999 so non-expert layers stay on GPU while
+   *  --n-cpu-moe/--cpu-moe moves only experts. */
   gpuLayers?: number;
   headroomPct: number;
   headroomGb: number;
@@ -152,19 +165,26 @@ export function analyze(meta: Meta): Analysis {
   const { arch, nl, nkv, kl, fsize } = meta;
   const moe = meta.nexp > 0;
   const kvPerLayer = new Array<number>(nl).fill(0);
-  let expEls = 0;
-  let nonexEls = 0;
+  const layerVals = new Array<number>(nl).fill(0);
+  const expertLayerVals = new Array<number>(nl).fill(0);
+  let expVal = 0;
+  let nonexVal = 0;
+  let totalVal = 0;
+  const hasTensorBytes = meta.tensors.length > 0 && meta.tensors.every((t) => typeof t.bytes === 'number');
 
   for (const t of meta.tensors) {
     const tn = t.name;
     let els = 1;
     for (const dim of t.dims) els *= dim;
+    const val = hasTensorBytes ? (t.bytes ?? 0) : els;
+    totalVal += val;
     const sd = t.dims;
     const last = sd[sd.length - 1] ?? 0;
+    const blkMatch = /^blk\.(\d+)\./.exec(tn);
+    const ln = blkMatch ? Number(blkMatch[1]) : -1;
 
     // ── KV per layer (F32 architecture-dimension bytes, no quantization) ──
     if (tn.startsWith('blk.') && tn.endsWith('.weight')) {
-      const ln = parseInt(tn.split('.')[1] ?? '', 10);
       if (Number.isInteger(ln) && ln >= 0 && ln < nl) {
         if (arch === 'deepseek2') {
           if (tn.includes('attn_kv_a_mqa')) kvPerLayer[ln]! += last;
@@ -182,34 +202,49 @@ export function analyze(meta: Meta): Analysis {
     }
 
     // ── Expert vs non-expert (shared expert stays GPU for DeepSeek) ──
-    if (SHARED_EXPERT_ARCHS.has(arch) && SHARED_EXPERT_PATTERNS.some((p) => tn.includes(p))) {
-      // DeepSeek shared expert: per-token dense, must stay on GPU → nonexEls
-      nonexEls += els;
-    } else if (EXPERT_PATTERNS.some((p) => tn.includes(p))) {
-      expEls += els;
+    const isSharedExpert = SHARED_EXPERT_ARCHS.has(arch) && SHARED_EXPERT_PATTERNS.some((p) => tn.includes(p));
+    const isExpert = !isSharedExpert && EXPERT_PATTERNS.some((p) => tn.includes(p));
+    if (isExpert) {
+      expVal += val;
+      if (ln >= 0 && ln < nl) expertLayerVals[ln]! += val;
     } else {
-      nonexEls += els;
+      nonexVal += val;
     }
+    if (ln >= 0 && ln < nl) layerVals[ln]! += val;
   }
 
-  const total = expEls + nonexEls;
   let nonexBytes: number;
   let expBytes: number;
-  if (moe && expEls === 0) {
-    const frac = EXPERT_FRACS[arch] ?? 0.9;
-    expBytes = Math.trunc(fsize * frac);
-    nonexBytes = fsize - expBytes;
-  } else if (total > 0) {
-    nonexBytes = Math.trunc(fsize * (nonexEls / total));
-    expBytes = fsize - nonexBytes;
+  let layerBytes: number[];
+  let expertLayerBytes: number[];
+  if (hasTensorBytes) {
+    nonexBytes = Math.trunc(nonexVal);
+    expBytes = Math.trunc(expVal);
+    layerBytes = layerVals.map((v) => Math.trunc(v));
+    expertLayerBytes = expertLayerVals.map((v) => Math.trunc(v));
   } else {
-    nonexBytes = fsize;
-    expBytes = 0;
+    const total = expVal + nonexVal;
+    if (moe && expVal === 0) {
+      const frac = EXPERT_FRACS[arch] ?? 0.9;
+      expBytes = Math.trunc(fsize * frac);
+      nonexBytes = fsize - expBytes;
+    } else if (total > 0) {
+      nonexBytes = Math.trunc(fsize * (nonexVal / total));
+      expBytes = fsize - nonexBytes;
+    } else {
+      nonexBytes = fsize;
+      expBytes = 0;
+    }
+    const layerTotal = layerVals.reduce((a, b) => a + b, 0);
+    layerBytes = layerVals.map((v) => layerTotal > 0 ? Math.trunc((nonexBytes + expBytes) * (v / layerTotal)) : 0);
+    const expertTotal = expertLayerVals.reduce((a, b) => a + b, 0);
+    expertLayerBytes = expertLayerVals.map((v) => expertTotal > 0 ? Math.trunc(expBytes * (v / expertTotal)) : 0);
   }
 
   let kvPtok = kvPerLayer.reduce((a, b) => a + b, 0);
   const nKv = kvPerLayer.filter((v) => v > 0).length;
   let nCache = nKv;
+  let fixedSwaBytes = 0;
 
   // SWA split (Gemma4): sliding layers are fixed-cost; global layers grow with context.
   if (arch === 'gemma4' && Array.isArray(nkv)) {
@@ -224,12 +259,14 @@ export function analyze(meta: Meta): Analysis {
       if (isSwa) sFixed += kvPerLayer[i]!;
       else gPtok += kvPerLayer[i]!;
     }
-    nonexBytes += Math.trunc(sFixed * win);
+    fixedSwaBytes = Math.trunc(sFixed * win);
+    nonexBytes += fixedSwaBytes;
     kvPtok = gPtok;
     nCache = nkv.filter((v) => v <= 2).length;
   }
 
-  return { nonex: nonexBytes, exp: expBytes, kvPtok, nKv, nCache, fsize };
+  const nonLayerBytes = Math.max(0, nonexBytes + expBytes - layerBytes.reduce((a, b) => a + b, 0));
+  return { nonex: nonexBytes, exp: expBytes, kvPtok, nKv, nCache, fsize, layerBytes, expertLayerBytes, nonLayerBytes };
 }
 
 function fail(error: string): SizeResult {
@@ -336,41 +373,239 @@ function sweepModes(
   };
 }
 
-function toMode(
-  kvCacheQuant: 'q4_0' | 'q8_0',
-  ctx: number, ncmoe: number, cpumoe: boolean, eg: number, ec: number,
-  budget: number, base: number, kvp: number, draft: number, nonexGb: number, nl: number,
-): SizedMode | null {
-  if (ctx <= 4096) return null;
-  let strategy: FitStrategy;
-  if (cpumoe) strategy = 'moe-cpu';
-  else if (ncmoe > 0) strategy = 'hybrid';
-  else strategy = 'full-gpu';
+type SizingCandidate = {
+  kvCacheQuant: 'q4_0' | 'q8_0';
+  kvp: number;
+  ctxMax: number;
+  strategy: FitStrategy;
+  cpuMoeLayers: number;
+  allExpertsCpu: boolean;
+  gpuLayers?: number;
+  staticGpuBytes: number;
+  nonexGpuBytes: number;
+  expGpuBytes: number;
+  expCpuBytes: number;
+  denseCpuBytes: number;
+};
 
-  const headroomGb = budget / GB - base / GB - eg / GB - draft / GB - (kvp * ctx) / GB;
+function kvBytesPerToken(ta: Analysis, kvCacheQuant: 'q4_0' | 'q8_0'): number {
+  const kvp = ta.kvPtok * KV_QUANT_RATIO[kvCacheQuant]!;
+  return kvp <= 0 && ta.nKv > 0 ? 0.001 : kvp;
+}
+
+function stableCtx(
+  budget: number,
+  staticGpuBytes: number,
+  kvp: number,
+  trainCtx: number,
+  minHeadroomPct: number,
+): number {
+  if (kvp <= 0) return trainCtx;
+  const minHeadroomBytes = Math.trunc((budget * minHeadroomPct) / 100);
+  const kvAvail = budget - staticGpuBytes - minHeadroomBytes;
+  if (kvAvail <= 0) return 0;
+  return Math.min(Math.trunc(kvAvail / kvp), trainCtx);
+}
+
+function candidateToMode(c: SizingCandidate, budget: number, ctx?: number): SizedMode | null {
+  const useCtx = Math.min(ctx ?? c.ctxMax, c.ctxMax);
+  if (useCtx <= MIN_USEFUL_CTX) return null;
+  const headroomGb = (budget - c.staticGpuBytes - c.kvp * useCtx) / GB;
   const headroomPct = budget > 0 ? (headroomGb / (budget / GB)) * 100 : 0;
-
-  // Dense full-gpu: every layer fits, so gpuLayers = nl.
-  // Hybrid or moe-cpu: we cannot compute a reliable layer count from sizing
-  // alone (the engine only knows nonex bytes, not per-layer weights), so omit
-  // gpuLayers to prevent false "partial offload" claims with -ngl 999.
-  const gpuLayers: number | undefined =
-    strategy === 'full-gpu' ? nl : undefined;
-
   return {
-    strategy,
-    ctx,
-    cpuMoeLayers: cpumoe ? 0 : ncmoe,
-    allExpertsCpu: cpumoe,
-    kvCacheQuant,
-    gpuLayers,
+    strategy: c.strategy,
+    ctx: useCtx,
+    cpuMoeLayers: c.allExpertsCpu ? 0 : c.cpuMoeLayers,
+    allExpertsCpu: c.allExpertsCpu,
+    kvCacheQuant: c.kvCacheQuant,
+    gpuLayers: c.gpuLayers,
     headroomPct,
     headroomGb,
-    kvGb: (kvp * ctx) / GB,
-    expGpuGb: eg / GB,
-    expCpuGb: ec / GB,
-    nonexGb,
+    kvGb: (c.kvp * useCtx) / GB,
+    expGpuGb: c.expGpuBytes / GB,
+    expCpuGb: c.expCpuBytes / GB,
+    nonexGb: c.nonexGpuBytes / GB,
   };
+}
+
+function modeTargets(trainCtx: number, moe: boolean): number[] {
+  const tiers = moe
+    ? [524288, 393216, 262144, 196608, 131072, 98304, 65536, 49152, 32768, 16384, 8192]
+    : [131072, 98304, 65536, 49152, 32768, 16384, 8192];
+  const cap = trainCtx > 0 ? trainCtx : 32768;
+  return tiers.filter((t) => t <= cap);
+}
+
+function pickHighestCtx(cands: SizingCandidate[], budget: number, quant?: 'q4_0' | 'q8_0'): SizedMode | null {
+  const filtered = quant ? cands.filter((c) => c.kvCacheQuant === quant) : cands;
+  const best = filtered
+    .filter((c) => c.ctxMax > MIN_USEFUL_CTX)
+    .sort((a, b) => b.ctxMax - a.ctxMax || (b.gpuLayers ?? 0) - (a.gpuLayers ?? 0) || b.expGpuBytes - a.expGpuBytes)[0];
+  return best ? candidateToMode(best, budget) : null;
+}
+
+function finalizeModes(modes: SizeResult['modes']): SizeResult {
+  const balancedMode = modes.balanced;
+  if (!balancedMode || balancedMode.ctx <= MIN_USEFUL_CTX) {
+    return fail('Cannot fit model — no room for KV cache');
+  }
+  return {
+    ok: true,
+    bestCtx: balancedMode.ctx,
+    cpuMoeLayers: balancedMode.cpuMoeLayers,
+    allExpertsCpu: balancedMode.allExpertsCpu,
+    headroomPct: balancedMode.headroomPct,
+    headroomGb: balancedMode.headroomGb,
+    kvGb: balancedMode.kvGb,
+    expGpuGb: balancedMode.expGpuGb,
+    expCpuGb: balancedMode.expCpuGb,
+    nonexGb: balancedMode.nonexGb,
+    modes,
+  };
+}
+
+function layerPrefixBytes(layerBytes: number[], nl: number): number[] {
+  const out = new Array<number>(nl + 1).fill(0);
+  for (let i = 0; i < nl; i++) out[i + 1] = out[i]! + (layerBytes[i] ?? 0);
+  return out;
+}
+
+function denseLayerPlan(ta: Analysis, nl: number): { fixedBytes: number; layerBytes: number[] } {
+  const layerBytes = (ta.layerBytes && ta.layerBytes.length >= nl && ta.layerBytes.some((v) => v > 0))
+    ? ta.layerBytes.slice(0, nl)
+    : new Array<number>(nl).fill((ta.nonex * 0.85) / Math.max(1, nl));
+  const layerTotal = layerBytes.reduce((a, b) => a + b, 0);
+  const fixedBytes = Math.max(0, ta.nonLayerBytes ?? (ta.nonex - layerTotal));
+  return { fixedBytes, layerBytes };
+}
+
+function computeDense(
+  budget: number,
+  dramFree: number,
+  meta: Meta,
+  ta: Analysis,
+  draft: number,
+  overheadFactor: number,
+  minHeadroomPct: number,
+): SizeResult {
+  const nl = Math.max(1, meta.nl);
+  const { fixedBytes, layerBytes } = denseLayerPlan(ta, nl);
+  const prefix = layerPrefixBytes(layerBytes, nl);
+  const layerTotal = prefix[nl]!;
+  const cands: SizingCandidate[] = [];
+
+  for (const kvCacheQuant of ['q8_0', 'q4_0'] as const) {
+    const kvp = kvBytesPerToken(ta, kvCacheQuant);
+    for (let gpuLayers = 0; gpuLayers <= nl; gpuLayers++) {
+      const gpuLayerBytes = prefix[gpuLayers]!;
+      const denseCpuBytes = Math.max(0, layerTotal - gpuLayerBytes);
+      if (denseCpuBytes + draft + CPU_OFFLOAD_DRAM_RESERVE_BYTES > dramFree) continue;
+      const rawGpuBytes = fixedBytes + gpuLayerBytes;
+      const staticGpuBytes = Math.trunc((rawGpuBytes + draft) * overheadFactor);
+      const ctxMax = stableCtx(budget, staticGpuBytes, kvp, meta.trainCtx, minHeadroomPct);
+      if (ctxMax <= MIN_USEFUL_CTX) continue;
+      cands.push({
+        kvCacheQuant,
+        kvp,
+        ctxMax,
+        strategy: gpuLayers >= nl ? 'full-gpu' : 'hybrid',
+        cpuMoeLayers: 0,
+        allExpertsCpu: false,
+        gpuLayers,
+        staticGpuBytes,
+        nonexGpuBytes: rawGpuBytes,
+        expGpuBytes: 0,
+        expCpuBytes: 0,
+        denseCpuBytes,
+      });
+    }
+  }
+
+  const speed = cands.find((c) => c.kvCacheQuant === 'q8_0' && c.gpuLayers === nl)
+    ?? cands.find((c) => c.kvCacheQuant === 'q4_0' && c.gpuLayers === nl);
+  const speedMode = speed ? candidateToMode(speed, budget) : null;
+
+  let balancedMode: SizedMode | null = null;
+  for (const target of modeTargets(meta.trainCtx, false)) {
+    const eligible = cands
+      .filter((c) => c.ctxMax >= target && ((c.gpuLayers ?? 0) / nl) >= BALANCED_DENSE_MIN_GPU_LAYER_FRAC)
+      .sort((a, b) => (b.gpuLayers ?? 0) - (a.gpuLayers ?? 0) || (a.kvCacheQuant === 'q8_0' ? -1 : 1));
+    const best = eligible[0];
+    if (best) {
+      balancedMode = candidateToMode(best, budget, best.strategy === 'full-gpu' ? best.ctxMax : target);
+      break;
+    }
+  }
+  balancedMode ??= pickHighestCtx(cands, budget, 'q4_0') ?? pickHighestCtx(cands, budget);
+
+  const capacityMode = pickHighestCtx(cands, budget, 'q4_0') ?? pickHighestCtx(cands, budget);
+  return finalizeModes({ speed: speedMode, balanced: balancedMode, capacity: capacityMode });
+}
+
+function computeMoe(
+  budget: number,
+  dramFree: number,
+  meta: Meta,
+  ta: Analysis,
+  draft: number,
+  overheadFactor: number,
+  minHeadroomPct: number,
+): SizeResult {
+  const nl = Math.max(1, meta.nl);
+  const exp = ta.exp;
+  const epl = exp / nl;
+  const cands: SizingCandidate[] = [];
+
+  for (const kvCacheQuant of ['q8_0', 'q4_0'] as const) {
+    const kvp = kvBytesPerToken(ta, kvCacheQuant);
+    for (let cpuLayers = 0; cpuLayers <= nl; cpuLayers++) {
+      const expCpuBytes = Math.min(exp, cpuLayers * epl);
+      const expGpuBytes = Math.max(0, exp - expCpuBytes);
+      if (expCpuBytes + draft + CPU_OFFLOAD_DRAM_RESERVE_BYTES > dramFree) continue;
+      const rawGpuBytes = ta.nonex + expGpuBytes;
+      const staticGpuBytes = Math.trunc((rawGpuBytes + draft) * overheadFactor) + MOE_PROMPT_BATCH_EXTRA_BYTES;
+      const ctxMax = stableCtx(budget, staticGpuBytes, kvp, meta.trainCtx, minHeadroomPct);
+      if (ctxMax <= MIN_USEFUL_CTX) continue;
+      const allExpertsCpu = cpuLayers >= nl || expGpuBytes <= 1;
+      cands.push({
+        kvCacheQuant,
+        kvp,
+        ctxMax,
+        strategy: allExpertsCpu ? 'moe-cpu' : cpuLayers > 0 ? 'hybrid' : 'full-gpu',
+        cpuMoeLayers: allExpertsCpu ? 0 : cpuLayers,
+        allExpertsCpu,
+        // Keep all non-expert transformer layers on GPU. Expert placement is
+        // controlled independently by --n-cpu-moe / --cpu-moe.
+        gpuLayers: cpuLayers > 0 || allExpertsCpu ? 999 : nl,
+        staticGpuBytes,
+        nonexGpuBytes: ta.nonex,
+        expGpuBytes,
+        expCpuBytes,
+        denseCpuBytes: 0,
+      });
+    }
+  }
+
+  const speed = cands.find((c) => c.kvCacheQuant === 'q8_0' && c.cpuMoeLayers === 0 && !c.allExpertsCpu)
+    ?? cands.find((c) => c.kvCacheQuant === 'q4_0' && c.cpuMoeLayers === 0 && !c.allExpertsCpu);
+  const speedMode = speed ? candidateToMode(speed, budget) : null;
+
+  let balancedMode: SizedMode | null = null;
+  for (const target of modeTargets(meta.trainCtx, true)) {
+    const eligible = cands
+      .filter((c) => c.ctxMax >= target)
+      .filter((c) => c.strategy === 'full-gpu' || (exp > 0 && c.expGpuBytes / exp >= BALANCED_MOE_MIN_EXPERT_GPU_FRAC))
+      .sort((a, b) => b.expGpuBytes - a.expGpuBytes || (a.kvCacheQuant === 'q8_0' ? -1 : 1));
+    const best = eligible[0];
+    if (best) {
+      balancedMode = candidateToMode(best, budget, best.strategy === 'full-gpu' ? best.ctxMax : target);
+      break;
+    }
+  }
+  balancedMode ??= pickHighestCtx(cands, budget, 'q4_0') ?? pickHighestCtx(cands, budget);
+
+  const capacityMode = pickHighestCtx(cands, budget, 'q4_0') ?? pickHighestCtx(cands, budget);
+  return finalizeModes({ speed: speedMode, balanced: balancedMode, capacity: capacityMode });
 }
 
 export function compute(
@@ -385,64 +620,15 @@ export function compute(
   const sm = Math.trunc(SAFETY_MARGIN_MB * safetyFactor);
   const cb = Math.trunc(COMPUTE_BUFS_MB * safetyFactor);
   const overheadPct = EMPIRICAL_OVERHEAD_PCT * safetyFactor;
+  const overheadFactor = 1 + overheadPct / 100;
   const budget = vram - (sm + cb) * MB;
   if (budget < 0) return fail('VRAM budget negative');
+  if (ta.nonex <= 0 && ta.exp <= 0) return fail('Model footprint is empty');
 
-  const base = Math.trunc((ta.nonex + draft) * (1 + overheadPct / 100));
-  if (base >= budget) return fail('Base footprint exceeds VRAM');
-
-  const exp = ta.exp;
-  const tctx = meta.trainCtx;
-  const nl = meta.nl;
-  const epl = nl > 0 ? exp / nl : exp;
-
-  // ── Sweep Q8 (preferred for speed/balanced) ──
-  const kvpQ8 = ta.kvPtok * KV_QUANT_RATIO['q8_0']!;
-  const q8 = sweepModes(budget, base, exp, epl, kvpQ8 <= 0 && ta.nKv > 0 ? 0.001 : kvpQ8, tctx, nl, dramFree, draft, minHeadroomPct);
-
-  // ── Sweep Q4 (fallback for speed, default for capacity) ──
-  const kvpQ4 = ta.kvPtok * KV_QUANT_RATIO['q4_0']!;
-  const q4 = sweepModes(budget, base, exp, epl, kvpQ4 <= 0 && ta.nKv > 0 ? 0.001 : kvpQ4, tctx, nl, dramFree, draft, minHeadroomPct);
-
-  const nonexGb = ta.nonex / GB;
-
-  // ── Derive three modes ──
-  // speed: Q8 full-GPU if it fits; else Q4 full-GPU.
-  let speedMode = toMode('q8_0', q8.speedCtx, 0, false, q8.speedEg, q8.speedEc, budget, base, kvpQ8, draft, nonexGb, nl);
-  if (!speedMode) {
-    speedMode = toMode('q4_0', q4.speedCtx, 0, false, q4.speedEg, q4.speedEc, budget, base, kvpQ4, draft, nonexGb, nl);
+  if (meta.nexp > 0 && ta.exp > 0) {
+    return computeMoe(budget, dramFree, meta, ta, draft, overheadFactor, minHeadroomPct);
   }
-
-  // balanced: default Q8_0 for better context accuracy. Fall back to Q4_0 if Q8_0 does not fit.
-  let balancedMode = toMode('q8_0', q8.bestCtx, q8.bestNcmoe, q8.bestCpumoe, q8.bestEg, q8.bestEc, budget, base, kvpQ8, draft, nonexGb, nl);
-  if (!balancedMode) {
-    const alt = toMode('q4_0', q4.bestCtx, q4.bestNcmoe, q4.bestCpumoe, q4.bestEg, q4.bestEc, budget, base, kvpQ4, draft, nonexGb, nl);
-    if (alt) balancedMode = alt;
-  }
-
-  // capacity: best Q4 overall (forced Q4).
-  const capacityMode = toMode('q4_0', q4.maxCtx, q4.maxNcmoe, q4.maxCpumoe, q4.maxEg, q4.maxEc, budget, base, kvpQ4, draft, nonexGb, nl);
-
-  const modes: SizeResult['modes'] = { speed: speedMode, balanced: balancedMode, capacity: capacityMode };
-
-  if (!balancedMode || balancedMode.ctx <= 4096) {
-    return fail('Cannot fit model — no room for KV cache');
-  }
-
-  // Fill backward-compat flat fields from balanced
-  return {
-    ok: true,
-    bestCtx: balancedMode.ctx,
-    cpuMoeLayers: balancedMode.cpuMoeLayers,
-    allExpertsCpu: balancedMode.allExpertsCpu,
-    headroomPct: balancedMode.headroomPct,
-    headroomGb: balancedMode.headroomGb,
-    kvGb: balancedMode.kvGb,
-    expGpuGb: balancedMode.expGpuGb,
-    expCpuGb: balancedMode.expCpuGb,
-    nonexGb: balancedMode.nonexGb,
-    modes,
-  };
+  return computeDense(budget, dramFree, meta, ta, draft, overheadFactor, minHeadroomPct);
 }
 
 /** Read a GGUF and size it for the given hardware budget (bytes). */
@@ -484,13 +670,16 @@ export function buildLaunchFlags(
   // For non-full-gpu modes with no gpuLayers, omit -ngl to avoid false claims.
   // (The lifecycle / probe will handle partial offload at runtime.)
 
+  const moeCpuOffload = mode.allExpertsCpu || mode.cpuMoeLayers > 0;
   const flags: string[] = [
     "--ctx-size", String(mode.ctx),
     ...(ng !== undefined ? ["-ngl", String(ng)] : []),
     "--parallel", String(parallel),
+    ...(moeCpuOffload ? ["-b", "4096", "-ub", "4096"] : []),
     "--flash-attn", flashAttn,
     "--cache-type-k", cacheType,
     "--cache-type-v", cacheType,
+    "--fit", "off",
     "--jinja",
   ];
 

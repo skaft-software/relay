@@ -13,12 +13,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { resolve } from 'node:path';
-import { existsSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 
-import { buildLaunchFlags, type SizedMode } from '../src/sizing/size-model.ts';
+import { compute, GB, buildLaunchFlags, type Meta, type Analysis, type SizedMode } from '../src/sizing/size-model.ts';
 import {
   configureQuickstart,
   estimateContextFromCatalog,
+  gpuPlacementLaunchFlags,
+  formatGpuProbe,
   parseEnv,
   type EnvMap,
   type GpuProbe,
@@ -51,6 +53,21 @@ function probe(vramGb: number): GpuProbe {
     driver: 'cuda',
     vram_total_gb: vramGb,
     vram_free_gb: vramGb,
+  };
+}
+
+function multiProbe(vramGbEach: number, count = 2): GpuProbe {
+  return {
+    gpu_type: 'nvidia',
+    driver: 'cuda',
+    vram_total_gb: vramGbEach * count,
+    vram_free_gb: vramGbEach * count,
+    devices: Array.from({ length: count }, (_, i) => ({
+      index: i,
+      device: `CUDA${i}`,
+      name: `RTX ${i}`,
+      vram_gb: vramGbEach,
+    })),
   };
 }
 
@@ -97,6 +114,9 @@ test('capacity mode: q4 KV in flags regardless of env KV type', () => {
   const f = launchFlags.join(' ');
   assert.ok(f.includes('--cache-type-k q4_0'));
   assert.ok(f.includes('--cache-type-v q4_0'));
+  assert.ok(f.includes('--fit off'));
+  assert.ok(f.includes('-b 4096'));
+  assert.ok(f.includes('-ub 4096'));
   assert.equal(expertFlag, '--cpu-moe');
 });
 
@@ -119,7 +139,7 @@ test('balanced q8: launches q8_0 KV', () => {
 
 // ── 3. q4 fallback ──
 
-test('q4 fallback: q4_0 KV, no -ngl 999 for hybrid', () => {
+test('q4 fallback: q4_0 KV, no -ngl 999 for hybrid without a layer plan', () => {
   const q4 = mockMode({
     strategy: 'hybrid',
     ctx: 16384,
@@ -133,6 +153,22 @@ test('q4 fallback: q4_0 KV, no -ngl 999 for hybrid', () => {
   assert.ok(f.includes('--cache-type-v q4_0'));
   assert.ok(!f.includes('-ngl 999'));
   assert.ok(!f.includes('-ngl'));
+});
+
+test('moe hybrid keeps non-expert layers on GPU while offloading experts', () => {
+  const moe = mockMode({
+    strategy: 'hybrid',
+    ctx: 131072,
+    kvCacheQuant: 'q4_0',
+    cpuMoeLayers: 18,
+    gpuLayers: 999,
+  });
+  const { launchFlags, expertFlag } = buildLaunchFlags(moe);
+  const f = launchFlags.join(' ');
+  assert.ok(f.includes('-ngl 999'));
+  assert.ok(f.includes('-b 4096'));
+  assert.ok(f.includes('-ub 4096'));
+  assert.equal(expertFlag, '--n-cpu-moe 18');
 });
 
 // ── 4. configureQuickstart kv_cache_type from selected mode ──
@@ -179,6 +215,27 @@ test('configureQuickstart: expert_flag in model map', () => {
 
     const mm = JSON.parse(env.get('RELAY_MODEL_MAP')!);
     assert.ok(mm['moe-exp']);
+  } finally { rm(); }
+});
+
+test('configureQuickstart: thinking models advertise thinking and launch reasoning parser', () => {
+  mk();
+  try {
+    const dummy = resolve(TMP, 'think.gguf');
+    writeFileSync(dummy, 'GGUF_MAGIC_DUMMY');
+
+    const env = parseEnv('');
+    const sel = [mkEntry({ id: 'think-m', thinking: 'on' })];
+    const paths = new Map<string, string>();
+    paths.set('think-m', dummy);
+
+    configureQuickstart(env, sel, paths, '/tmp/llama-server', TMP, probe(16));
+
+    const mm = JSON.parse(env.get('RELAY_MODEL_MAP')!);
+    assert.deepEqual(mm['think-m'].thinking_levels, ['on']);
+    const script = readFileSync(mm['think-m'].cmd, 'utf8');
+    assert.ok(script.includes('--reasoning-format deepseek'));
+    assert.ok(script.includes('--reasoning on'));
   } finally { rm(); }
 });
 
@@ -290,4 +347,99 @@ test('capacity mode: always q4_0 in modes', () => {
   const cap = est.modes.capacity;
   assert.ok(cap, 'capacity mode must exist');
   assert.equal(cap.kvCacheQuant, 'q4_0', 'capacity must always be q4_0');
+});
+
+function syntheticMeta(overrides: Partial<Meta> = {}): Meta {
+  return {
+    arch: 'qwen35',
+    nl: 64,
+    nkv: 8,
+    kl: 128,
+    emb: 5120,
+    nexp: 0,
+    nact: 0,
+    trainCtx: 262144,
+    swaWindow: undefined,
+    swaPattern: undefined,
+    fsize: 12 * GB,
+    tensors: [],
+    ...overrides,
+  };
+}
+
+function syntheticAnalysis(overrides: Partial<Analysis> = {}): Analysis {
+  const nonex = 11.17 * GB;
+  return {
+    nonex,
+    exp: 0,
+    kvPtok: 131072,
+    nKv: 64,
+    nCache: 64,
+    fsize: nonex,
+    ...overrides,
+  };
+}
+
+test('catalog estimate uses multi-GPU placement budget for fit labels', () => {
+  const m = mkEntry({
+    moe: false,
+    family: 'dense',
+    arch: 'qwen35',
+    size_gb: 40,
+    ctx: 131072,
+    kv_ptok: 131072,
+  });
+  const single = estimateContextFromCatalog(m, probe(24), 64, 'headless', 'cuda');
+  const multi = estimateContextFromCatalog(m, multiProbe(24, 2), 64, 'headless', 'cuda');
+  assert.notEqual(single.fit, 'full-gpu');
+  assert.equal(multi.fit, 'full-gpu');
+});
+
+test('setup launch flags include portable multi-GPU placement', () => {
+  const flags = gpuPlacementLaunchFlags(multiProbe(24, 2)).join(' ');
+  assert.ok(flags.includes('--device CUDA0,CUDA1'));
+  assert.ok(flags.includes('--split-mode layer'));
+  assert.ok(flags.includes('--tensor-split 24,24'));
+});
+
+test('formatGpuProbe shows multi-GPU total and Relay split budget', () => {
+  const text = formatGpuProbe(multiProbe(24, 2));
+  assert.match(text, /2 GPUs/);
+  assert.match(text, /48GB total VRAM/);
+  assert.match(text, /46GB Relay split budget/);
+});
+
+test('dense balanced sizing offloads a few layers to reach useful context', () => {
+  const result = compute(15.9 * GB, 28 * GB, syntheticMeta(), syntheticAnalysis());
+  assert.equal(result.ok, true, result.error);
+  const balanced = result.modes.balanced;
+  assert.ok(balanced, 'balanced mode must fit');
+  assert.equal(balanced.strategy, 'hybrid');
+  assert.equal(balanced.kvCacheQuant, 'q4_0');
+  assert.ok(balanced.ctx >= 65536, `ctx ${balanced.ctx} should reach the dense balanced target`);
+  assert.ok(typeof balanced.gpuLayers === 'number' && balanced.gpuLayers > 0 && balanced.gpuLayers < 64,
+    `gpuLayers ${balanced.gpuLayers} should be a real partial-offload layer count`);
+});
+
+test('dense capacity sizing is partial-ngl, never fake moe-cpu', () => {
+  const result = compute(15.9 * GB, 28 * GB, syntheticMeta(), syntheticAnalysis());
+  assert.equal(result.ok, true, result.error);
+  const capacity = result.modes.capacity;
+  assert.ok(capacity, 'capacity mode must fit');
+  assert.notEqual(capacity.strategy, 'moe-cpu');
+  assert.equal(capacity.allExpertsCpu, false);
+  assert.ok(typeof capacity.gpuLayers === 'number', 'dense capacity must emit a real -ngl value');
+});
+
+test('moe sizing keeps double-digit VRAM headroom by default', () => {
+  const result = compute(
+    15.9 * GB,
+    28 * GB,
+    syntheticMeta({ arch: 'cohere2moe', nl: 49, nexp: 128, nact: 8, trainCtx: 500000 }),
+    syntheticAnalysis({ nonex: 0.65 * GB, exp: 12.71 * GB, kvPtok: 50176, nKv: 49, nCache: 49 }),
+  );
+  assert.equal(result.ok, true, result.error);
+  assert.ok(result.modes.balanced, 'balanced mode must fit');
+  assert.ok(result.modes.balanced!.headroomPct >= 12,
+    `MoE headroom ${result.modes.balanced!.headroomPct.toFixed(2)}% should be at least 12%`);
 });

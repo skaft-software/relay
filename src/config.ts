@@ -199,7 +199,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     lifecycleCircuitBreakerCooldownMs: readInteger(env.RELAY_LIFECYCLE_CIRCUIT_BREAKER_COOLDOWN_MS, 120_000, 'RELAY_LIFECYCLE_CIRCUIT_BREAKER_COOLDOWN_MS'),
     lifecycleRingBufferBytes: readInteger(env.RELAY_LIFECYCLE_RING_BUFFER_BYTES, 65536, 'RELAY_LIFECYCLE_RING_BUFFER_BYTES'),
     lifecycleShutdownConfirmTimeoutMs: readInteger(env.RELAY_LIFECYCLE_SHUTDOWN_CONFIRM_TIMEOUT_MS, 10_000, 'RELAY_LIFECYCLE_SHUTDOWN_CONFIRM_TIMEOUT_MS'),
-    maxStoreBytes: readOptionalNumber(env.MAX_STORE_BYTES, 'MAX_STORE_BYTES'),
+    maxStoreBytes: readPositiveOptionalInteger(env.MAX_STORE_BYTES, 'MAX_STORE_BYTES'),
     rateLimitRelayPostMax: readInteger(env.RATE_LIMIT_RELAY_POST_MAX, 50, 'RATE_LIMIT_RELAY_POST_MAX'),
     rateLimitRelayPostWindowMs: readInteger(env.RATE_LIMIT_RELAY_POST_WINDOW_SECONDS, 60, 'RATE_LIMIT_RELAY_POST_WINDOW_SECONDS') * 1000,
     serializeRequests: readBoolean(env.RELAY_SERIALIZE_REQUESTS, true),
@@ -343,6 +343,16 @@ function readOptionalNumber(value: string | undefined, name: string): number | u
   const parsed = Number(raw);
   if (!Number.isFinite(parsed)) {
     throw new Error(`${name} must be a finite number`);
+  }
+  return parsed;
+}
+
+function readPositiveOptionalInteger(value: string | undefined, name: string): number | undefined {
+  const raw = readOptional(value);
+  if (!raw) return undefined;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive integer`);
   }
   return parsed;
 }

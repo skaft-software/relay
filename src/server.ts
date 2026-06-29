@@ -170,6 +170,9 @@ export function createApp(config: AppConfig): App {
     config.rateLimitRelayPostMax ?? 50,
     config.rateLimitRelayPostWindowMs ?? 60_000,
   );
+  // General request rate limiter for unauthenticated mode — prevents abuse
+  // when no API key is configured (auth rate limiters are bypassed in that case).
+  const generalRateLimiter = new KeyRateLimiter(100, 60_000);
 
   let shuttingDown = false;
   const bindHost = `${config.host}:${config.port}`;
@@ -281,6 +284,22 @@ export function createApp(config: AppConfig): App {
     let requestModel: string | undefined;
     let response: Response;
     try {
+      // General rate limit for unauthenticated mode
+      if (!config.apiKey) {
+        const ip = clientIp(request, config);
+        if (!generalRateLimiter.allow(ip)) {
+          response = openAIError(429, 'Too many requests', 'rate_limit_exceeded');
+          return finalizeResponse(
+            response,
+            requestId,
+            path,
+            request.method,
+            startedAt,
+            startedAtMs,
+            requestModel,
+          );
+        }
+      }
       if (request.method === "OPTIONS") {
         response = optionsResponse(request, config);
         return finalizeResponse(
@@ -1066,9 +1085,15 @@ export function createApp(config: AppConfig): App {
         : path;
       const cloudUrl = config.cloudFallbackUrl!.replace(/\/+$/, "") + (cloudPath.startsWith("/") ? cloudPath : "/" + cloudPath);
       logger.info("forwarding to cloud", { model: (body as any)?.model, cloudUrl, path });
+      // Forward auth header so the cloud fallback can authenticate the request.
+      const fwdHeaders: Record<string, string> = { "content-type": "application/json" };
+      const incomingAuth = request.headers.get('authorization');
+      if (incomingAuth) fwdHeaders['authorization'] = incomingAuth;
+      const incomingXKey = request.headers.get('x-api-key');
+      if (incomingXKey) fwdHeaders['x-api-key'] = incomingXKey;
       const upstream = await fetch(cloudUrl, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: fwdHeaders,
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(config.requestTimeoutMs),
       });
@@ -1427,7 +1452,7 @@ async function readJson(
   const contentType = request.headers.get("content-type") ?? "";
   const mime = contentType.split(';')[0].trim();
   if (mime !== 'application/json') {
-    throw new GatewayError(400, "Content-Type must be application/json");
+    throw new GatewayError(400, `Content-Type must be application/json, got ${mime || '(empty)'}`);
   }
   const text = await request.text();
   try {
@@ -1502,9 +1527,12 @@ function nodeHeaderValue(
 }
 
 function readRequestModel(body: unknown): string | undefined {
-  return isObject(body) && typeof body.model === "string"
-    ? body.model
-    : undefined;
+  if (!isObject(body) || typeof body.model !== 'string') return undefined;
+  // Cap model name length to prevent abuse via shell interpolation or URL construction.
+  if (body.model.length > 512) {
+    throw new GatewayError(400, 'Model name exceeds maximum length (512)', 'invalid_request_error', 'invalid_model');
+  }
+  return body.model;
 }
 
 function extractObservabilityFields(payload: any) {

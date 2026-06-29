@@ -28,6 +28,12 @@ export type MetaValue = number | bigint | boolean | string | number[] | bigint[]
 export interface TensorInfo {
   name: string;
   dims: number[];
+  /** GGML tensor type id from the GGUF tensor info table. */
+  type?: number;
+  /** Tensor data offset relative to the GGUF data section. */
+  offset?: number;
+  /** On-disk tensor payload bytes, including any alignment padding before the next tensor. */
+  bytes?: number;
 }
 
 export interface GgufModel {
@@ -91,6 +97,8 @@ class ByteReader {
     this.ensure(this.pos + len);
     this.pos += len;
   }
+
+  position(): number { return this.pos; }
 }
 
 function readScalar(r: ByteReader, type: number): MetaValue {
@@ -132,6 +140,10 @@ function readValue(r: ByteReader, type: number, collect: boolean): MetaValue | u
   return arr as MetaValue;
 }
 
+function alignOffset(offset: number, alignment: number): number {
+  return Math.ceil(offset / alignment) * alignment;
+}
+
 export function readGguf(path: string): GgufModel {
   const fileSize = statSync(path).size;
   const fd = openSync(path, 'r');
@@ -160,9 +172,22 @@ export function readGguf(path: string): GgufModel {
       const nDims = r.u32();
       const dims: number[] = [];
       for (let d = 0; d < nDims; d++) dims.push(r.u64());
-      r.u32(); // ggml_type — unused
-      r.u64(); // data offset — unused
-      tensors.push({ name, dims });
+      const type = r.u32();
+      const offset = r.u64();
+      tensors.push({ name, dims, type, offset });
+    }
+
+    const alignmentValue = metadata.get('general.alignment');
+    const alignment = typeof alignmentValue === 'number' && alignmentValue > 0 ? alignmentValue : 32;
+    const dataStart = alignOffset(r.position(), alignment);
+    const byOffset = tensors
+      .map((t, index) => ({ t, index, offset: t.offset ?? 0 }))
+      .sort((a, b) => a.offset - b.offset || a.index - b.index);
+    for (let i = 0; i < byOffset.length; i++) {
+      const cur = byOffset[i]!;
+      const next = byOffset[i + 1];
+      const end = next ? next.offset : Math.max(0, fileSize - dataStart);
+      cur.t.bytes = Math.max(0, end - cur.offset);
     }
 
     const get = (suffix: string): MetaValue | undefined => {
