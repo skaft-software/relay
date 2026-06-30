@@ -48,21 +48,12 @@ test('#11: GET / is protected when API_KEY is set', async () => {
   });
 });
 
-test('#11: GET /health is protected when API_KEY is set', async () => {
-  await withUpstream(async (upstream) => {
-    const app = createApp({ ...testConfig(upstream.url), apiKey: 'secret' });
-    const res = await app.fetch('/health');
-    assert.equal(res.status, 401, 'GET /health without auth should return 401');
-    assert.equal((await res.json()).error?.type, 'authentication_error');
-  });
-});
-
-test('#11: GET / and /health are public when API_KEY is not set', async () => {
+test('#11: GET /health is public even when API_KEY is set', async () => {
   await withUpstream(async (upstream) => {
     upstream.handler = (req, res) => sendJson(res, 200, { ok: true });
-    const app = createApp(testConfig(upstream.url));
-    assert.equal((await app.fetch('/')).status, 200);
-    assert.equal((await app.fetch('/health')).status, 200);
+    const app = createApp({ ...testConfig(upstream.url), apiKey: 'secret' });
+    const res = await app.fetch('/health');
+    assert.equal(res.status, 200, 'GET /health should be public for LBs and healthchecks');
   });
 });
 

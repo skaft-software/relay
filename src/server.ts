@@ -1416,8 +1416,10 @@ function authorizeRelay(
   rateLimiter?: KeyRateLimiter,
 ): Response | undefined {
   if (!config.apiKey) return undefined;
-  // Protect all /relay/* paths with auth. Also protect / and /health.
-  if (!path.startsWith("/relay/") && path !== "/" && path !== "/health") return undefined;
+  // Protect all /relay/* paths with auth. Also protect /.
+  // /health is intentionally public — load balancers, Docker HEALTHCHECK,
+  // and monitoring probes need it without credentials.
+  if (!path.startsWith("/relay/") && path !== "/") return undefined;
   const bearer = request.headers
     .get("authorization")
     ?.match(/^Bearer\s+(.+)$/i)?.[1];
