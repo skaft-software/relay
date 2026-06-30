@@ -1,39 +1,64 @@
 #!/usr/bin/env bash
 # probe-gpu.sh — Detect GPU hardware and estimate available VRAM.
-# Outputs JSON: { gpu_type, vram_total_gb, vram_free_gb, driver, models: [...] }
+# Outputs JSON: { gpu_type, vram_total_gb, vram_free_gb, driver, devices: [...], models: [...] }
+#
+# Primary path: relay uses llama-server --list-devices when available (cross-vendor,
+# authoritative). This script is the pre-build fallback for the setup TUI.
 set -euo pipefail
 
 GPU_TYPE="unknown"
 VRAM_TOTAL=0
 VRAM_FREE=0
 DRIVER="unknown"
+DEVICES_JSON="[]"
 
-# ── AMD ROCm ──────────────────────────────────────────────────────────
+# ── AMD ROCm/Vulkan ────────────────────────────────────────────────────
 if command -v rocm-smi &>/dev/null; then
   GPU_TYPE="amd"
-  DRIVER="rocm"
-  # rocm-smi outputs lines like: "0       1     0x7550,   ...  87%   100%"
-  # VRAM% is the second-to-last field before GPU%
-  while IFS= read -r line; do
-    # Try to parse VRAM total/used from sysfs
-    for card in /sys/class/drm/card?/device; do
-      if [[ -f "$card/mem_info_vram_total" ]]; then
-        total=$(<"$card/mem_info_vram_total")
-        used=$(<"$card/mem_info_vram_used" 2>/dev/null || echo 0)
-        VRAM_TOTAL=$((total / 1024 / 1024 / 1024))
-        VRAM_FREE=$(((total - used) / 1024 / 1024 / 1024))
-      fi
-    done
-  done < <(rocm-smi 2>/dev/null || true)
+  # Relay uses Vulkan for AMD (not HIP/ROCm) — device handles match llama-server Vulkan{i}.
+  DRIVER="vulkan"
+  idx=0
+  first=true
+  DEVICES_JSON="["
+  for card in /sys/class/drm/card?/device; do
+    [[ -f "$card/mem_info_vram_total" ]] || continue
+    total=$(<"$card/mem_info_vram_total")
+    used=$(<"$card/mem_info_vram_used" 2>/dev/null || echo 0)
+    gb=$((total / 1024 / 1024 / 1024))
+    (( gb > 0 )) || continue
+    free_gb=$(((total - used) / 1024 / 1024 / 1024))
+    VRAM_TOTAL=$((VRAM_TOTAL + gb))
+    VRAM_FREE=$((VRAM_FREE + free_gb))
+    [[ "$first" == "true" ]] && first=false || DEVICES_JSON+=","
+    DEVICES_JSON+="{\"index\":$idx,\"device\":\"Vulkan$idx\",\"name\":\"AMD GPU\",\"vram_gb\":$gb,\"free_vram_gb\":$free_gb}"
+    idx=$((idx + 1))
+  done
+  DEVICES_JSON+="]"
 
 # ── NVIDIA CUDA ────────────────────────────────────────────────────────
 elif command -v nvidia-smi &>/dev/null; then
   GPU_TYPE="nvidia"
   DRIVER="cuda"
-  VRAM_TOTAL=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
-  VRAM_FREE=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
-  VRAM_TOTAL=$((VRAM_TOTAL / 1024))
-  VRAM_FREE=$((VRAM_FREE / 1024))
+  DEVICES_JSON="["
+  first=true
+  while IFS=, read -r raw_idx raw_name raw_mib raw_free_mib; do
+    raw_idx="${raw_idx// /}"
+    raw_name="${raw_name## }"  # strip leading space from csv
+    raw_mib="${raw_mib// /}"
+    raw_free_mib="${raw_free_mib// /}"
+    (( raw_mib > 0 )) 2>/dev/null || continue
+    gb=$((raw_mib / 1024))
+    free_gb=$((raw_free_mib / 1024))
+    (( gb > 0 )) || continue
+    VRAM_TOTAL=$((VRAM_TOTAL + gb))
+    VRAM_FREE=$((VRAM_FREE + free_gb))
+    # Minimal JSON string escaping for GPU names (backslash and double-quote).
+    safe_name="${raw_name//\\/\\\\}"
+    safe_name="${safe_name//\"/\\\"}"
+    [[ "$first" == "true" ]] && first=false || DEVICES_JSON+=","
+    DEVICES_JSON+="{\"index\":$raw_idx,\"device\":\"CUDA$raw_idx\",\"name\":\"$safe_name\",\"vram_gb\":$gb,\"free_vram_gb\":$free_gb}"
+  done < <(nvidia-smi --query-gpu=index,name,memory.total,memory.free --format=csv,noheader,nounits 2>/dev/null || true)
+  DEVICES_JSON+="]"
 
 # ── Apple Metal ────────────────────────────────────────────────────────
 elif command -v sysctl &>/dev/null && sysctl -n hw.optional.arm64 2>/dev/null | grep -q 1; then
@@ -42,6 +67,7 @@ elif command -v sysctl &>/dev/null && sysctl -n hw.optional.arm64 2>/dev/null | 
   # Apple Silicon has unified memory; total is system RAM
   VRAM_TOTAL=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1024 / 1024 / 1024 ))
   VRAM_FREE=$(( VRAM_TOTAL - 2 ))  # rough: 2GB reserved for OS
+  DEVICES_JSON="[{\"index\":0,\"device\":\"Metal0\",\"name\":\"Apple Silicon\",\"vram_gb\":$VRAM_TOTAL,\"free_vram_gb\":$VRAM_FREE}]"
 
 # ── Vulkan-only (no vendor tool) ──────────────────────────────────────
 elif command -v vulkaninfo &>/dev/null; then
@@ -87,6 +113,7 @@ cat <<JSON
   "driver": "$DRIVER",
   "vram_total_gb": $VRAM_TOTAL,
   "vram_free_gb": $VRAM_FREE,
+  "devices": $DEVICES_JSON,
   "models": $MODELS
 }
 JSON

@@ -250,6 +250,23 @@ test('summarizeGpus: empty list collapses to vendor none', () => {
   assert.equal(sum.totalGpuVramGb, 0);
 });
 
+test('AMD rocm-smi fallback uses Vulkan device handles (not ROCm)', () => {
+  // Relay uses Vulkan for AMD. The rocm-smi fallback in detectHardware creates
+  // synthetic GpuInfo objects; they must use Vulkan{i} handles so that
+  // planGpuPlacement can emit the correct --device Vulkan0,Vulkan1 flags.
+  // Regression: previously created ROCm{i} which would fail with a Vulkan build.
+  const gpus = [
+    { index: 0, device: 'Vulkan0', name: 'AMD GPU', vramGb: 16 },
+    { index: 1, device: 'Vulkan1', name: 'AMD GPU', vramGb: 16 },
+  ];
+  const sum = summarizeGpus(gpus, 'amd');
+  assert.equal(sum.vendor, 'amd');
+  assert.equal(sum.gpuCount, 2);
+  const placement = planGpuPlacement(sum);
+  assert.ok(placement?.config.device?.includes('Vulkan'), 'device handle should be Vulkan, not ROCm');
+  assert.equal(placement?.config.device, 'Vulkan0,Vulkan1');
+});
+
 // ── GpuConfig → llama.cpp launch flags ───────────────────────────────────────
 
 test('gpuLaunchFlags: maps every field to its llama.cpp flag', () => {

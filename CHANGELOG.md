@@ -18,6 +18,9 @@
 
 - Sizing engine: three-mode dispatch (`speed`/`balanced`/`capacity`) now correctly applies to the selected mode rather than always using balanced.
 - Provisioning: cross-vendor multi-GPU detection with per-model GPU flags; `--list-devices` parsing for Vulkan/ROCm/CUDA.
+- **Multi-GPU AMD device handles** — the `rocm-smi` detection fallback (used when no `llama-server` binary exists yet) now creates `Vulkan{i}` device handles instead of `ROCm{i}`. Since Relay uses Vulkan for AMD, the previous handles would have generated invalid `--device ROCm0,ROCm1` flags in start scripts on multi-GPU AMD boxes.
+- **`probe-gpu.sh` multi-GPU enumeration** — the pre-build GPU probe (setup TUI fallback before any `llama-server` is installed) now sums VRAM across all GPUs and emits a `devices` array. Previously: NVIDIA reported only the first card (`head -1`) and AMD overwrote `VRAM_TOTAL` on each sysfs card iteration, so multi-GPU systems were mis-sized as single-GPU during initial setup.
+- **`probe-gpu.sh` AMD driver label** — corrected from `"rocm"` to `"vulkan"` to match Relay's AMD backend policy.
 - Dockerfile: uses `node --env-file` instead of fragile shell sourcing.
 - `/v1/models` now only advertises provisioned models that have a start script AND whose GGUF is still on disk.
 - Auto-discovered models no longer mutate the shared `config.modelEntries` with untyped runtime fields (`__ggufPath` is now typed).

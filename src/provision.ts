@@ -290,7 +290,10 @@ export function detectHardware(serverPath?: string): Hardware {
     const totals = [...out.matchAll(/(\d{9,})/g)].map((m) => Number(m[1]));
     if (totals.length) {
       const gpus: GpuInfo[] = totals.map((bytes, i) => ({
-        index: i, device: 'ROCm' + i, name: amdName() ?? 'AMD GPU', vramGb: Math.round(bytes / 1024 ** 3),
+        // Relay uses Vulkan for AMD (not HIP/ROCm). Handles match what a Vulkan
+        // llama-server reports in --list-devices. If you build with HIP, the
+        // primary --list-devices path runs first and this fallback never fires.
+        index: i, device: 'Vulkan' + i, name: amdName() ?? 'AMD GPU', vramGb: Math.round(bytes / 1024 ** 3),
       })).filter((g) => g.vramGb > 0);
       if (gpus.length) return summarizeGpus(gpus, 'amd');
     }
