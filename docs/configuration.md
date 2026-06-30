@@ -88,6 +88,7 @@ Each entry:
 - `port` (optional) — fixed port (auto-allocated if unset)
 - `thinking_levels` (optional) — `["on"]` or `["on","off"]` for thinking-capable models
 - `expert_flag` (optional) — MoE expert offload flag (`--cpu-moe` or `--n-cpu-moe N`), informational (baked into the start script)
+- `gpu` (optional) — advanced llama.cpp GPU placement override. Generated for multi-GPU boxes when safe.
 - `health_url` (optional) — override health check URL
 
 Example:
@@ -106,6 +107,22 @@ Example:
   }
 }
 ```
+
+### Multi-GPU llama.cpp placement
+
+Relay probes the actual `llama-server --list-devices` output and uses those device handles directly, so the same path works for NVIDIA/CUDA (`CUDA0,CUDA1`), AMD/Vulkan or HIP (`Vulkan0,Vulkan1` / `ROCm0,ROCm1`), and Metal (`Metal0`).
+
+Default generated multi-GPU policy:
+
+```json
+"gpu": {
+  "device": "CUDA0,CUDA1",
+  "splitMode": "layer",
+  "tensorSplit": [24, 24]
+}
+```
+
+`layer` split is the portable default: llama.cpp splits layers and KV across devices. Tiny integrated GPUs are skipped so they do not slow down or OOM a discrete card. Garage-tinkerer overrides can use `splitMode: "row"` or `"tensor"`, `mainGpu`, or custom `tensorSplit` values.
 
 ### Session-Aware Context
 
@@ -127,7 +144,7 @@ Headers checked (first match wins): `session-id`, `session_id`, `x-session-affin
 | `RELAY_UNKNOWN_FIELD_POLICY` | `pass_through` | `pass_through`, `strip` (with warning), or `reject` |
 | `RELAY_STRICT_COMPAT` | `false` | Reject non-standard requests |
 | `RELAY_WARN_ON_STRIPPED_FIELDS` | `true` | Log warnings when fields are stripped |
-| `RELAY_REASONING_MODE` | `off` | `off`, `preserve`, or `auto` for reasoning/thinking fields |
+| `RELAY_REASONING_MODE` | `off` | `off`, `raw`, `parsed`, or `preserve` for reasoning/thinking fields |
 | `RELAY_TOOL_MODE` | `auto` | Tool call handling mode |
 | `RELAY_THINKING_SUPPORTED` | `false` | Declare thinking capability to clients |
 | `RELAY_THINKING_LEVELS` | `on,off` | Available thinking levels (comma-separated) |

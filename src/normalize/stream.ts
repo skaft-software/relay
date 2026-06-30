@@ -31,6 +31,10 @@ export function encodeSSE(frame: SSEFrame): string {
 
 export function ensureOpenAIStreamDone(body: ReadableStream<Uint8Array>, includeUsage = false, hooks?: StreamDiagnosticsHooks): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
+  const abortController = new AbortController();
+  let cancelled = false;
+  let iterator: AsyncGenerator<ParsedSSEFrame> | undefined;
+
   return new ReadableStream<Uint8Array>({
     async start(controller) {
       let sawDone = false;
@@ -40,7 +44,9 @@ export function ensureOpenAIStreamDone(body: ReadableStream<Uint8Array>, include
       let streamModel: string | undefined;
       let streamCreated: number | undefined;
       try {
-        for await (const frame of parseSSEStream(body)) {
+        iterator = parseSSEStream(body, undefined, abortController.signal);
+        for await (const frame of iterator) {
+          if (cancelled) return;
           hooks?.onUpstreamFrame?.(frame);
           if (frame.data === '[DONE]') {
             if (includeUsage && latestUsage && !sawUsageOnlyChunk) {
@@ -78,12 +84,15 @@ export function ensureOpenAIStreamDone(body: ReadableStream<Uint8Array>, include
           hooks?.onDownstreamChunk?.(outChunk);
           controller.enqueue(encoder.encode(outChunk));
         }
+        if (cancelled || abortController.signal.aborted) return;
         hooks?.onUpstreamComplete?.(true);
       } catch {
+        if (cancelled || abortController.signal.aborted) return;
         hooks?.onUpstreamComplete?.(false);
         // OpenAI chat streams do not have a clean post-start error frame. Close
         // the stream with a single done marker instead of leaking malformed SSE.
       }
+      if (cancelled || abortController.signal.aborted) return;
       if (!sawDone) {
         if (includeUsage && latestUsage && !sawUsageOnlyChunk) {
           const usageChunk = encodeSSE({
@@ -105,28 +114,78 @@ export function ensureOpenAIStreamDone(body: ReadableStream<Uint8Array>, include
       }
       controller.close();
     },
+    async cancel(reason) {
+      cancelled = true;
+      abortController.abort(reason);
+      try { await iterator?.return?.(undefined); } catch { /* ignore cancellation races */ }
+    },
   });
 }
 
-export async function* parseSSEStream(body: ReadableStream<Uint8Array>): AsyncGenerator<ParsedSSEFrame> {
+export async function* parseSSEStream(body: ReadableStream<Uint8Array>, chunkTimeoutMs?: number, signal?: AbortSignal): AsyncGenerator<ParsedSSEFrame> {
   const decoder = new TextDecoder();
   const reader = body.getReader();
+  const readTimeout = chunkTimeoutMs ?? 300_000; // default 5 min per chunk
   let buffer = '';
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const frames = splitFrames(buffer);
-    buffer = frames.remainder;
-    for (const block of frames.complete) {
-      const frame = parseSSEBlock(block);
-      if (frame) yield frame;
+  let completed = false;
+  try {
+    while (true) {
+      const result = await readSSEChunk(reader, readTimeout, signal);
+      if (result.done) {
+        completed = true;
+        break;
+      }
+      buffer += decoder.decode(result.value, { stream: true });
+      const frames = splitFrames(buffer);
+      buffer = frames.remainder;
+      for (const block of frames.complete) {
+        const frame = parseSSEBlock(block);
+        if (frame) yield frame;
+      }
     }
+    buffer += decoder.decode();
+    if (buffer.trim().length > 0) {
+      throw upstreamError('stream_interrupted', 'Upstream stream ended mid-frame');
+    }
+  } finally {
+    if (!completed) {
+      try { await reader.cancel(signal?.reason); } catch { /* already closed */ }
+    }
+    try { reader.releaseLock(); } catch { /* already released */ }
   }
-  buffer += decoder.decode();
-  if (buffer.trim().length > 0) {
-    throw upstreamError('stream_interrupted', 'Upstream stream ended mid-frame');
-  }
+}
+
+function readSSEChunk(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    const settle = (fn: typeof resolve | typeof reject, value: ReadableStreamReadResult<Uint8Array> | Error) => {
+      if (settled) return;
+      settled = true;
+      if (timeoutId) clearTimeout(timeoutId);
+      if (signal) signal.removeEventListener('abort', onAbort);
+      (fn as (v: ReadableStreamReadResult<Uint8Array> | Error) => void)(value);
+    };
+    const onAbort = () => settle(reject, signal?.reason instanceof Error ? signal.reason : new DOMException('SSE stream cancelled', 'AbortError'));
+
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+
+    timeoutId = setTimeout(() => settle(reject, new Error('SSE stream chunk read timed out')), timeoutMs);
+    (timeoutId as { unref?: () => void }).unref?.();
+
+    reader.read().then(
+      (result) => settle(resolve, result),
+      (error) => settle(reject, error instanceof Error ? error : new Error(String(error))),
+    );
+  });
 }
 
 export function parseSSEJson(frame: ParsedSSEFrame, message = 'Upstream returned invalid streaming JSON'): any {

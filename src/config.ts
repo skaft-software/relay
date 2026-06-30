@@ -14,7 +14,8 @@ export type ModelEntry = {
   cmd: string;
   /** Optional health URL (defaults to probing upstreamBaseUrl).
    *  @deprecated Per-model health checks always use http://127.0.0.1:${port}/health.
-   *  This field is parsed but not consulted by the lifecycle. */
+   *  This field is parsed but not consulted by the lifecycle.
+   *  Will be removed in v0.4.0. */
   health_url?: string;
   /** Startup timeout in seconds (defaults to modelStartTimeoutMs / 1000) */
   timeout_sec?: number;
@@ -99,7 +100,9 @@ export type AppConfig = {
   switchPolicy?: 'eager';
   /** Starting port number for dynamic model port allocation. */
   modelPortBase?: number;
-  /** Maximum number of concurrent model processes to keep warm. */
+  /** Maximum number of concurrent model processes to keep warm.
+   *  Enforced by lifecycle.shutdownIdleModels() which prunes oldest warm
+   *  models (LRU by lastUsedAt) when exceeded. */
   switchMaxWarmModels?: number;
   /** Relay mode: gateway (default, manages local models) or cloud (proxies to external APIs). */
   relayMode?: 'gateway' | 'cloud';
@@ -196,7 +199,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     lifecycleCircuitBreakerCooldownMs: readInteger(env.RELAY_LIFECYCLE_CIRCUIT_BREAKER_COOLDOWN_MS, 120_000, 'RELAY_LIFECYCLE_CIRCUIT_BREAKER_COOLDOWN_MS'),
     lifecycleRingBufferBytes: readInteger(env.RELAY_LIFECYCLE_RING_BUFFER_BYTES, 65536, 'RELAY_LIFECYCLE_RING_BUFFER_BYTES'),
     lifecycleShutdownConfirmTimeoutMs: readInteger(env.RELAY_LIFECYCLE_SHUTDOWN_CONFIRM_TIMEOUT_MS, 10_000, 'RELAY_LIFECYCLE_SHUTDOWN_CONFIRM_TIMEOUT_MS'),
-    maxStoreBytes: readOptionalNumber(env.MAX_STORE_BYTES, 'MAX_STORE_BYTES'),
+    maxStoreBytes: readPositiveOptionalInteger(env.MAX_STORE_BYTES, 'MAX_STORE_BYTES'),
     rateLimitRelayPostMax: readInteger(env.RATE_LIMIT_RELAY_POST_MAX, 50, 'RATE_LIMIT_RELAY_POST_MAX'),
     rateLimitRelayPostWindowMs: readInteger(env.RATE_LIMIT_RELAY_POST_WINDOW_SECONDS, 60, 'RATE_LIMIT_RELAY_POST_WINDOW_SECONDS') * 1000,
     serializeRequests: readBoolean(env.RELAY_SERIALIZE_REQUESTS, true),
@@ -340,6 +343,16 @@ function readOptionalNumber(value: string | undefined, name: string): number | u
   const parsed = Number(raw);
   if (!Number.isFinite(parsed)) {
     throw new Error(`${name} must be a finite number`);
+  }
+  return parsed;
+}
+
+function readPositiveOptionalInteger(value: string | undefined, name: string): number | undefined {
+  const raw = readOptional(value);
+  if (!raw) return undefined;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive integer`);
   }
   return parsed;
 }

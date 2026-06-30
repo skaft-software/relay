@@ -116,7 +116,15 @@ export class ResponseStore {
   }
 }
 
-export async function createResponse(config: AppConfig, store: ResponseStore, body: unknown, externalSignal?: AbortSignal, lifecycle?: ModelLifecycle): Promise<Response> {
+export async function createResponse(
+  config: AppConfig,
+  store: ResponseStore,
+  body: unknown,
+  externalSignal?: AbortSignal,
+  lifecycle?: ModelLifecycle,
+  upstreamBaseUrlOverride?: string,
+  upstreamAuthHeaderOverride?: string,
+): Promise<Response> {
   const logger = createLogger(config.logLevel);
   if (!isObject(body)) throw invalidRequestError('JSON body must be an object');
   const { body: normalized, strippedFields } = applyFieldPolicy('openai_responses', body, config);
@@ -127,27 +135,29 @@ export async function createResponse(config: AppConfig, store: ResponseStore, bo
     }
     previousMessages = store.getChatMessages(normalized.previous_response_id) ?? [];
   }
-  // Resolve dynamic upstream URL when lifecycle provides per-model port routing.
-  const upstreamBaseUrl = lifecycle && typeof normalized.model === 'string'
-    ? lifecycle.getUpstreamUrl(normalized.model)
-    : config.upstreamBaseUrl;
+  // Resolve upstream URL: explicit cloud override > lifecycle > config default.
+  const upstreamBaseUrl = upstreamBaseUrlOverride ?? (
+    lifecycle && typeof normalized.model === 'string'
+      ? lifecycle.getUpstreamUrl(normalized.model)
+      : config.upstreamBaseUrl
+  );
 
   const chatRequest = responseRequestToChat(normalized, config, previousMessages);
   logResponsesTranslation(logger, normalized, chatRequest, previousMessages);
   logUpstreamPayloadDiagnostics(logger, { route: '/v1/responses', upstream_route: '/v1/chat/completions', payload: chatRequest });
   if (normalized.stream === true) {
-    return withFieldWarning(await streamResponse(config, store, normalized, chatRequest, upstreamBaseUrl, externalSignal), strippedFields, config);
+    return withFieldWarning(await streamResponse(config, store, normalized, chatRequest, upstreamBaseUrl, upstreamAuthHeaderOverride, externalSignal), strippedFields, config);
   }
 
   const toolCount_ns = Array.isArray((chatRequest as any).tools) ? (chatRequest as any).tools.length : 0;
-  logger.info("upstream non-stream call", { url: config.upstreamBaseUrl, model: (chatRequest as any).model, bodyKB: Math.round(JSON.stringify(chatRequest).length / 1024), tools: toolCount_ns });
+  logger.info("upstream non-stream call", { url: upstreamBaseUrl, model: (chatRequest as any).model, bodyKB: Math.round(JSON.stringify(chatRequest).length / 1024), tools: toolCount_ns });
   const upstreamRes = await upstreamFetch(config, '/v1/chat/completions', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(chatRequest),
-  }, externalSignal, upstreamBaseUrl);
-  if (!upstreamRes.response.ok) throw await upstreamHttpError(upstreamRes.response, config);
-  const upstreamText = await readLimitedText(upstreamRes.response, config.maxUpstreamResponseBytes);
+  }, externalSignal, upstreamBaseUrl, upstreamAuthHeaderOverride);
+  if (!upstreamRes.response.ok) throw await upstreamHttpError(upstreamRes.response, config, externalSignal);
+  const upstreamText = await readLimitedText(upstreamRes.response, config.maxUpstreamResponseBytes, externalSignal, config.requestTimeoutMs);
   const upstreamBytes = Buffer.byteLength(upstreamText);
   let chat: unknown;
   try {
@@ -235,7 +245,7 @@ type StreamToolCallState = {
   started: boolean;
 };
 
-async function streamResponse(config: AppConfig, store: ResponseStore, request: JsonObject, chatRequest: JsonObject, upstreamBaseUrl?: string, externalSignal?: AbortSignal): Promise<Response> {
+async function streamResponse(config: AppConfig, store: ResponseStore, request: JsonObject, chatRequest: JsonObject, upstreamBaseUrl?: string, upstreamAuthHeaderOverride?: string, externalSignal?: AbortSignal): Promise<Response> {
   const logger = createLogger(config.logLevel);
   const toolCount_stream = Array.isArray((chatRequest as any).tools) ? (chatRequest as any).tools.length : 0;
   logger.info("upstream stream call", { url: upstreamBaseUrl ?? config.upstreamBaseUrl, model: (chatRequest as any).model, bodyKB: Math.round(JSON.stringify(chatRequest).length / 1024), tools: toolCount_stream });
@@ -246,7 +256,7 @@ async function streamResponse(config: AppConfig, store: ResponseStore, request: 
       'content-type': 'application/json',
     },
     body: JSON.stringify(chatRequest),
-  }, externalSignal, upstreamBaseUrl);
+  }, externalSignal, upstreamBaseUrl, upstreamAuthHeaderOverride);
   if (!upstream.response.ok || !upstream.response.body) {
     throw upstream.response.body ? await upstreamHttpError(upstream.response, config) : upstreamError('bad_response', 'Upstream returned an empty stream');
   }

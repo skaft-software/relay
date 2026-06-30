@@ -107,7 +107,7 @@ export function createApp(config: AppConfig): App {
     try {
       if (job.kind === "anthropic.messages") {
         const headers = new Headers({ "content-type": "application/json" });
-        const url = `http://${config.host}:${config.port}/v1/messages`;
+        const url = `http://${formatHostForUrl(config.host)}:${config.port}/v1/messages`;
         const upstreamReq = new Request(url, {
           method: "POST",
           headers,
@@ -170,6 +170,9 @@ export function createApp(config: AppConfig): App {
     config.rateLimitRelayPostMax ?? 50,
     config.rateLimitRelayPostWindowMs ?? 60_000,
   );
+  // General request rate limiter for unauthenticated mode — prevents abuse
+  // when no API key is configured (auth rate limiters are bypassed in that case).
+  const generalRateLimiter = new KeyRateLimiter(100, 60_000);
 
   let shuttingDown = false;
   const bindHost = `${config.host}:${config.port}`;
@@ -281,6 +284,22 @@ export function createApp(config: AppConfig): App {
     let requestModel: string | undefined;
     let response: Response;
     try {
+      // General rate limit for unauthenticated mode
+      if (!config.apiKey) {
+        const ip = clientIp(request, config);
+        if (!generalRateLimiter.allow(ip)) {
+          response = openAIError(429, 'Too many requests', 'rate_limit_exceeded');
+          return finalizeResponse(
+            response,
+            requestId,
+            path,
+            request.method,
+            startedAt,
+            startedAtMs,
+            requestModel,
+          );
+        }
+      }
       if (request.method === "OPTIONS") {
         response = optionsResponse(request, config);
         return finalizeResponse(
@@ -346,6 +365,24 @@ export function createApp(config: AppConfig): App {
         );
       }
       if (request.method === "GET" && path === "/health") {
+        if (config.apiKey) {
+          const relayAuthError = authorizeRelay(
+            config,
+            request,
+            path,
+            authRateLimiter,
+          );
+          if (relayAuthError)
+            return finalizeResponse(
+              relayAuthError,
+              requestId,
+              path,
+              request.method,
+              startedAt,
+              startedAtMs,
+              requestModel,
+            );
+        }
         response = jsonResponse({ ok: true });
         return finalizeResponse(
           response,
@@ -655,18 +692,19 @@ export function createApp(config: AppConfig): App {
               response, requestId, path, request.method, startedAt, startedAtMs, requestModel,
             );
           }
-          // Cloud mode: resolve upstream overrides per model
-          let upstreamOverrides: { baseUrl?: string; authHeader?: string } | undefined;
+          // Cloud mode: resolve upstream overrides per model (thread-safe — passed as args, not config mutation)
+          let upstreamBaseUrlOverride: string | undefined;
+          let upstreamAuthHeaderOverride: string | undefined;
           if (isCloud && cloudRegistry && anthropicModel) {
-            upstreamOverrides = cloudRegistry.upstreamOptionsFor(anthropicModel);
-            if (upstreamOverrides) {
-              config.upstreamBaseUrl = upstreamOverrides.baseUrl!;
-              config.upstreamAuthHeader = upstreamOverrides.authHeader;
+            const overrides = cloudRegistry.upstreamOptionsFor(anthropicModel);
+            if (overrides) {
+              upstreamBaseUrlOverride = overrides.baseUrl;
+              upstreamAuthHeaderOverride = overrides.authHeader;
             }
           }
           if (isCloud) {
             response = await withMutex(
-              () => handleAnthropicMessages(config, request, externalSignal, lifecycle),
+              () => handleAnthropicMessages(config, request, externalSignal, lifecycle, upstreamBaseUrlOverride, upstreamAuthHeaderOverride),
               externalSignal,
             );
           } else {
@@ -675,7 +713,7 @@ export function createApp(config: AppConfig): App {
               () => withLifecycleForStreaming(
                 lifecycle,
                 anthropicModel,
-                () => handleAnthropicMessages(config, request, externalSignal, lifecycle),
+                () => handleAnthropicMessages(config, request, externalSignal, lifecycle, upstreamBaseUrlOverride, upstreamAuthHeaderOverride),
                 isStream,
                 "anthropic",
                 externalSignal,
@@ -772,20 +810,21 @@ export function createApp(config: AppConfig): App {
               response, requestId, path, request.method, startedAt, startedAtMs, requestModel,
             );
           }
-          // Cloud mode: resolve upstream overrides per model
-          let upstreamOverrides: { baseUrl?: string; authHeader?: string } | undefined;
+          // Cloud mode: resolve upstream overrides per model (thread-safe — passed as args, not config mutation)
+          let upstreamBaseUrlOverride: string | undefined;
+          let upstreamAuthHeaderOverride: string | undefined;
           if (isCloud && cloudRegistry && requestModel) {
-            upstreamOverrides = cloudRegistry.upstreamOptionsFor(requestModel);
-            if (upstreamOverrides) {
-              config.upstreamBaseUrl = upstreamOverrides.baseUrl!;
-              config.upstreamAuthHeader = upstreamOverrides.authHeader;
+            const overrides = cloudRegistry.upstreamOptionsFor(requestModel);
+            if (overrides) {
+              upstreamBaseUrlOverride = overrides.baseUrl;
+              upstreamAuthHeaderOverride = overrides.authHeader;
             }
           }
           const isStream = isObject(body) && body.stream === true;
           if (isCloud) {
             // Cloud mode: no lifecycle, call handler directly
             response = await withMutex(
-              () => createChatCompletion(config, store, body, externalSignal, lifecycle),
+              () => createChatCompletion(config, store, body, externalSignal, lifecycle, upstreamBaseUrlOverride, upstreamAuthHeaderOverride),
               externalSignal,
             );
           } else {
@@ -794,7 +833,7 @@ export function createApp(config: AppConfig): App {
               () => withLifecycleForStreaming(
                 lifecycle,
                 requestModel,
-                () => createChatCompletion(config, store, body, externalSignal, lifecycle),
+                () => createChatCompletion(config, store, body, externalSignal, lifecycle, upstreamBaseUrlOverride, upstreamAuthHeaderOverride),
                 isStream,
                 "openai_chat",
                 externalSignal,
@@ -868,19 +907,20 @@ export function createApp(config: AppConfig): App {
             upstream, requestId, path, request.method, startedAt, startedAtMs, requestModel,
           );
         }
-        // Cloud mode: resolve upstream overrides per model
-        let upstreamOverrides: { baseUrl?: string; authHeader?: string } | undefined;
+        // Cloud mode: resolve upstream overrides per model (thread-safe — passed as args, not config mutation)
+        let upstreamBaseUrlOverride: string | undefined;
+        let upstreamAuthHeaderOverride: string | undefined;
         if (isCloud && cloudRegistry && requestModel) {
-          upstreamOverrides = cloudRegistry.upstreamOptionsFor(requestModel);
-          if (upstreamOverrides) {
-            config.upstreamBaseUrl = upstreamOverrides.baseUrl!;
-            config.upstreamAuthHeader = upstreamOverrides.authHeader;
+          const overrides = cloudRegistry.upstreamOptionsFor(requestModel);
+          if (overrides) {
+            upstreamBaseUrlOverride = overrides.baseUrl;
+            upstreamAuthHeaderOverride = overrides.authHeader;
           }
         }
         const isStream = isObject(body) && body.stream === true;
         if (isCloud) {
           response = await withMutex(
-            () => createResponse(config, responseStore, body, externalSignal, lifecycle),
+            () => createResponse(config, responseStore, body, externalSignal, lifecycle, upstreamBaseUrlOverride, upstreamAuthHeaderOverride),
             externalSignal,
           );
         } else {
@@ -889,7 +929,7 @@ export function createApp(config: AppConfig): App {
               () => withLifecycleForStreaming(
                 lifecycle,
                 requestModel,
-                () => createResponse(config, responseStore, body, externalSignal, lifecycle),
+                () => createResponse(config, responseStore, body, externalSignal, lifecycle, upstreamBaseUrlOverride, upstreamAuthHeaderOverride),
                 isStream,
                 "openai_responses",
                 externalSignal,
@@ -1045,9 +1085,15 @@ export function createApp(config: AppConfig): App {
         : path;
       const cloudUrl = config.cloudFallbackUrl!.replace(/\/+$/, "") + (cloudPath.startsWith("/") ? cloudPath : "/" + cloudPath);
       logger.info("forwarding to cloud", { model: (body as any)?.model, cloudUrl, path });
+      // Forward auth header so the cloud fallback can authenticate the request.
+      const fwdHeaders: Record<string, string> = { "content-type": "application/json" };
+      const incomingAuth = request.headers.get('authorization');
+      if (incomingAuth) fwdHeaders['authorization'] = incomingAuth;
+      const incomingXKey = request.headers.get('x-api-key');
+      if (incomingXKey) fwdHeaders['x-api-key'] = incomingXKey;
       const upstream = await fetch(cloudUrl, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: fwdHeaders,
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(config.requestTimeoutMs),
       });
@@ -1062,7 +1108,15 @@ export function createApp(config: AppConfig): App {
           headers: plainHeaders,
         });
       }
-      const bodyText = await upstream.text();
+      // Read body with timeout — the fetch signal fires on headers, but body read can hang.
+      let bodyTimeoutId: ReturnType<typeof setTimeout> | undefined;
+      const bodyText = await Promise.race([
+        upstream.text(),
+        new Promise<string>((_, reject) => {
+          bodyTimeoutId = setTimeout(() => reject(new Error('Cloud forward body read timed out')), config.requestTimeoutMs);
+        }),
+      ]);
+      clearTimeout(bodyTimeoutId);
       return new Response(bodyText, {
         status: upstream.status,
         statusText: upstream.statusText,
@@ -1087,6 +1141,7 @@ export function createApp(config: AppConfig): App {
         currentResponse,
         currentRequestId,
         config,
+        undefined, // request available but not threaded through finalizeResponse params
       );
       await recordObservation(
         finalResponse.clone(),
@@ -1237,7 +1292,7 @@ export function createApp(config: AppConfig): App {
           });
           await writeWebResponse(
             res,
-            withRelayHeaders(errorResponse(error), requestId, config),
+            withRelayHeaders(errorResponse(error), requestId, config, undefined),
           );
         } finally {
           res.removeListener('close', onClose);
@@ -1246,7 +1301,7 @@ export function createApp(config: AppConfig): App {
       await new Promise<void>((resolve) =>
         server.listen(config.port, config.host, resolve),
       );
-      const url = `http://${config.host}:${config.port}`;
+      const url = `http://${formatHostForUrl(config.host)}:${config.port}`;
       logger.info("server started", { url });
 
       // Exposed so main.ts can close for graceful shutdown.
@@ -1266,7 +1321,16 @@ export function createApp(config: AppConfig): App {
 }
 
 const CORS_ALLOWED_HEADERS =
-  "authorization,content-type,x-api-key,x-request-id,anthropic-version,anthropic-beta";
+  "authorization,content-type,x-api-key,x-request-id,anthropic-version,anthropic-beta,session-id,session_id,x-session-affinity,x-client-request-id,idempotency-key";
+
+/** Wrap an IPv6 literal in brackets for URL construction.
+ *  IPv4 and hostnames are returned as-is. */
+function formatHostForUrl(host: string): string {
+  if (host.includes(':') && !host.startsWith('[')) {
+    return `[${host}]`;
+  }
+  return host;
+}
 
 function optionsResponse(request: Request, config: AppConfig): Response {
   const headers: Record<string, string> = {
@@ -1287,6 +1351,7 @@ function withRelayHeaders(
   response: Response,
   requestId: string,
   config: AppConfig,
+  request?: Request,
 ): Response {
   response.headers.set("x-request-id", requestId);
   response.headers.set("x-relay-request-id", requestId);
@@ -1294,6 +1359,17 @@ function withRelayHeaders(
   response.headers.set("x-content-type-options", "nosniff");
   response.headers.set("x-frame-options", "DENY");
   response.headers.set("referrer-policy", "no-referrer");
+  // Apply CORS origin to all responses, not just OPTIONS preflight.
+  if (config.corsOrigin) {
+    response.headers.set("access-control-allow-origin", config.corsOrigin);
+    // Reflect allowed headers when the client requests them (for preflight).
+    if (request) {
+      const reqHeaders = request.headers.get("access-control-request-headers");
+      if (reqHeaders) {
+        response.headers.set("access-control-allow-headers", CORS_ALLOWED_HEADERS);
+      }
+    }
+  }
   return response;
 }
 
@@ -1339,7 +1415,9 @@ function authorizeRelay(
   path: string,
   rateLimiter?: KeyRateLimiter,
 ): Response | undefined {
-  if (!config.apiKey || !path.startsWith("/relay/")) return undefined;
+  if (!config.apiKey) return undefined;
+  // Protect all /relay/* paths with auth. Also protect / and /health.
+  if (!path.startsWith("/relay/") && path !== "/" && path !== "/health") return undefined;
   const bearer = request.headers
     .get("authorization")
     ?.match(/^Bearer\s+(.+)$/i)?.[1];
@@ -1374,7 +1452,7 @@ async function readJson(
   const contentType = request.headers.get("content-type") ?? "";
   const mime = contentType.split(';')[0].trim();
   if (mime !== 'application/json') {
-    throw new GatewayError(400, "Content-Type must be application/json");
+    throw new GatewayError(400, `Content-Type must be application/json, got ${mime || '(empty)'}`);
   }
   const text = await request.text();
   try {
@@ -1390,6 +1468,17 @@ async function readJson(
     });
     return body;
   } catch {
+    // Log diagnostics even on parse failure for debugging truncated/malformed payloads.
+    logInboundDiagnostics(logger, {
+      route: path,
+      provider_format: detectProviderFormat(path),
+      content_length_header: request.headers.get("content-length"),
+      raw_body_bytes: parseHeaderInt(
+        request.headers.get("x-relay-internal-raw-body-bytes"),
+      ),
+      raw_body_first_bytes: text.slice(0, 200),
+      raw_body_last_bytes: text.slice(-200),
+    } as any);
     throw invalidJsonError();
   }
 }
@@ -1416,7 +1505,7 @@ async function nodeRequestToWebRequest(
   const headers = new Headers(req.headers as HeadersInit);
   headers.set("x-relay-internal-raw-body-bytes", String(totalBytes));
   headers.set("x-relay-internal-remote-address", req.socket?.remoteAddress ?? "unknown");
-  return new Request(`http://${config.host}:${config.port}${req.url ?? "/"}`, {
+  return new Request(`http://${formatHostForUrl(config.host)}:${config.port}${req.url ?? "/"}`, {
     method: req.method,
     headers,
     body,
@@ -1438,9 +1527,12 @@ function nodeHeaderValue(
 }
 
 function readRequestModel(body: unknown): string | undefined {
-  return isObject(body) && typeof body.model === "string"
-    ? body.model
-    : undefined;
+  if (!isObject(body) || typeof body.model !== 'string') return undefined;
+  // Cap model name length to prevent abuse via shell interpolation or URL construction.
+  if (body.model.length > 512) {
+    throw new GatewayError(400, 'Model name exceeds maximum length (512)', 'invalid_request_error', 'invalid_model');
+  }
+  return body.model;
 }
 
 function extractObservabilityFields(payload: any) {
@@ -1680,7 +1772,16 @@ async function withLifecycleForStreaming(
         },
       }, 503);
     }
+    // Hot path: model is already loaded.  But we must verify session isolation
+    // first — ensureModelAvailable checks session-id and restarts the model if
+    // the session changed (preventing cross-session KV-cache leaks).
     if (status.modelAvailable && status.state === 'running' && status.currentModel === modelName) {
+      const availability = await lifecycle.ensureModelAvailable(modelName, externalSignal, sessionId);
+      // If ensureModelAvailable restarted the model (session change), fall through
+      // to streamWithModelLoading so the client gets loading events.
+      if (!availability.ok || status.currentModel !== modelName || status.state !== 'running') {
+        return streamWithModelLoading(lifecycle, modelName, handler, protocol, externalSignal, sessionId);
+      }
       lifecycle.markJobStarted();
       const response = await handler();
       // Wrap the response body so markJobFinished/maybeShutdownWhenIdle
@@ -1728,9 +1829,11 @@ async function withLifecycleForStreaming(
     return streamWithModelLoading(lifecycle, modelName, handler, protocol, externalSignal, sessionId);
   }
 
-  // Non-streaming with lifecycle: ensure model is available first
+  // Non-streaming with lifecycle: ensure model is available first.
+  // Pass the caller abort signal so a disconnected client cancels an
+  // in-progress cold start (avoids wasting GPU time on orphaned starts).
   if (enabled && !isStream) {
-    const availability = await lifecycle.ensureModelAvailable(modelName, undefined, sessionId);
+    const availability = await lifecycle.ensureModelAvailable(modelName, externalSignal, sessionId);
     if (!availability.ok) {
       return jsonResponse({
         error: {

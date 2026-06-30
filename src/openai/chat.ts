@@ -138,13 +138,17 @@ export async function createChatCompletion(
   body: unknown,
   externalSignal?: AbortSignal,
   lifecycle?: ModelLifecycle,
+  upstreamBaseUrlOverride?: string,
+  upstreamAuthHeaderOverride?: string,
 ): Promise<Response> {
   const logger = createLogger(config.logLevel);
   if (!isObject(body)) throw invalidRequestError('JSON body must be an object');
-  // v2: resolve dynamic upstream URL based on model name
-  const upstreamBaseUrl = lifecycle && isObject(body) && typeof (body as any).model === 'string'
-    ? lifecycle.getUpstreamUrl((body as any).model)
-    : config.upstreamBaseUrl;
+  // Resolve upstream URL: explicit cloud override > lifecycle > config default.
+  const upstreamBaseUrl = upstreamBaseUrlOverride ?? (
+    lifecycle && isObject(body) && typeof (body as any).model === 'string'
+      ? lifecycle.getUpstreamUrl((body as any).model)
+      : config.upstreamBaseUrl
+  );
   const original = body;
   const { body: normalized, strippedFields } = normalizeChatRequest(original, config);
 
@@ -168,15 +172,15 @@ export async function createChatCompletion(
     payload: normalized,
   });
 
-  if (normalized.stream === true) return withFieldWarning(await streamChatCompletion(config, normalized, upstreamBaseUrl, externalSignal), strippedFields, config);
+  if (normalized.stream === true) return withFieldWarning(await streamChatCompletion(config, normalized, upstreamBaseUrl, upstreamAuthHeaderOverride, externalSignal), strippedFields, config);
 
   const upstreamRes = await upstreamFetch(config, '/v1/chat/completions', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(normalized),
-  }, externalSignal, upstreamBaseUrl);
-  if (!upstreamRes.response.ok) throw await upstreamHttpError(upstreamRes.response, config);
-  const upstreamText = await readLimitedText(upstreamRes.response, config.maxUpstreamResponseBytes);
+  }, externalSignal, upstreamBaseUrl, upstreamAuthHeaderOverride);
+  if (!upstreamRes.response.ok) throw await upstreamHttpError(upstreamRes.response, config, externalSignal);
+  const upstreamText = await readLimitedText(upstreamRes.response, config.maxUpstreamResponseBytes, externalSignal, config.requestTimeoutMs);
   const upstreamBytes = Buffer.byteLength(upstreamText);
   let upstream: unknown;
   try {
@@ -288,7 +292,7 @@ function normalizeChatRequest(input: JsonObject, config: AppConfig): { body: Jso
   return { body: upstreamBody, strippedFields };
 }
 
-async function streamChatCompletion(config: AppConfig, body: JsonObject, upstreamBaseUrl: string, externalSignal?: AbortSignal): Promise<Response> {
+async function streamChatCompletion(config: AppConfig, body: JsonObject, upstreamBaseUrl: string, upstreamAuthHeaderOverride?: string, externalSignal?: AbortSignal): Promise<Response> {
   const logger = createLogger(config.logLevel);
   const includeUsage = isObject(body.stream_options) && body.stream_options.include_usage === true;
   const upstream = await upstreamFetch(config, '/v1/chat/completions', {
@@ -298,7 +302,7 @@ async function streamChatCompletion(config: AppConfig, body: JsonObject, upstrea
       'content-type': 'application/json',
     },
     body: JSON.stringify(body),
-  }, externalSignal, upstreamBaseUrl);
+  }, externalSignal, upstreamBaseUrl, upstreamAuthHeaderOverride);
   if (!upstream.response.ok) {
     throw await upstreamHttpError(upstream.response, config);
   }

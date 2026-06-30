@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 
 import { createApp } from '../src/server.ts';
@@ -122,6 +125,43 @@ test('GET /v1/models passes through upstream model list', async () => {
 
     assert.equal(res.status, 200);
     assert.equal((await res.json()).data[0].id, 'llama');
+  });
+});
+
+test('GET /v1/models hides deleted local model map entries', async () => {
+  await withUpstream(async (upstream) => {
+    const tmp = mkdtempSync(join(tmpdir(), 'relay-models-'));
+    const oldModelDir = process.env.RELAY_MODEL_DIR;
+    try {
+      const modelsDir = join(tmp, 'models');
+      const scriptsDir = join(tmp, 'scripts');
+      mkdirSync(modelsDir);
+      mkdirSync(scriptsDir);
+      const presentModel = join(modelsDir, 'present.gguf');
+      const presentScript = join(scriptsDir, 'start-present.sh');
+      const missingScript = join(scriptsDir, 'start-missing.sh');
+      writeFileSync(presentModel, 'gguf');
+      writeFileSync(presentScript, `#!/usr/bin/env bash\nMODEL='${presentModel}'\n`);
+      writeFileSync(missingScript, `#!/usr/bin/env bash\nMODEL='${join(modelsDir, 'deleted.gguf')}'\n`);
+      process.env.RELAY_MODEL_DIR = modelsDir;
+
+      const cfg = testConfig(upstream.url);
+      cfg.modelEntries = {
+        present: { cmd: presentScript, ctx_size: 12345 },
+        missing: { cmd: missingScript, ctx_size: 12345 },
+      };
+      const app = createApp(cfg);
+
+      const list = await (await app.fetch('/v1/models')).json();
+      assert.deepEqual(list.data.map((m: any) => m.id), ['present']);
+
+      const missing = await app.fetch('/v1/models/missing');
+      assert.equal(missing.status, 404);
+    } finally {
+      if (oldModelDir === undefined) delete process.env.RELAY_MODEL_DIR;
+      else process.env.RELAY_MODEL_DIR = oldModelDir;
+      rmSync(tmp, { recursive: true, force: true });
+    }
   });
 });
 

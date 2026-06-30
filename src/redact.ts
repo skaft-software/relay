@@ -6,10 +6,11 @@ export function redactForLogs<T>(value: T): T {
 
 export function redactText(value: string): string {
   return value
-    .replace(/\bBearer\s+([A-Za-z0-9._~+/=-]+)/gi, 'Bearer [REDACTED]')
+    .replace(/\bBearer\s+([A-Za-z0-9._~+/=\-]+)/gi, 'Bearer [REDACTED]')
+    .replace(/\b(?:sk|sq|sg|sk-ant|dsk)-[A-Za-z0-9._~+/=\-]{16,}/g, '[API_KEY]')
     .replace(/(cf-access-client-id\s*[:=]\s*)([^\s,;]+)/gi, `$1${REDACTED}`)
     .replace(/(cf-access-client-secret\s*[:=]\s*)([^\s,;]+)/gi, `$1${REDACTED}`)
-    .replace(/((?:openai|anthropic|relay)?_?api_?key\s*[:=]\s*)([^\s,;]+)/gi, `$1${REDACTED}`)
+    .replace(/((?:openai|anthropic|deepseek|groq|gemini|relay)?_?api_?key\s*[:=]\s*)([^\s,;]+)/gi, `$1${REDACTED}`)
     .replace(/(cookie\s*[:=]\s*)([^\n]+)/gi, `$1${REDACTED}`)
     .replace(/(\/(?:[\w.-]+\/)+[\w.-]{3,})/g, '[PATH]');
 }

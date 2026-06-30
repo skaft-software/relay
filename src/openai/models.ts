@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 import type { AppConfig, ModelEntry } from '../config.ts';
@@ -42,18 +42,24 @@ export function discoverModels(config: AppConfig): Array<{
     ggufPath?: string;
   }> = new Map();
 
-  // First pass: static entries (always shown, even if file is missing)
+  // First pass: static entries. They are provisioned, but only advertised when
+  // the GGUF is still on disk. This keeps /v1/models honest after a user deletes
+  // a model file without regenerating RELAY_MODEL_MAP.
   if (config.modelEntries) {
     for (const [id, entry] of Object.entries(config.modelEntries)) {
       const catEntry = catalogById.get(id) ??
         (entry.cmd ? catalogByFilename.get(basenameOf(entry.cmd).toLowerCase()) : undefined);
-      // Check if the model file exists on disk
+      const scriptModelPath = modelPathFromStartCommand(entry.cmd);
       let ggufPath: string | undefined;
-      for (const g of onDisk) {
-        if (g.name.toLowerCase() === (catEntry?.filename ?? '').toLowerCase() ||
-            g.name.toLowerCase().replace(/[^a-z0-9]/g, '').includes(id.toLowerCase().replace(/[^a-z0-9]/g, ''))) {
-          ggufPath = g.path;
-          break;
+      if (scriptModelPath && existsSync(scriptModelPath)) {
+        ggufPath = scriptModelPath;
+      } else if (!scriptModelPath) {
+        for (const g of onDisk) {
+          if (g.name.toLowerCase() === (catEntry?.filename ?? '').toLowerCase() ||
+              g.name.toLowerCase().replace(/[^a-z0-9]/g, '').includes(id.toLowerCase().replace(/[^a-z0-9]/g, ''))) {
+            ggufPath = g.path;
+            break;
+          }
         }
       }
       result.set(id, { id: entry.name ?? id, entry, catalogEntry: catEntry, onDisk: Boolean(ggufPath), ggufPath });
@@ -99,14 +105,25 @@ function basenameOf(p: string): string {
   return parts[parts.length - 1] ?? p;
 }
 
+function modelPathFromStartCommand(cmd: string): string | undefined {
+  if (!existsSync(cmd)) return undefined;
+  try {
+    const script = readFileSync(cmd, 'utf8');
+    const match = /^\s*(?:MODEL|MODEL_PATH)=(?:'([^']+)'|"([^"]+)"|([^\s#]+))/m.exec(script);
+    return match?.[1] ?? match?.[2] ?? match?.[3];
+  } catch {
+    return undefined;
+  }
+}
+
 export async function handleModels(config: AppConfig, model?: string, externalSignal?: AbortSignal): Promise<Response> {
   // When modelEntries is configured (gateway mode), merge static map with on-disk discovery.
   if (config.modelEntries) {
     const discovered = discoverModels(config);
-    // Only advertise models that have a static entry (went through setup and have
-    // a launch command). On-disk GGUFs matched from the catalog but not yet
-    // provisioned are excluded — they have no start script and will fail at runtime.
-    const provisioned = discovered.filter((d) => d.entry != null);
+    // Only advertise models that have a static entry and whose GGUF is still on
+    // disk. On-disk GGUFs matched from the catalog but not yet provisioned are
+    // excluded — they have no start script and will fail at runtime.
+    const provisioned = discovered.filter((d) => d.entry != null && d.onDisk);
     const allModels = provisioned.map((d) => {
       const entry = d.entry;
       const cat = d.catalogEntry;

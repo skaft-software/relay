@@ -109,12 +109,37 @@ export class LlmJobQueue {
     for (const [key, entry] of this.idempotencyKeys) {
       if (now - entry.createdAt > this.idempotencyTtlMs) this.idempotencyKeys.delete(key);
     }
+    // Hard cap to prevent unbounded memory growth from idempotency key churn.
+    if (this.idempotencyKeys.size > 10_000) {
+      const entries = [...this.idempotencyKeys.entries()].sort((a, b) => a[1].createdAt - b[1].createdAt);
+      for (const [key] of entries.slice(0, entries.length - 5000)) {
+        this.idempotencyKeys.delete(key);
+      }
+    }
   }
 
   submit(input: LlmJobRequest): LlmJobSnapshot {
-    if (!input || typeof input !== 'object') throw new Error('job body must be an object');
-    if (!input.request || typeof input.request !== 'object')
-      throw new Error('job.request must be an object');
+    if (!input || typeof input !== 'object') {
+      const err: any = new Error('job body must be an object');
+      err.status = 400;
+      err.type = 'invalid_request_error';
+      throw err;
+    }
+    if (!input.request || typeof input.request !== 'object') {
+      const err: any = new Error('job.request must be an object');
+      err.status = 400;
+      err.type = 'invalid_request_error';
+      throw err;
+    }
+    // Reject excessively large job payloads (default 1 MiB) to prevent memory exhaustion.
+    const bodyBytes = Buffer.byteLength(JSON.stringify(input.request));
+    if (bodyBytes > 1_048_576) {
+      const err: any = new Error(`job.request exceeds maximum size of 1 MiB (${Math.round(bodyBytes / 1024)} KiB)`);
+      err.status = 413;
+      err.type = 'invalid_request_error';
+      err.code = 'request_too_large';
+      throw err;
+    }
     const id = input.id || crypto.randomUUID();
     const kind: LlmJobKind = input.kind ?? 'openai.chat';
     const job: JobRecord = {

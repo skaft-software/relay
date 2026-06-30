@@ -14,7 +14,14 @@ import { detectProviderFormat, logInboundDiagnostics, logStreamingResponseDiagno
 
 type JsonObject = Record<string, any>;
 
-export async function handleAnthropicMessages(config: AppConfig, request: Request, externalSignal?: AbortSignal, lifecycle?: ModelLifecycle): Promise<Response> {
+export async function handleAnthropicMessages(
+  config: AppConfig,
+  request: Request,
+  externalSignal?: AbortSignal,
+  lifecycle?: ModelLifecycle,
+  upstreamBaseUrlOverride?: string,
+  upstreamAuthHeaderOverride?: string,
+): Promise<Response> {
   const logger = createLogger(config.logLevel);
   try {
     authorizeAnthropic(config, request);
@@ -23,24 +30,23 @@ export async function handleAnthropicMessages(config: AppConfig, request: Reques
     const chatRequest = anthropicRequestToChat(body, config);
     logUpstreamPayloadDiagnostics(logger, { route: '/v1/messages', upstream_route: '/v1/chat/completions', payload: chatRequest });
 
-    // Ensure lifecycle model is available before proxying upstream.
-    // Only when lifecycle is enabled AND has model entries to manage.
-    const modelName = isObject(body) && typeof (body as any).model === 'string' ? (body as any).model : undefined;
-    let upstreamBaseUrlOverride: string | undefined;
-    if (lifecycle && modelName && config.lazyModelEnabled && config.modelEntries) {
-      const availability = await lifecycle.ensureModelAvailable(modelName, externalSignal);
-      if (!availability.ok) throw upstreamError('unavailable', availability.message ?? 'Model unavailable');
-      upstreamBaseUrlOverride = lifecycle.getUpstreamUrl(modelName);
-    }
+    // Resolve upstream URL override: explicit cloud override > lifecycle > config default.
+    const resolvedBaseUrl = upstreamBaseUrlOverride ?? (() => {
+      const modelName = isObject(body) && typeof (body as any).model === 'string' ? (body as any).model : undefined;
+      if (lifecycle && modelName && config.lazyModelEnabled && config.modelEntries) {
+        return lifecycle.getUpstreamUrl(modelName);
+      }
+      return undefined;
+    })();
 
-    if (body.stream === true) return withFieldWarning(await streamAnthropicMessage(config, chatRequest, externalSignal, upstreamBaseUrlOverride), strippedFields, config);
+    if (body.stream === true) return withFieldWarning(await streamAnthropicMessage(config, chatRequest, externalSignal, resolvedBaseUrl, upstreamAuthHeaderOverride), strippedFields, config);
     const upstreamRes = await upstreamFetch(config, '/v1/chat/completions', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(chatRequest),
-    }, externalSignal, upstreamBaseUrlOverride);
-    if (!upstreamRes.response.ok) throw await upstreamHttpError(upstreamRes.response, config);
-    const upstreamText = await readLimitedText(upstreamRes.response, config.maxUpstreamResponseBytes);
+    }, externalSignal, resolvedBaseUrl, upstreamAuthHeaderOverride);
+    if (!upstreamRes.response.ok) throw await upstreamHttpError(upstreamRes.response, config, externalSignal);
+    const upstreamText = await readLimitedText(upstreamRes.response, config.maxUpstreamResponseBytes, externalSignal, config.requestTimeoutMs);
     let chat: unknown;
     try {
       chat = JSON.parse(upstreamText);
@@ -234,13 +240,13 @@ function chatCompletionToAnthropicMessage(chat: unknown, requestedModel: unknown
   return canonicalToAnthropicMessage(canonical);
 }
 
-async function streamAnthropicMessage(config: AppConfig, chatRequest: JsonObject, externalSignal?: AbortSignal, upstreamBaseUrlOverride?: string): Promise<Response> {
+async function streamAnthropicMessage(config: AppConfig, chatRequest: JsonObject, externalSignal?: AbortSignal, upstreamBaseUrlOverride?: string, upstreamAuthHeaderOverride?: string): Promise<Response> {
   const logger = createLogger(config.logLevel);
   const upstream = await upstreamFetch(config, '/v1/chat/completions', {
     method: 'POST',
     headers: { accept: 'text/event-stream', 'content-type': 'application/json' },
     body: JSON.stringify(chatRequest),
-  }, externalSignal, upstreamBaseUrlOverride);
+  }, externalSignal, upstreamBaseUrlOverride, upstreamAuthHeaderOverride);
   if (!upstream.response.ok || !upstream.response.body) {
     throw upstream.response.body ? await upstreamHttpError(upstream.response, config) : upstreamError('bad_response', 'Upstream returned an empty stream');
   }

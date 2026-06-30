@@ -9,6 +9,7 @@ import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { packageDir, envFilePath, startScriptsDir, ensureDataDir } from './paths.ts';
 import { sizeModel, buildLaunchFlags, GB, KV_QUANT_RATIO, type FitStrategy, type SizedMode, type SizeResult } from './sizing/size-model.ts';
+import { parseListDevices, gpuVendor, planGpuPlacement, gpuLaunchFlags, type GpuInfo, type Hardware } from './provision.ts';
 export type { FitStrategy };
 
 // ── Types ───────────────────────────────────────────────────────────────
@@ -45,8 +46,11 @@ export type EnvMap = Map<string, string>;
 export type GpuProbe = {
   gpu_type: string;
   driver: string;
+  /** Aggregate VRAM across selected usable devices. Legacy single-GPU callers still see one card's VRAM. */
   vram_total_gb: number;
   vram_free_gb: number;
+  /** llama.cpp device handles from --list-devices, e.g. CUDA0/Vulkan1/Metal0. */
+  devices?: Array<{ index: number; device: string; name: string; vram_gb: number; free_vram_gb?: number }>;
 };
 
 export type FitClass = 'full-gpu' | 'partial-offload' | 'too-large' | 'unknown';
@@ -220,7 +224,47 @@ function extractRepoFromUrl(url: string): string | null {
 
 // ── GPU probing ─────────────────────────────────────────────────────────
 
-export function probeGpu(): GpuProbe | undefined {
+function driverForDevice(device: string): string {
+  const d = device.toLowerCase();
+  if (d.startsWith('cuda')) return 'cuda';
+  if (d.startsWith('vulkan')) return 'vulkan';
+  if (d.startsWith('rocm') || d.startsWith('hip')) return 'hip';
+  if (d.startsWith('metal') || d.startsWith('mtl')) return 'metal';
+  return 'unknown';
+}
+
+function probeFromGpus(gpus: GpuInfo[]): GpuProbe | undefined {
+  if (!gpus.length) return undefined;
+  const vendor = gpuVendor(gpus[0]!.device, gpus[0]!.name);
+  const total = gpus.reduce((sum, g) => sum + g.vramGb, 0);
+  const free = gpus.every((g) => typeof g.freeVramGb === 'number')
+    ? gpus.reduce((sum, g) => sum + (g.freeVramGb ?? 0), 0)
+    : total;
+  return {
+    gpu_type: vendor,
+    driver: driverForDevice(gpus[0]!.device),
+    vram_total_gb: total,
+    vram_free_gb: free,
+    devices: gpus.map((g) => ({
+      index: g.index,
+      device: g.device,
+      name: g.name,
+      vram_gb: g.vramGb,
+      ...(typeof g.freeVramGb === 'number' ? { free_vram_gb: g.freeVramGb } : {}),
+    })),
+  };
+}
+
+export function probeGpu(llamaServerPath?: string): GpuProbe | undefined {
+  const server = llamaServerPath ?? detectLlamaServerPath();
+  if (server && existsSync(server)) {
+    try {
+      const raw = execFileSync(server, ['--list-devices'], { cwd: PKG, encoding: 'utf8', timeout: 8000, stdio: ['ignore', 'pipe', 'ignore'] });
+      const parsed = probeFromGpus(parseListDevices(raw));
+      if (parsed) return parsed;
+    } catch { /* fall back to shell probe */ }
+  }
+
   if (!existsSync(PROBE_GPU_PATH)) return undefined;
   try {
     const raw = execFileSync('bash', [PROBE_GPU_PATH], { cwd: PKG, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
@@ -232,6 +276,54 @@ export function probeGpu(): GpuProbe | undefined {
   }
 }
 
+function hardwareFromProbe(gpu: GpuProbe, ramGb = SYSTEM_RAM_GB): Hardware {
+  const vendor = (gpu.gpu_type === 'nvidia' || gpu.gpu_type === 'amd' || gpu.gpu_type === 'apple') ? gpu.gpu_type : 'none';
+  const devices: GpuInfo[] = gpu.devices?.length
+    ? gpu.devices.map((g) => ({
+      index: g.index,
+      device: g.device,
+      name: g.name,
+      vramGb: g.vram_gb,
+      ...(typeof g.free_vram_gb === 'number' ? { freeVramGb: g.free_vram_gb } : {}),
+    }))
+    : (gpu.vram_total_gb > 0 ? [{ index: 0, device: driverForDevice(gpu.driver) === 'cuda' ? 'CUDA0' : driverForDevice(gpu.driver) === 'metal' ? 'Metal0' : 'Vulkan0', name: gpu.gpu_type, vramGb: gpu.vram_total_gb }] : []);
+  const maxGpuVramGb = devices.length ? Math.max(...devices.map((g) => g.vramGb)) : 0;
+  const totalGpuVramGb = devices.reduce((sum, g) => sum + g.vramGb, 0);
+  return {
+    vendor,
+    gpuName: devices[0]?.name,
+    vramGb: devices.length ? maxGpuVramGb : gpu.vram_total_gb,
+    ramGb,
+    gpus: devices,
+    gpuCount: devices.length,
+    maxGpuVramGb,
+    totalGpuVramGb,
+  };
+}
+
+export function effectiveGpuVramGb(gpu: GpuProbe): number {
+  const hw = hardwareFromProbe(gpu);
+  return planGpuPlacement(hw)?.effectiveVramGb ?? gpu.vram_total_gb;
+}
+
+export function gpuPlacementLaunchFlags(gpu: GpuProbe): string[] {
+  const placement = planGpuPlacement(hardwareFromProbe(gpu));
+  if (!placement) return [];
+  return gpuLaunchFlags(placement.config).flat();
+}
+
+export function formatGpuProbe(gpu: GpuProbe): string {
+  const hw = hardwareFromProbe(gpu);
+  if (hw.gpuCount > 1) {
+    const effective = effectiveGpuVramGb(gpu);
+    const vrams = hw.gpus.map((g) => g.vramGb);
+    const uniform = vrams.every((v) => v === vrams[0]);
+    const perCard = uniform ? `${vrams[0]}GB each` : vrams.map((v) => `${v}GB`).join(' + ');
+    return `${hw.gpuCount} GPUs · ${perCard} · ${hw.totalGpuVramGb}GB total VRAM · ${effective}GB Relay split budget`;
+  }
+  return `${gpu.vram_total_gb}GB VRAM (${Math.max(0, gpu.vram_total_gb - 2).toFixed(1)}GB usable)`;
+}
+
 export function classifyFit(model: CatalogEntry, gpu: GpuProbe): FitClass {
   return classifyFitFromCatalog(model, gpu);
 }
@@ -241,7 +333,7 @@ export function classifyFit(model: CatalogEntry, gpu: GpuProbe): FitClass {
 export function classifyFitFromCatalog(model: CatalogEntry, gpu: GpuProbe): FitClass {
   const estimate = model.size_gb;
   if (!estimate || !gpu.vram_total_gb) return 'unknown';
-  const gpuBudget = Math.max(0, gpu.vram_total_gb - 2);
+  const gpuBudget = Math.max(0, effectiveGpuVramGb(gpu) - 2);
   const ramBudget = Math.max(0, SYSTEM_RAM_GB - 8);
 
   // Full GPU fit (dense or small MoE) — whole file fits
@@ -533,7 +625,7 @@ export function estimateContextFromCatalog(
   backend?: FitBackend,
 ): CatalogFitEstimate {
   const sizeGb = model.size_gb;
-  const tvram = gpu.vram_total_gb;
+  const tvram = effectiveGpuVramGb(gpu);
   if (!sizeGb || !tvram) return {
     fit: 'unknown', maxCtx: 0, expertStrategy: 'none', ctxLabel: '?',
     provenance: 'calc', ramTight: false, strategy: 'full-gpu',
@@ -582,10 +674,14 @@ export function estimateContextFromCatalog(
     }
 
     // Balanced: best of full-GPU (Q8 preferred) and cpu-moe (Q4)
+    // Balanced: best of full-GPU (Q8 preferred) and cpu-moe (Q4)
     const fgQ8 = tryMode(sizeGb, 'q8_0', 'full-gpu');
     const fgQ4 = tryMode(sizeGb, 'q4_0', 'full-gpu');
-    const moeQ8 = nonexGb <= usableVram && expertGb <= usableDram + usableVram ? tryMode(nonexGb, 'q8_0', 'moe-cpu') : null;
-    const moeQ4 = nonexGb <= usableVram && expertGb <= usableDram + usableVram ? tryMode(nonexGb, 'q4_0', 'moe-cpu') : null;
+    // Expert offload MUST fit in DRAM only (not DRAM+VRAM).  VRAM is the GPU
+    // budget for non-expert weights + KV + compute buffers — it is NOT a
+    // secondary RAM for CPU-resident experts.
+    const moeQ8 = nonexGb <= usableVram && expertGb <= usableDram ? tryMode(nonexGb, 'q8_0', 'moe-cpu') : null;
+    const moeQ4 = nonexGb <= usableVram && expertGb <= usableDram ? tryMode(nonexGb, 'q4_0', 'moe-cpu') : null;
 
     // Balanced: pick the config with the most context (minimizing offload tiebreaks on ctx).
     const balCands = [fgQ8, fgQ4, moeQ8, moeQ4].filter((c): c is ModeEstimate => c !== null);
@@ -753,9 +849,13 @@ export function detectAvailableRamGb(): number {
 export function detectLlamaServerPath(): string {
   const candidates = [
     process.env.RELAY_LLAMA_SERVER_PATH,
-    '/usr/local/bin/llama-server',
     resolveHome('~/llama.cpp/build/bin/llama-server'),
+    resolveHome('~/llama.cpp/build-cuda/bin/llama-server'),
     resolveHome('~/llama.cpp/build-vulkan/bin/llama-server'),
+    resolveHome('~/llama.cpp/build-rocm/bin/llama-server'),
+    resolveHome('~/llama.cpp/build-metal/bin/llama-server'),
+    '/usr/local/bin/llama-server',
+    commandPath('llama-server'),
   ].filter(Boolean) as string[];
   for (const candidate of candidates) {
     if (existsSync(candidate)) return candidate;
@@ -848,10 +948,16 @@ export function generateStartScript(input: {
    *  so without baking it in here the experts would never be offloaded at runtime
    *  (the lifecycle execs this script verbatim with only LLAMA_PORT injected). */
   expertFlag?: string;
+  /** Whether this model emits <think> reasoning blocks. For thinking models,
+   *  llama.cpp should extract those blocks into OpenAI-compatible
+   *  reasoning_content, matching the upstream HF serving recipe's reasoning
+   *  parser behavior. */
+  thinking?: 'off' | 'on' | 'toggle';
 }): string {
   mkdirSync(START_SCRIPTS_DIR, { recursive: true });
   const scriptPath = resolve(START_SCRIPTS_DIR, `start-${input.modelId}.sh`);
   const maybeVisionComment = input.multimodal ? '# Vision model: add --mmproj /path/to/mmproj.gguf before first real use.\n' : '';
+  const isThinkingModel = input.thinking === 'on' || input.thinking === 'toggle';
 
   let flagsBlock: string;
   if (input.launchFlags && input.launchFlags.length > 0) {
@@ -875,6 +981,11 @@ export function generateStartScript(input: {
         i += 1;
       }
     }
+    if (isThinkingModel) {
+      const present = new Set(input.launchFlags);
+      if (!present.has('--reasoning-format')) lines.push('  --reasoning-format deepseek \\');
+      if (!present.has('--reasoning')) lines.push('  --reasoning on \\');
+    }
     // Bake in the MoE expert-offload flag (sizer returns it separately).
     if (input.expertFlag && !input.launchFlags.some((f) => f === '--cpu-moe' || f === '--n-cpu-moe')) {
       lines.push(`  ${input.expertFlag} \\`);
@@ -885,6 +996,9 @@ export function generateStartScript(input: {
     const maybeMoEComment = input.fit === 'partial-offload'
       ? '# Relay: after downloading, run \'relay provision --apply\' or re-run setup to tune flags\n'
       : '';
+    const reasoningFallback = isThinkingModel
+      ? ' \\\n  --reasoning-format deepseek \\\n  --reasoning on'
+      : '';
     flagsBlock = `${maybeMoEComment}  --model "$MODEL" \\
   --host 127.0.0.1 \\
   --port "$LLAMA_PORT" \\
@@ -894,7 +1008,7 @@ export function generateStartScript(input: {
   --flash-attn on \\
   --cache-type-k q4_0 \\
   --cache-type-v q4_0 \\
-  --jinja`;
+  --jinja${reasoningFallback}`;
   }
 
   const script = `#!/usr/bin/env bash
@@ -949,17 +1063,22 @@ export type SizeModelResult = {
   modes: SizeResult['modes'];
 };
 
-/** Call the TS sizing engine against a downloaded GGUF. Returns null on failure. */
+/** Call the TS sizing engine against a downloaded GGUF. Returns null on failure.
+ *
+ *  The kvCacheQuant param is only used as a fallback for backward-compat launch
+ *  flags returned in the SizeModelResult.  The modes themselves always carry
+ *  their own kvCacheQuant — callers MUST use the selected mode's kvCacheQuant
+ *  when generating final launch flags (configureQuickstart does this).
+ */
 export function sizeModelTS(ggufPath: string, vramGb: number, dramGb: number, kvCacheQuant: 'q4_0' | 'q8_0' = 'q4_0'): SizeModelResult | null {
   try {
     const { result } = sizeModel(ggufPath, Math.trunc(vramGb * GB), Math.trunc(dramGb * GB));
     if (!result.ok) return null;
-    const cacheType = kvCacheQuant;
-    // Build launch flags from balanced mode (the backward-compat default).
-    // configureQuickstart overrides these per-selected mode later.
+    // Build backward-compat launch flags from balanced mode using the caller's
+    // requested cacheType (used only by legacy callers that pre-choose a quant).
     const balMode = result.modes.balanced;
     const { launchFlags, expertFlag } = balMode
-      ? buildLaunchFlags(balMode, { cacheType })
+      ? buildLaunchFlags(balMode, { gpuLayers: balMode.gpuLayers })
       : { launchFlags: [] as string[], expertFlag: '' };
     return {
       maxCtx: result.bestCtx,
@@ -968,7 +1087,7 @@ export function sizeModelTS(ggufPath: string, vramGb: number, dramGb: number, kv
       cpuMoeLayers: result.cpuMoeLayers,
       headroomPct: Math.round(result.headroomPct * 100) / 100,
       kvGb: Math.round(result.kvGb * 10000) / 10000,
-      cacheType,
+      cacheType: balMode?.kvCacheQuant ?? kvCacheQuant,
       modes: result.modes,
     };
   } catch {
@@ -987,33 +1106,41 @@ export function configureQuickstart(
   gpu?: GpuProbe,
 ): void {
   const sizingMode = ((env.get('RELAY_SIZING_MODE') ?? 'balanced') === 'capacity' ? 'capacity' : (env.get('RELAY_SIZING_MODE') ?? 'balanced') === 'speed' ? 'speed' : 'balanced') as 'speed' | 'balanced' | 'capacity';
-  // Default to q8_0 for better context accuracy and reduced hallucination; use q4_0 only if explicitly requested.
-  const kvCacheType = (env.get('RELAY_KV_CACHE_TYPE') ?? 'q8_0') === 'q4_0' ? 'q4_0' as const : 'q8_0' as const;
   const modelEntries: Record<string, { cmd: string; ctx_size: number; multimodal: boolean; thinking_levels?: string[]; expert_flag?: string; kv_cache_type?: string; sizing_mode?: string; provenance?: string; strategy?: string }> = {};
   const defaultModel = selections[0]!;
+
+  // Track the default model's configured ctx so UPSTREAM_CTX_SIZE matches.
+  let defaultCtxSize: number | undefined;
+
   for (const model of selections) {
     const modelPath = modelPaths.get(model.id)!;
     let ctxSize = recommendedContext(model, gpu);
     let launchFlags: string[] | undefined;
     let expertFlag: string | undefined;
+    // The actual kvCacheQuant from the selected sizing mode (not the env default).
+    let modeCacheType: string | undefined;
 
     // If the GGUF is on disk, use the real TS sizing engine for optimal flags
     let tuned: SizeModelResult | null = null;
     if (existsSync(modelPath)) {
-      const vramGb = gpu?.vram_total_gb ?? 0;
+      const vramGb = gpu ? effectiveGpuVramGb(gpu) : 0;
       const dramGb = Math.max(0, detectAvailableRamGb() - reservesFor(detectHostProfile()).ramReserveGb);
-      tuned = sizeModelTS(modelPath, vramGb, dramGb, kvCacheType);
+      tuned = sizeModelTS(modelPath, vramGb, dramGb);
       if (tuned) {
-        // Use selected mode's ctx, falling back to balanced
+        // Use selected mode's ctx, falling back to balanced.
         const selMode = tuned.modes[sizingMode] ?? tuned.modes.balanced;
         ctxSize = selMode?.ctx ?? tuned.maxCtx;
-        // Build launch flags from the selected mode so --ctx-size and --n-cpu-moe
-        // match the chosen strategy (speed → full-GPU, capacity → --cpu-moe).
+        modeCacheType = selMode?.kvCacheQuant;
+
+        // Build launch flags ONCE from the selected mode — using its OWN
+        // kvCacheQuant.  No env-default override is passed.
         launchFlags = selMode
-          ? buildLaunchFlags(selMode, { cacheType: kvCacheType }).launchFlags
+          ? buildLaunchFlags(selMode, { gpuLayers: selMode.gpuLayers }).launchFlags
           : tuned.launchFlags;
+        const placementFlags = gpu ? gpuPlacementLaunchFlags(gpu) : [];
+        if (placementFlags.length) launchFlags = [...launchFlags, ...placementFlags];
         expertFlag = selMode
-          ? buildLaunchFlags(selMode, { cacheType: kvCacheType }).expertFlag
+          ? buildLaunchFlags(selMode, { gpuLayers: selMode.gpuLayers }).expertFlag
           : tuned.expertFlag;
       }
     }
@@ -1028,7 +1155,12 @@ export function configureQuickstart(
       fit: gpu ? classifyFit(model, gpu) : 'unknown',
       launchFlags,
       expertFlag,
+      thinking: model.thinking,
     });
+
+    // Track the default model's final ctx for UPSTREAM_CTX_SIZE.
+    if (model.id === defaultModel.id) defaultCtxSize = ctxSize;
+
     const entry: Record<string, unknown> = {
       cmd: scriptPath,
       ctx_size: ctxSize,
@@ -1037,12 +1169,13 @@ export function configureQuickstart(
       ...(model.thinking === 'toggle' ? { thinking_levels: ['on', 'off'] } : {}),
     };
     if (expertFlag) entry.expert_flag = expertFlag;
-    entry.kv_cache_type = kvCacheType;
+    // Use the actual launched mode's kvCacheQuant, not the env default.
+    entry.kv_cache_type = modeCacheType ?? tuned?.cacheType;
     entry.sizing_mode = sizingMode;
     entry.provenance = 'estimated';
     if (tuned) {
-      const bal = tuned.modes.balanced;
-      if (bal) entry.strategy = bal.strategy;
+      const selected = tuned.modes[sizingMode] ?? tuned.modes.balanced;
+      if (selected) entry.strategy = selected.strategy;
     }
     modelEntries[model.id] = entry as typeof modelEntries[string];
   }
@@ -1051,7 +1184,9 @@ export function configureQuickstart(
   env.set('RELAY_MODEL_LIFECYCLE_ENABLED', 'true');
   env.set('RELAY_SWITCH_POLICY', 'eager');
   env.set('DEFAULT_MODEL', defaultModel.id);
-  env.set('UPSTREAM_CTX_SIZE', String(recommendedContext(defaultModel, gpu)));
+  // UPSTREAM_CTX_SIZE should match the configured default model's actual ctx,
+  // not a generic recommendedContext that ignores sizing mode.
+  env.set('UPSTREAM_CTX_SIZE', String(defaultCtxSize ?? recommendedContext(defaultModel, gpu)));
   env.set('RELAY_REPO_DIR', PKG);
   env.set('RELAY_MODEL_DIR', modelDir);
   env.set('RELAY_LLAMA_SERVER_PATH', llamaServerPath);

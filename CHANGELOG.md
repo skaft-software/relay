@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.3.1 - 2026-06-29
+
+### Security
+
+- **General rate limiting for unauthenticated mode** — when no `API_KEY` is set, requests are now capped at 100/min/IP. Previously, unauthenticated instances had zero rate limiting.
+- **Cloud fallback forwards auth headers** — `forwardToCloud()` now forwards incoming `Authorization` and `X-Api-Key` headers to the cloud fallback URL. Previously they were silently dropped, making authenticated cloud fallback unusable.
+- **Shell metacharacter stripping in argv `${MODEL}`** — model names substituted into `modelStartArgv` arrays now have shell metacharacters (`;`, `|`, `` ` ``, `$()`, etc.) replaced. Shell-interpolated `${MODEL}` in `cmd` was already sanitized.
+- **Model name length cap** — model names exceeding 512 characters are rejected with 400 before reaching shell interpolation or URL construction.
+- **Mutex abort listener cleanup** — queued request waiters now properly remove their abort signal listeners when dequeued, preventing memory leaks under high concurrency with client disconnects.
+- **Port allocation exhaustion guard** — `allocatePort()` now throws if `nextPort > 65530`, preventing invalid port numbers.
+- **Idempotency key map hard cap** — the idempotency key cache is now capped at 10,000 entries with LRU eviction, preventing unbounded memory growth under adversarial key churn.
+- **`MAX_STORE_BYTES` validated as positive integer** — the store byte cap now rejects floats and negative values. Added to `.env.example`.
+- **Improved Content-Type error message** — non-JSON Content-Type rejections now include the actual received type.
+
+### Fixed
+
+- Sizing engine: three-mode dispatch (`speed`/`balanced`/`capacity`) now correctly applies to the selected mode rather than always using balanced.
+- Provisioning: cross-vendor multi-GPU detection with per-model GPU flags; `--list-devices` parsing for Vulkan/ROCm/CUDA.
+- **Multi-GPU AMD device handles** — the `rocm-smi` detection fallback (used when no `llama-server` binary exists yet) now creates `Vulkan{i}` device handles instead of `ROCm{i}`. Since Relay uses Vulkan for AMD, the previous handles would have generated invalid `--device ROCm0,ROCm1` flags in start scripts on multi-GPU AMD boxes.
+- **`probe-gpu.sh` multi-GPU enumeration** — the pre-build GPU probe (setup TUI fallback before any `llama-server` is installed) now sums VRAM across all GPUs and emits a `devices` array. Previously: NVIDIA reported only the first card (`head -1`) and AMD overwrote `VRAM_TOTAL` on each sysfs card iteration, so multi-GPU systems were mis-sized as single-GPU during initial setup.
+- **`probe-gpu.sh` AMD driver label** — corrected from `"rocm"` to `"vulkan"` to match Relay's AMD backend policy.
+- Dockerfile: uses `node --env-file` instead of fragile shell sourcing.
+- `/v1/models` now only advertises provisioned models that have a start script AND whose GGUF is still on disk.
+- Auto-discovered models no longer mutate the shared `config.modelEntries` with untyped runtime fields (`__ggufPath` is now typed).
+
+### Changed
+
+- Sizing engine overhaul: F32 KV cache calibration, GGUF metadata enrichment, MoE expert-layer byte splitting.
+- Setup TUI: download, probe, quant picker, tunnel/docker/start screens, BYO/cloud config.
+- SSE parser: CRLF (`\r\n\r\n`) frame separator support; upstream stream cancellation propagation on client disconnect.
+- Provisioning: `relay provision` now generates multi-GPU layer-split flags by default when multiple GPUs are detected.
+- New tests: catalog-fit, provision GPU placement, upstream cancellation on disconnect, model discovery filtering.
+- Removed 4 stale hang-test fixtures.
+
 ## v0.3.0 - 2026-06-22
 
 ### Added

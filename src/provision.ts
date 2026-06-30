@@ -12,8 +12,10 @@
  */
 import { execFileSync } from 'node:child_process';
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { join, dirname, basename } from 'node:path';
+import { join, dirname, basename, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+import { sizeModel, buildLaunchFlags, GB } from './sizing/size-model.ts';
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -288,7 +290,10 @@ export function detectHardware(serverPath?: string): Hardware {
     const totals = [...out.matchAll(/(\d{9,})/g)].map((m) => Number(m[1]));
     if (totals.length) {
       const gpus: GpuInfo[] = totals.map((bytes, i) => ({
-        index: i, device: 'ROCm' + i, name: amdName() ?? 'AMD GPU', vramGb: Math.round(bytes / 1024 ** 3),
+        // Relay uses Vulkan for AMD (not HIP/ROCm). Handles match what a Vulkan
+        // llama-server reports in --list-devices. If you build with HIP, the
+        // primary --list-devices path runs first and this fallback never fires.
+        index: i, device: 'Vulkan' + i, name: amdName() ?? 'AMD GPU', vramGb: Math.round(bytes / 1024 ** 3),
       })).filter((g) => g.vramGb > 0);
       if (gpus.length) return summarizeGpus(gpus, 'amd');
     }
@@ -434,8 +439,20 @@ function inferQuant(stem: string): string {
   return m ? m[1]!.toLowerCase() : 'unknown';
 }
 
-function isMoe(stem: string): boolean {
-  return /\b(a\d+b|moe|\d+x\d+b|next|qwen3-?(coder-)?(next|30b|35b|80b))\b/i.test(stem);
+function readCatalog(): Set<string> {
+  const catalogPath = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'docs', 'model-catalog.json');
+  try {
+    const raw = readFileSync(catalogPath, 'utf8');
+    const entries = JSON.parse(raw) as Array<{ id: string; moe?: boolean }>;
+    return new Set(entries.filter((e) => e.moe).map((e) => e.id));
+  } catch {
+    return new Set();
+  }
+}
+
+function isMoe(stem: string, catalogMoe?: boolean): boolean {
+  if (catalogMoe) return true;
+  return /\b(a\d+b|moe|\d+x\d+b|qwen3-?(coder-)?(next|30b|35b|80b))\b/i.test(stem);
 }
 
 export function scanModels(dir: string): ModelFile[] {
@@ -448,6 +465,8 @@ export function scanModels(dir: string): ModelFile[] {
     return !sh || sh[1] === '00001';
   });
 
+  const catalogMoeIds = readCatalog();
+
   const built: BuiltModel[] = bases.map((path) => {
     const b = basename(path);
     const stem = b.replace(SHARD_RE, '').replace(/\.gguf$/i, '');
@@ -458,13 +477,18 @@ export function scanModels(dir: string): ModelFile[] {
           .reduce((s, f) => s + safeSize(f), 0)
       : safeSize(path);
     const sizeGb = Math.round((sizeBytes / 1024 ** 3) * 10) / 10;
+    const stemSlug = slug(stem);
+    const stemTokens = stemSlug.split('-').filter(Boolean);
+    const catalogMoe = [...catalogMoeIds].some((catId) =>
+      catId.split('-').filter(Boolean).every((t) => stemTokens.includes(t))
+    );
     return {
       id: slug(stem),
       label: prettyLabel(stem),
       path,
       sizeGb,
       quant: inferQuant(stem),
-      moe: isMoe(stem),
+      moe: isMoe(stem, catalogMoe),
       vision: false,
       shards,
       incomplete: sizeBytes > 0 && sizeGb < 0.3,
@@ -508,7 +532,7 @@ function safeSize(f: string): number {
 
 export function fitModel(model: ModelFile, hw: Hardware, profile: Profile = 'full'): ModelFit {
   if (model.incomplete) return { model, fit: 'unknown', ngl: 0, ctxSize: 0 };
-  const gpuBudget = Math.max(0, hw.vramGb - 2);
+  const gpuBudget = Math.max(0, effectiveSizingVramGb(hw) - 2);
   const ramBudget = Math.max(0, hw.ramGb - 8);
   let fit: FitClass;
   if (!hw.vramGb || !model.sizeGb) fit = 'unknown';
@@ -516,7 +540,10 @@ export function fitModel(model: ModelFile, hw: Hardware, profile: Profile = 'ful
   else if (model.sizeGb <= gpuBudget + ramBudget) fit = 'partial-offload';
   else fit = 'too-large';
 
-  const ngl = fit === 'full-gpu' || fit === 'unknown' ? 999 : 0;
+  // Never emit -ngl 999 for partial-offload — that would pretend the model
+  // fully fits GPU when it doesn't.  0 means "let llama.cpp decide" (via --fit)
+  // or "no GPU offload" for MoE.
+  const ngl = fit === 'full-gpu' ? 999 : 0;
 
   let ctxSize: number;
   if (profile === 'nano') {
@@ -538,9 +565,7 @@ export function fitModel(model: ModelFile, hw: Hardware, profile: Profile = 'ful
 }
 
 
-// ── size-model.py integration ─────────────────────────────────────────
-
-const SIZE_MODEL_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'size-model.py');
+// ── TypeScript sizing engine integration ──────────────────────────────
 
 type SizeModelResult = {
   maxCtx: number;
@@ -551,24 +576,23 @@ type SizeModelResult = {
   kvGb: number;
 };
 
-export function sizeModelWithPython(ggufPath: string, pythonPath?: string): SizeModelResult | null {
+export function sizeModelForProvision(ggufPath: string, hw: Hardware): SizeModelResult | null {
   try {
-    const out = execFileSync(pythonPath ?? 'python3', [SIZE_MODEL_SCRIPT, ggufPath, '--json'], {
-      encoding: 'utf8',
-      timeout: 180_000,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      cwd: dirname(SIZE_MODEL_SCRIPT),
-    });
-    const data = JSON.parse(out.trim());
-    if (!data || typeof data !== 'object') return null;
-    if (data.error) return null;
+    // Reserve RAM for OS/docker/relay/cloudflared/systemd before CPU offload;
+    // the sizing engine itself also keeps a 2GB DRAM offload reserve.
+    const dramGb = Math.max(0, (hw.ramGb || 0) - 4);
+    const vramGb = effectiveSizingVramGb(hw);
+    const { result } = sizeModel(ggufPath, Math.trunc(vramGb * GB), Math.trunc(dramGb * GB));
+    const mode = result.modes.balanced;
+    if (!result.ok || !mode) return null;
+    const { launchFlags, expertFlag } = buildLaunchFlags(mode, { gpuLayers: mode.gpuLayers });
     return {
-      maxCtx: typeof data.max_ctx === 'number' ? data.max_ctx : 0,
-      launchFlags: Array.isArray(data.launch_flags) ? data.launch_flags : [],
-      expertFlag: typeof data.expert_flag === 'string' ? data.expert_flag : '',
-      nCpuMoe: typeof data.n_cpu_moe === 'number' ? data.n_cpu_moe : 0,
-      headroomPct: typeof data.headroom_pct === 'number' ? data.headroom_pct : 0,
-      kvGb: typeof data.kv_gb === 'number' ? data.kv_gb : 0,
+      maxCtx: mode.ctx,
+      launchFlags,
+      expertFlag,
+      nCpuMoe: mode.cpuMoeLayers,
+      headroomPct: mode.headroomPct,
+      kvGb: mode.kvGb,
     };
   } catch {
     return null;
@@ -590,7 +614,7 @@ export function renderStartScript(model: ModelFile, entry: MapEntry, llama: Llam
     let i = 0;
     while (i < launchFlags.length) {
       const f = launchFlags[i]!;
-      if (f.startsWith('--') && i + 1 < launchFlags.length && !launchFlags[i + 1]!.startsWith('--')) {
+      if (f.startsWith('-') && i + 1 < launchFlags.length && !launchFlags[i + 1]!.startsWith('-')) {
         pairs.push([f, launchFlags[i + 1]!]);
         i += 2;
       } else {
@@ -619,6 +643,20 @@ export function renderStartScript(model: ModelFile, entry: MapEntry, llama: Llam
   if (entry.gpu) {
     const present = new Set(args.map((a) => a[0]!));
     for (const pair of gpuLaunchFlags(entry.gpu, present)) args.push(pair);
+  }
+  if (entry.thinking_levels?.length) {
+    const present = new Set(args.map((a) => a[0]!));
+    if (!present.has('--reasoning-format')) args.push(['--reasoning-format', 'deepseek']);
+    if (!present.has('--reasoning')) args.push(['--reasoning', 'on']);
+  }
+  if (entry.expert_flag) {
+    const present = new Set(args.map((a) => a[0]!));
+    const parts = entry.expert_flag.trim().split(/\s+/);
+    if (parts[0] === '--cpu-moe' && !present.has('--cpu-moe')) {
+      args.push(['--cpu-moe']);
+    } else if (parts[0] === '--n-cpu-moe' && parts[1] && !present.has('--n-cpu-moe')) {
+      args.push(['--n-cpu-moe', parts[1]]);
+    }
   }
   if (entry.multimodal && model.mmproj) args.push(['--mmproj', shq(model.mmproj)]);
   if (model.draft) args.push(['--model-draft', shq(model.draft)]);
@@ -692,6 +730,72 @@ export function gpuLaunchFlags(gpu: GpuConfig, present: ReadonlySet<string> = ne
   return out;
 }
 
+const MULTI_GPU_MIN_USABLE_GB = 4;
+const MULTI_GPU_MIN_SECONDARY_FRAC = 0.25;
+
+function perGpuReserveGb(vendor: Hardware['vendor']): number {
+  if (vendor === 'amd') return 1.5;
+  if (vendor === 'nvidia') return 1.0;
+  if (vendor === 'apple') return 1.0;
+  return 1.0;
+}
+
+export type GpuPlacementPlan = {
+  devices: GpuInfo[];
+  config: GpuConfig;
+  /** Effective aggregate VRAM budget for Relay sizing, after per-device reserve. */
+  effectiveVramGb: number;
+};
+
+/**
+ * Pick a portable llama.cpp GPU placement. Default to layer split: it works on
+ * CUDA, Vulkan/HIP, and Metal, accepts the same --device handles printed by
+ * --list-devices, and avoids experimental tensor mode. Tiny integrated GPUs are
+ * filtered out so a discrete card is not slowed down or OOMed by a 1-2GB iGPU.
+ */
+export function planGpuPlacement(hw: Hardware): GpuPlacementPlan | undefined {
+  if (!hw.gpus.length) return undefined;
+  const reserve = perGpuReserveGb(hw.vendor);
+  const scored = hw.gpus
+    .map((gpu) => ({ gpu, usableGb: Math.max(0, gpu.vramGb - reserve) }))
+    .filter((x) => x.usableGb >= MULTI_GPU_MIN_USABLE_GB)
+    .sort((a, b) => b.usableGb - a.usableGb || a.gpu.index - b.gpu.index);
+  if (!scored.length) return undefined;
+
+  const largest = scored[0]!.usableGb;
+  const selected = scored
+    .filter((x) => x.usableGb >= largest * MULTI_GPU_MIN_SECONDARY_FRAC)
+    .sort((a, b) => a.gpu.index - b.gpu.index);
+  if (!selected.length) return undefined;
+
+  if (selected.length === 1) {
+    const only = selected[0]!;
+    if (hw.gpuCount <= 1) return undefined;
+    return {
+      devices: [only.gpu],
+      config: { device: only.gpu.device },
+      effectiveVramGb: only.gpu.vramGb,
+    };
+  }
+
+  return {
+    devices: selected.map((x) => x.gpu),
+    config: {
+      device: selected.map((x) => x.gpu.device).join(','),
+      splitMode: 'layer',
+      tensorSplit: selected.map((x) => x.gpu.vramGb),
+    },
+    effectiveVramGb: Math.max(0, Math.round(selected.reduce((sum, x) => sum + x.usableGb, 0) * 10) / 10),
+  };
+}
+
+/** Effective VRAM budget used by fit/sizing. Single GPU keeps legacy behavior;
+ * multi-GPU uses the selected layer-split aggregate budget. */
+export function effectiveSizingVramGb(hw: Hardware): number {
+  const placement = planGpuPlacement(hw);
+  return placement?.effectiveVramGb ?? hw.vramGb;
+}
+
 export function modelMapEntry(fit: ModelFit, containerScriptPath: string, port: number, tuned?: SizeModelResult): MapEntry {
   const ctx_size = tuned?.maxCtx || fit.ctxSize;
   const e: MapEntry = { cmd: containerScriptPath, ctx_size, port };
@@ -757,16 +861,19 @@ export function generateMap(
     let sizeResult: SizeModelResult | undefined;
     if (!existing[fit.model.id]) {
       console.error('  tuning: ' + fit.model.id + ' ...');
-      sizeResult = sizeModelWithPython(fit.model.path) ?? undefined;
+      sizeResult = sizeModelForProvision(fit.model.path, plan.hw) ?? undefined;
       if (sizeResult) {
         tuned[fit.model.id] = sizeResult;
       }
     }
     const entry = modelMapEntry(fit, containerScriptDir + '/start-' + fit.model.id + '.sh', port, sizeResult);
-    // Multi-GPU default: let llama.cpp pipeline-parallel across visible cards and
-    // auto-fit unset args. We do NOT pre-compute a tensor-split — `--fit on` is the
-    // safe cross-vendor default. A user can override per-model via the map's `gpu`.
-    if (plan.hw.gpuCount > 1 && !entry.gpu) entry.gpu = { fit: true };
+    // Multi-GPU default: use llama.cpp layer split across selected devices.
+    // Device handles come from --list-devices, so this works for CUDA, Vulkan,
+    // HIP/ROCm, and Metal. Tiny iGPUs are filtered by planGpuPlacement().
+    if (plan.hw.gpuCount > 1 && !entry.gpu) {
+      const placement = planGpuPlacement(plan.hw);
+      if (placement) entry.gpu = placement.config;
+    }
     out[fit.model.id] = entry;
   }
   return { map: out, tuned };
@@ -821,11 +928,22 @@ export type ApplyResult = {
   llamaPath: string | null;
 };
 
-export function applyProvision(repoDir: string, opts: { writeScripts?: boolean } = {}): ApplyResult {
+export function applyProvision(
+  repoDir: string,
+  opts: Partial<ProvisionOptions> & { writeScripts?: boolean } = {},
+): ApplyResult {
   const writeScripts = opts.writeScripts ?? true;
   const envPath = join(repoDir, '.env');
   const composePath = join(repoDir, 'docker-compose.yml');
-  const plan = buildPlan();
+  const plan = buildPlan({
+    apply: opts.apply ?? true,
+    profile: opts.profile ?? 'full',
+    backend: opts.backend ?? 'auto',
+    modelsDir: opts.modelsDir,
+    skipBuild: opts.skipBuild ?? false,
+    skipDocker: opts.skipDocker ?? false,
+    smoke: opts.smoke ?? false,
+  });
   const existing = readExistingMap(envPath);
   const { map: generated, tuned } = generateMap(plan, existing);
   const { merged, preserved, added, kept } = reconcileMap(generated, existing);
@@ -987,7 +1105,9 @@ function printPlan(plan: Plan, skipDocker = false): void {
   console.log('  llama-server ' + (llama.path ?? '(none — would build)') + '  [' + llama.backend + ', via ' + llama.source + ']');
   console.log('  hardware     ' + formatHardware(hw));
   if (hw.gpuCount > 1) {
-    console.log('               single-model budget: ' + hw.maxGpuVramGb + 'GB  ·  total physical VRAM: ' + hw.totalGpuVramGb + 'GB  ·  multi-GPU split: available');
+    const placement = planGpuPlacement(hw);
+    const devices = placement?.devices.map((g) => g.device).join(',') ?? 'none';
+    console.log('               split budget: ' + effectiveSizingVramGb(hw) + 'GB  ·  total physical VRAM: ' + hw.totalGpuVramGb + 'GB  ·  devices: ' + devices);
   }
   console.log('  models       ' + models.length + ' found in ' + layout.modelsDir + '\n');
   for (const f of models) {
@@ -1006,9 +1126,12 @@ function printPlan(plan: Plan, skipDocker = false): void {
     console.log('\n  ⚠ Warning: No GPU detected. Models will run CPU-only (very slow).');
   }
   if (hw.gpuCount > 1) {
-    console.log('\n  ℹ ' + hw.gpuCount + ' GPUs: defaulting to llama.cpp --fit on (pipeline-parallel across all cards).');
-    console.log('    For finer control set a per-model "gpu" block in RELAY_MODEL_MAP, e.g.');
-    console.log('    "gpu": { "splitMode": "layer", "tensorSplit": [' + hw.gpus.map((g) => g.vramGb).join(', ') + '], "device": "' + hw.gpus.map((g) => g.device).join(',') + '" }');
+    const placement = planGpuPlacement(hw);
+    console.log('\n  ℹ ' + hw.gpuCount + ' GPUs: defaulting to llama.cpp layer split across selected devices.');
+    if (placement) {
+      console.log('    flags: ' + gpuLaunchFlags(placement.config).map((p) => p.join(' ')).join(' '));
+    }
+    console.log('    For finer control edit the per-model "gpu" block in RELAY_MODEL_MAP.');
   }
   if (profile === 'nano' && hw.ramGb > 0 && hw.ramGb < 8) {
     console.log('  ⚠ Warning: Less than 8GB RAM. Nano profile may still be tight.');
@@ -1116,7 +1239,7 @@ export function runProvisionCli(args: string[], repoDir: string): void {
   }
 
   if (opts.apply) {
-    const r = applyProvision(repoDir);
+    const r = applyProvision(repoDir, opts);
     const envPath = join(repoDir, '.env');
     const composePath = join(repoDir, 'docker-compose.yml');
     console.log('\nProvision applied (staged — live service untouched)');

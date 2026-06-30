@@ -4,7 +4,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import test from 'node:test';
 
 import type { AppConfig } from '../src/config.ts';
-import { anthropicEventsToOpenAIChunks, encodeSSE, parseSSEJson, parseSSEStream } from '../src/normalize/stream.ts';
+import { anthropicEventsToOpenAIChunks, encodeSSE, ensureOpenAIStreamDone, parseSSEJson, parseSSEStream } from '../src/normalize/stream.ts';
 import { createApp } from '../src/server.ts';
 
 test('encodeSSE emits provider-compatible SSE frames', () => {
@@ -59,6 +59,28 @@ test('OpenAI streaming emits JSON-parsable SSE chunks before DONE', async () => 
     assert.equal(jsonFrames, 1);
     assert.equal(sawDone, true);
   });
+});
+
+test('OpenAI stream wrapper cancels upstream when downstream is cancelled', async () => {
+  const encoder = new TextEncoder();
+  let upstreamCancelled = false;
+  const upstream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(encoder.encode('data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"llama","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}\n\n'));
+    },
+    cancel() {
+      upstreamCancelled = true;
+    },
+  });
+
+  const wrapped = ensureOpenAIStreamDone(upstream);
+  const reader = wrapped.getReader();
+  const first = await reader.read();
+  assert.equal(first.done, false);
+  await reader.cancel('client disconnected');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(upstreamCancelled, true);
 });
 
 test('shared SSE parser handles frames split across network reads', async () => {
