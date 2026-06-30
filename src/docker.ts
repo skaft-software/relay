@@ -153,6 +153,8 @@ services:
     build:
       context: ${o.context}
       dockerfile: Dockerfile
+      args:
+        GPU_BACKEND: ${o.backend}
     image: ${IMAGE_NAME}
     container_name: ${CONTAINER_NAME}
     restart: unless-stopped
