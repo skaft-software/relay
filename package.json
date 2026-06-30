@@ -12,7 +12,6 @@
     "scripts/",
     "docs/model-catalog.json",
     "Dockerfile",
-    "docker-compose.yml",
     ".dockerignore",
     "package-lock.json",
     ".env.example",

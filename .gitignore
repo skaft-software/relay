@@ -11,5 +11,6 @@ __pycache__/
 *.pyc
 .pytest_cache/
 start-scripts/
+docker-compose.yml
 .hamr/
 docs/.vitepress/dist/
