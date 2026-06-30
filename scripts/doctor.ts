@@ -27,7 +27,7 @@ rows.push({
   }))),
 });
 
-await checkJson('relay health', `${relayBaseUrl}/health`, undefined, (body) => `ok=${body?.ok === true}`);
+await checkJson('relay health', `${relayBaseUrl}/health`, { headers: relayHeaders() }, (body) => `ok=${body?.ok === true}`);
 const capabilities = await checkJson('relay capabilities', `${relayBaseUrl}/relay/capabilities`, {
   headers: relayHeaders(),
 }, (body) => `reachable=${body?.upstream?.reachable ?? 'unknown'}`);
